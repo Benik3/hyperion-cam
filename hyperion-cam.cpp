@@ -208,7 +208,7 @@ int main(int argc, char *argv[])
 	}
 
 	streamConfig.pixelFormat = libcamera::formats::BGR888;
-	// streamConfig.colorSpace = libcamera::ColorSpace::Srgb;
+	streamConfig.colorSpace = libcamera::ColorSpace::Sycc;
 
 	libcamera::Size mySize(_width, _height);
 	streamConfig.size = mySize;
@@ -224,17 +224,20 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
+	if (streamConfig.colorSpace != libcamera::ColorSpace::Sycc)
+		std::cout << "Color space not Sycc" << std::endl;
+
 	if (_verbose)
 	{
 		std::cout << "Validated viewfinder configuration is: "
 				  << streamConfig.toString() << std::endl;
 	}
 
-	/* 	if (streamConfig.pixelFormat != libcamera::formats::RGB888)
-		{
-			std::cout << "ERROR: RGB888 format is not supported" << std::endl;
-			return EXIT_FAILURE;
-		} */
+	if (streamConfig.pixelFormat != libcamera::formats::BGR888)
+	{
+		std::cout << "ERROR: BGR888 format is not supported" << std::endl;
+		return EXIT_FAILURE;
+	} 
 
 	_imgHeight = streamConfig.size.height;
 	_imgWidth = streamConfig.size.width;
