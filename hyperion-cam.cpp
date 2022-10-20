@@ -224,8 +224,20 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if (streamConfig.colorSpace != libcamera::ColorSpace::Sycc)
-		std::cout << "Color space not Sycc" << std::endl;
+	if(streamConfig.colorSpace == libcamera::ColorSpace::Raw)
+		std::cout << "Color space: Raw" << std::endl;
+	else if(streamConfig.colorSpace == libcamera::ColorSpace::Srgb)
+		std::cout << "Color space: Srgb" << std::endl;
+	else if(streamConfig.colorSpace == libcamera::ColorSpace::Sycc)
+		std::cout << "Color space: Sycc" << std::endl;
+	else if(streamConfig.colorSpace == libcamera::ColorSpace::Smpte170m)
+		std::cout << "Color space: Smpte170m" << std::endl;
+	else if(streamConfig.colorSpace == libcamera::ColorSpace::Rec709)
+		std::cout << "Color space: Rec709" << std::endl;
+	else if(streamConfig.colorSpace == libcamera::ColorSpace::Rec2020)
+		std::cout << "Color space: Rec2020" << std::endl;
+	else
+		std::cout << "Color space: Unknown" << std::endl;
 
 	if (_verbose)
 	{
