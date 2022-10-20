@@ -14,6 +14,7 @@ using namespace libcamera;
 namespace po = boost::program_options;
 
 static std::shared_ptr<Camera> camera;
+std::map<libcamera::FrameBuffer *, std::vector<libcamera::Span<uint8_t>>> mapped_buffers_;
 static EventLoop loop;
 static EventLoop loopFb;
 static EventLoop loopTr;
@@ -92,23 +93,17 @@ static void processRequest(Request *request)
 	for (auto bufferPair : buffers)
 	{
 		FrameBuffer *buffer = bufferPair.second;
-		const FrameBuffer::Plane &plane = buffer->planes().front();
-
-		void *tmp;
-		tmp = mmap(NULL, plane.length, PROT_READ, MAP_PRIVATE, plane.fd.get(), 0);
 
 		if (_transformEn)
 		{
-			memcpy(_imgMem, tmp, plane.length);
+			_imgMem = mapped_buffers_.find(buffer)->second[0].data();
 			loopFb.callLater(std::bind(&transformImg));
 		}
 		else
 		{
-			memcpy(_imgMemToSend, tmp, plane.length);
+			_imgMemToSend = mapped_buffers_.find(buffer)->second[0].data();
 			loopFb.callLater(std::bind(&flatBufSend));
 		}
-
-		munmap(tmp, plane.length);
 	}
 
 	/* Re-queue the Request to the camera. */
@@ -224,17 +219,17 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if(streamConfig.colorSpace == libcamera::ColorSpace::Raw)
+	if (streamConfig.colorSpace == libcamera::ColorSpace::Raw)
 		std::cout << "Color space: Raw" << std::endl;
-	else if(streamConfig.colorSpace == libcamera::ColorSpace::Srgb)
+	else if (streamConfig.colorSpace == libcamera::ColorSpace::Srgb)
 		std::cout << "Color space: Srgb" << std::endl;
-	else if(streamConfig.colorSpace == libcamera::ColorSpace::Sycc)
+	else if (streamConfig.colorSpace == libcamera::ColorSpace::Sycc)
 		std::cout << "Color space: Sycc" << std::endl;
-	else if(streamConfig.colorSpace == libcamera::ColorSpace::Smpte170m)
+	else if (streamConfig.colorSpace == libcamera::ColorSpace::Smpte170m)
 		std::cout << "Color space: Smpte170m" << std::endl;
-	else if(streamConfig.colorSpace == libcamera::ColorSpace::Rec709)
+	else if (streamConfig.colorSpace == libcamera::ColorSpace::Rec709)
 		std::cout << "Color space: Rec709" << std::endl;
-	else if(streamConfig.colorSpace == libcamera::ColorSpace::Rec2020)
+	else if (streamConfig.colorSpace == libcamera::ColorSpace::Rec2020)
 		std::cout << "Color space: Rec2020" << std::endl;
 	else
 		std::cout << "Color space: Unknown" << std::endl;
@@ -249,18 +244,13 @@ int main(int argc, char *argv[])
 	{
 		std::cout << "ERROR: BGR888 format is not supported" << std::endl;
 		return EXIT_FAILURE;
-	} 
+	}
 
 	_imgHeight = streamConfig.size.height;
 	_imgWidth = streamConfig.size.width;
 
-	if (_transformEn)
+	if (!_transformEn)
 	{
-		_imgMem = malloc(_imgHeight * _imgWidth * 3);
-	}
-	else
-	{
-		_imgMemToSend = (uint8_t *)malloc(_imgHeight * _imgWidth * 3);
 		_imgHeightToSend = _imgHeight;
 		_imgWidthToSend = _imgWidth;
 	}
@@ -316,6 +306,14 @@ int main(int argc, char *argv[])
 
 	camera->requestCompleted.connect(requestComplete);
 
+	// Buffers memory mapping
+	for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : buffers)
+	{
+		const FrameBuffer::Plane &plane = buffer->planes().front();
+		void *memory = mmap(NULL, plane.length, PROT_READ | PROT_WRITE, MAP_SHARED, plane.fd.get(), 0);
+		mapped_buffers_[buffer.get()].push_back(libcamera::Span<uint8_t>(static_cast<uint8_t *>(memory), plane.length));
+	}
+
 	// controls the setting of camera
 	ControlList controls;
 	controls.set(controls::AeEnable, false);
@@ -355,10 +353,6 @@ int main(int argc, char *argv[])
 	camera->release();
 	camera.reset();
 	cm->stop();
-	if (_transformEn)
-		free(_imgMem);
-	else
-		free(_imgMemToSend);
 
 	return EXIT_SUCCESS;
 }
