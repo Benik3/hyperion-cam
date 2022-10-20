@@ -13,13 +13,13 @@
 using namespace libcamera;
 namespace po = boost::program_options;
 
-static std::shared_ptr<Camera> camera;
-std::map<libcamera::FrameBuffer *, std::vector<libcamera::Span<uint8_t>>> mapped_buffers_;
-static EventLoop loop;
-static EventLoop loopFb;
-static EventLoop loopTr;
-FlatBufferConnection flatbuf;
-OpencvTransform *transformation;
+static std::shared_ptr<Camera> _camera;
+std::map<libcamera::FrameBuffer *, std::vector<libcamera::Span<uint8_t>>> _mappedBuffers;
+static EventLoop _loop;
+static EventLoop _loopFb;
+static EventLoop _loopTr;
+FlatBufferConnection _flatbuf;
+OpencvTransform *_transformation;
 cv::Point2f _imgQuad[4];
 
 void *_imgMem = nullptr;
@@ -47,15 +47,15 @@ bool _help = false;
 
 void *flatLoop(void *arg)
 {
-	loopFb.exec();
+	_loopFb.exec();
 	return 0;
 }
 
 void flatBufSend()
 {
-	if (flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
-		if (flatbuf.setImage(_imgMemToSend, _imgWidthToSend, _imgHeightToSend) < 0)
+		if (_flatbuf.setImage(_imgMemToSend, _imgWidthToSend, _imgHeightToSend) < 0)
 		{
 			std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
 		}
@@ -66,15 +66,15 @@ void flatBufSend()
 
 void *transformLoop(void *arg)
 {
-	transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend);
-	loopTr.exec();
+	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend);
+	_loopTr.exec();
 	return 0;
 }
 
 void transformImg()
 {
-	_imgMemToSend = transformation->transform((uint8_t *)_imgMem);
-	loopFb.callLater(std::bind(&flatBufSend));
+	_imgMemToSend = _transformation->transform((uint8_t *)_imgMem);
+	_loopFb.callLater(std::bind(&flatBufSend));
 }
 
 static void processRequest(Request *request);
@@ -84,7 +84,7 @@ static void requestComplete(Request *request)
 	if (request->status() == Request::RequestCancelled)
 		return;
 
-	loop.callLater(std::bind(&processRequest, request));
+	_loop.callLater(std::bind(&processRequest, request));
 }
 
 static void processRequest(Request *request)
@@ -96,19 +96,19 @@ static void processRequest(Request *request)
 
 		if (_transformEn)
 		{
-			_imgMem = mapped_buffers_.find(buffer)->second[0].data();
-			loopFb.callLater(std::bind(&transformImg));
+			_imgMem = _mappedBuffers.find(buffer)->second[0].data();
+			_loopFb.callLater(std::bind(&transformImg));
 		}
 		else
 		{
-			_imgMemToSend = mapped_buffers_.find(buffer)->second[0].data();
-			loopFb.callLater(std::bind(&flatBufSend));
+			_imgMemToSend = _mappedBuffers.find(buffer)->second[0].data();
+			_loopFb.callLater(std::bind(&flatBufSend));
 		}
 	}
 
 	/* Re-queue the Request to the camera. */
 	request->reuse(Request::ReuseBuffers);
-	camera->queueRequest(request);
+	_camera->queueRequest(request);
 }
 
 // Main loop
@@ -181,12 +181,12 @@ int main(int argc, char *argv[])
 	}
 
 	std::string cameraId = cm->cameras()[0]->id();
-	camera = cm->get(cameraId);
-	camera->acquire();
+	_camera = cm->get(cameraId);
+	_camera->acquire();
 
 	// Stream
 	std::unique_ptr<CameraConfiguration> config =
-		camera->generateConfiguration({StreamRole::Viewfinder});
+		_camera->generateConfiguration({StreamRole::Viewfinder});
 
 	// Stream configuration
 	StreamConfiguration &streamConfig = config->at(0);
@@ -255,10 +255,10 @@ int main(int argc, char *argv[])
 		_imgWidthToSend = _imgWidth;
 	}
 
-	camera->configure(config.get());
+	_camera->configure(config.get());
 
 	// Buffer Allocation
-	FrameBufferAllocator *allocator = new FrameBufferAllocator(camera);
+	FrameBufferAllocator *allocator = new FrameBufferAllocator(_camera);
 
 	for (StreamConfiguration &cfg : *config)
 	{
@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
 	std::vector<std::unique_ptr<Request>> requests;
 	for (unsigned int i = 0; i < buffers.size(); ++i)
 	{
-		std::unique_ptr<Request> request = camera->createRequest();
+		std::unique_ptr<Request> request = _camera->createRequest();
 		if (!request)
 		{
 			std::cout << "ERROR: Can't create request" << std::endl;
@@ -304,14 +304,14 @@ int main(int argc, char *argv[])
 		requests.push_back(std::move(request));
 	}
 
-	camera->requestCompleted.connect(requestComplete);
+	_camera->requestCompleted.connect(requestComplete);
 
 	// Buffers memory mapping
 	for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : buffers)
 	{
 		const FrameBuffer::Plane &plane = buffer->planes().front();
 		void *memory = mmap(NULL, plane.length, PROT_READ | PROT_WRITE, MAP_SHARED, plane.fd.get(), 0);
-		mapped_buffers_[buffer.get()].push_back(libcamera::Span<uint8_t>(static_cast<uint8_t *>(memory), plane.length));
+		_mappedBuffers[buffer.get()].push_back(libcamera::Span<uint8_t>(static_cast<uint8_t *>(memory), plane.length));
 	}
 
 	// controls the setting of camera
@@ -328,9 +328,9 @@ int main(int argc, char *argv[])
 	controls.set(controls::FrameDurationLimits, libcamera::Span<const int64_t, 2>({INT64_C(100), INT64_C(1000000)}));
 
 	// Start Capture
-	camera->start(&controls);
+	_camera->start(&controls);
 	for (std::unique_ptr<Request> &request : requests)
-		camera->queueRequest(request.get());
+		_camera->queueRequest(request.get());
 
 	// Run thread for flatbuffer
 	pthread_t ptidFb;
@@ -344,14 +344,14 @@ int main(int argc, char *argv[])
 	}
 
 	// Run an EventLoop for camera
-	loop.exec();
+	_loop.exec();
 
 	// Clean Up
-	camera->stop();
+	_camera->stop();
 	allocator->free(stream);
 	delete allocator;
-	camera->release();
-	camera.reset();
+	_camera->release();
+	_camera.reset();
 	cm->stop();
 
 	return EXIT_SUCCESS;
