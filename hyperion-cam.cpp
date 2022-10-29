@@ -51,7 +51,7 @@ void *flatLoop(void *arg)
 	return 0;
 }
 
-void flatBufSend()
+static void flatBufSend()
 {
 	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
@@ -71,7 +71,7 @@ void *transformLoop(void *arg)
 	return 0;
 }
 
-void transformImg()
+static void transformImg()
 {
 	_imgMemToSend = _transformation->transform((uint8_t *)_imgMem);
 	_loopFb.callLater(std::bind(&flatBufSend));
@@ -97,7 +97,7 @@ static void processRequest(Request *request)
 		if (_transformEn)
 		{
 			_imgMem = _mappedBuffers.find(buffer)->second[0].data();
-			_loopFb.callLater(std::bind(&transformImg));
+			_loopTr.callLater(std::bind(&transformImg));
 		}
 		else
 		{
