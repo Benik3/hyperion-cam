@@ -44,6 +44,7 @@ std::string _transformStr;
 bool _transformEn = false;
 bool _verbose = false;
 bool _help = false;
+bool _frameToProcess = false;
 
 void *flatLoop(void *arg)
 {
@@ -62,6 +63,8 @@ static void flatBufSend()
 	}
 	else
 		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+
+	_frameToProcess = false;
 }
 
 void *transformLoop(void *arg)
@@ -89,6 +92,17 @@ static void requestComplete(Request *request)
 
 static void processRequest(Request *request)
 {
+	if (_frameToProcess && _verbose)
+	{
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame processing was too slow" << std::endl;
+	}
+	_frameToProcess = true;
+
 	const Request::BufferMap &buffers = request->buffers();
 	for (auto bufferPair : buffers)
 	{
