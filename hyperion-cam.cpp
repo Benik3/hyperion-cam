@@ -203,7 +203,7 @@ int main(int argc, char *argv[])
 	}
 
 	streamConfig.pixelFormat = libcamera::formats::BGR888;
-	streamConfig.colorSpace = libcamera::ColorSpace::Sycc;
+	streamConfig.colorSpace = libcamera::ColorSpace::fromString("Rec709/Rec709/None/Full");
 
 	libcamera::Size mySize(_width, _height);
 	streamConfig.size = mySize;
@@ -212,27 +212,14 @@ int main(int argc, char *argv[])
 	if (valRet == CameraConfiguration::Status::Adjusted)
 	{
 		std::cout << "WARNING: Configuration Adjusted" << std::endl;
+		std::cout << "Color space: " << libcamera::ColorSpace::toString(streamConfig.colorSpace) << std::endl;
+		std::cout << "Configuration: " << streamConfig.toString() << std::endl;
 	}
 	else if (valRet == CameraConfiguration::Status::Invalid)
 	{
 		std::cout << "ERROR: Configuration invalid" << std::endl;
 		return EXIT_FAILURE;
 	}
-
-	if (streamConfig.colorSpace == libcamera::ColorSpace::Raw)
-		std::cout << "Color space: Raw" << std::endl;
-	else if (streamConfig.colorSpace == libcamera::ColorSpace::Srgb)
-		std::cout << "Color space: Srgb" << std::endl;
-	else if (streamConfig.colorSpace == libcamera::ColorSpace::Sycc)
-		std::cout << "Color space: Sycc" << std::endl;
-	else if (streamConfig.colorSpace == libcamera::ColorSpace::Smpte170m)
-		std::cout << "Color space: Smpte170m" << std::endl;
-	else if (streamConfig.colorSpace == libcamera::ColorSpace::Rec709)
-		std::cout << "Color space: Rec709" << std::endl;
-	else if (streamConfig.colorSpace == libcamera::ColorSpace::Rec2020)
-		std::cout << "Color space: Rec2020" << std::endl;
-	else
-		std::cout << "Color space: Unknown" << std::endl;
 
 	if (_verbose)
 	{
