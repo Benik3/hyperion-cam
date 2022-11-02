@@ -44,7 +44,10 @@ std::string _transformStr;
 bool _transformEn = false;
 bool _verbose = false;
 bool _help = false;
-bool _frameToProcess = false;
+int _frameToProcess = 0;
+int _frameToSend = 0;
+auto _startProces = std::chrono::high_resolution_clock::now();
+auto _startSend = std::chrono::high_resolution_clock::now();
 
 void *flatLoop(void *arg)
 {
@@ -64,7 +67,19 @@ static void flatBufSend()
 	else
 		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
 
-	_frameToProcess = false;
+	if (_frameToSend > 1 && _verbose)
+	{
+		auto elapsed = std::chrono::high_resolution_clock::now() - _startSend;
+		long long elapsedMicros = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+	_frameToSend = 0;
 }
 
 void *transformLoop(void *arg)
@@ -77,6 +92,24 @@ void *transformLoop(void *arg)
 static void transformImg()
 {
 	_imgMemToSend = _transformation->transform((uint8_t *)_imgMem);
+
+	if (_frameToProcess > 1 && _verbose)
+	{
+		auto elapsed = std::chrono::high_resolution_clock::now() - _startProces;
+		long long elapsedMicros = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+	_frameToProcess = 0;
+
+	_frameToSend++;
+	if (_frameToSend <= 1)
+		_startSend = std::chrono::high_resolution_clock::now();
 	_loopFb.callLater(std::bind(&flatBufSend));
 }
 
@@ -92,17 +125,6 @@ static void requestComplete(Request *request)
 
 static void processRequest(Request *request)
 {
-	if (_frameToProcess && _verbose)
-	{
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame processing was too slow" << std::endl;
-	}
-	_frameToProcess = true;
-
 	const Request::BufferMap &buffers = request->buffers();
 	for (auto bufferPair : buffers)
 	{
@@ -111,11 +133,17 @@ static void processRequest(Request *request)
 		if (_transformEn)
 		{
 			_imgMem = _mappedBuffers.find(buffer)->second[0].data();
+			_frameToProcess++;
+			if (_frameToProcess <= 1)
+				_startProces = std::chrono::high_resolution_clock::now();
 			_loopTr.callLater(std::bind(&transformImg));
 		}
 		else
 		{
 			_imgMemToSend = _mappedBuffers.find(buffer)->second[0].data();
+			_frameToSend++;
+			if (_frameToSend <= 1)
+				_startSend = std::chrono::high_resolution_clock::now();
 			_loopFb.callLater(std::bind(&flatBufSend));
 		}
 	}
