@@ -4,8 +4,8 @@
 #include <sys/un.h>
 
 #include "FlatBufferConnection.h"
-#include "hyperion_reply_generated.h"
-#include "hyperion_request_generated.h"
+#include "hyperhdr_reply_generated.h"
+#include "hyperhdr_request_generated.h"
 
 FlatBufferConnection::FlatBufferConnection()
 	: _sockfd(0), _registered(false), _connected(false), _skipReply(false)
@@ -160,7 +160,7 @@ int FlatBufferConnection::readData()
 		std::cerr << "ERROR: Read from socket failed" << std::endl;
 		return -1;
 	}
-	parseReply(hyperionnet::GetReply(recvBuff));
+	parseReply(hyperhdrnet::GetReply(recvBuff));
 	return 0;
 }
 
@@ -169,8 +169,8 @@ int FlatBufferConnection::setRegister(const char *origin, int priority)
 	if (!_sockfd)
 		return -1;
 
-	auto registerReq = hyperionnet::CreateRegister(_builder, _builder.CreateString(origin), priority);
-	auto req = hyperionnet::CreateRequest(_builder, hyperionnet::Command_Register, registerReq.Union());
+	auto registerReq = hyperhdrnet::CreateRegister(_builder, _builder.CreateString(origin), priority);
+	auto req = hyperhdrnet::CreateRequest(_builder, hyperhdrnet::Command_Register, registerReq.Union());
 	_builder.Finish(req);
 
 	uint32_t size = _builder.GetSize();
@@ -194,9 +194,9 @@ int FlatBufferConnection::setImage(const uint8_t *buffer, uint16_t width, uint16
 	}
 
 	auto imgData = _builder.CreateVector(buffer, width * height * 3);
-	auto rawImg = hyperionnet::CreateRawImage(_builder, imgData, width, height);
-	auto imageReq = hyperionnet::CreateImage(_builder, hyperionnet::ImageType_RawImage, rawImg.Union(), -1);
-	auto req = hyperionnet::CreateRequest(_builder, hyperionnet::Command_Image, imageReq.Union());
+	auto rawImg = hyperhdrnet::CreateRawImage(_builder, imgData, width, height);
+	auto imageReq = hyperhdrnet::CreateImage(_builder, hyperhdrnet::ImageType_RawImage, rawImg.Union(), -1);
+	auto req = hyperhdrnet::CreateRequest(_builder, hyperhdrnet::Command_Image, imageReq.Union());
 	_builder.Finish(req);
 
 	int ret = sendMessage(_builder.GetBufferPointer(), _builder.GetSize());
@@ -238,7 +238,7 @@ int FlatBufferConnection::sendMessage(const uint8_t *buffer, uint32_t size)
 	return 0;
 }
 
-bool FlatBufferConnection::parseReply(const hyperionnet::Reply *reply)
+bool FlatBufferConnection::parseReply(const hyperhdrnet::Reply *reply)
 {
 
 	if (!reply->error())
