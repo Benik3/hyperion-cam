@@ -46,6 +46,16 @@ public:
 	/// @return 0 = OK, -1 = failed
 	int setImage(const uint8_t *buffer, uint16_t width, uint16_t height);
 
+	/// @brief Send NV12 image data through flatbuffer
+	/// @param yPlane Pointer to Y plane
+	/// @param uvPlane Pointer to interleaved UV plane
+	/// @param width Image width (pixels)
+	/// @param height Image height (pixels)
+	/// @param strideY Y plane stride (bytes per row)
+	/// @param strideUV UV plane stride (bytes per row)
+	/// @return 0 = OK, -1 = failed
+	int setNV12Image(const uint8_t *yPlane, const uint8_t *uvPlane, uint16_t width, uint16_t height, uint16_t strideY, uint16_t strideUV);
+
 	/// @brief Pre-size the internal FlatBufferBuilder to reduce reallocations.
 	/// Safe to call multiple times; it only grows the internal buffer.
 	void reserveBuilderBytes(size_t bytes);

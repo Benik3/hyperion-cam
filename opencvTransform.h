@@ -9,7 +9,7 @@ class OpencvTransform
 {
 public:
 	/// @brief Constructor
-	OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut);
+	OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut, bool alignEvenOutput = false);
 
 	/// @brief Destructor
 	~OpencvTransform();

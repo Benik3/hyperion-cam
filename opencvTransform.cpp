@@ -1,10 +1,20 @@
 #include "opencvTransform.h"
 
-OpencvTransform::OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut)
+OpencvTransform::OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut, bool alignEvenOutput)
     : _srcQuad(points), _srcWidth(width), _srcHeight(height)
 {
     int x = std::max(_srcQuad[1].x - _srcQuad[0].x, _srcQuad[3].x - _srcQuad[2].x);
     int y = std::max(_srcQuad[2].y - _srcQuad[0].y, _srcQuad[3].y - _srcQuad[1].y);
+
+    if (alignEvenOutput)
+    {
+        x &= ~1;
+        y &= ~1;
+        if (x <= 0)
+            x = 2;
+        if (y <= 0)
+            y = 2;
+    }
 
     _dstQuad[0] = cv::Point2f(0.f, 0.f);
     _dstQuad[1] = cv::Point2f((float)x, 0.f);

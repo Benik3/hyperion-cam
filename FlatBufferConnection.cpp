@@ -228,6 +228,35 @@ int FlatBufferConnection::setImage(const uint8_t *buffer, uint16_t width, uint16
 	return ret;
 }
 
+int FlatBufferConnection::setNV12Image(const uint8_t *yPlane, const uint8_t *uvPlane, uint16_t width, uint16_t height, uint16_t strideY, uint16_t strideUV)
+{
+	if (!_registered)
+	{
+		if (setRegister(_origin, _priority) == -1)
+			return -1;
+	}
+
+	// Send the full plane buffers (including per-row padding) and provide strides.
+	const size_t yBytes = static_cast<size_t>(strideY) * static_cast<size_t>(height);
+	const size_t uvBytes = static_cast<size_t>(strideUV) * (static_cast<size_t>(height) / 2u);
+	reserveBuilderBytes(yBytes + uvBytes + 1024u);
+
+	auto yData = _builder.CreateVector(yPlane, yBytes);
+	auto uvData = _builder.CreateVector(uvPlane, uvBytes);
+	auto nv12Img = hyperhdrnet::CreateNV12Image(_builder, yData, uvData, width, height, strideY, strideUV);
+	auto imageReq = hyperhdrnet::CreateImage(_builder, hyperhdrnet::ImageType_NV12Image, nv12Img.Union(), -1);
+	auto req = hyperhdrnet::CreateRequest(_builder, hyperhdrnet::Command_Image, imageReq.Union());
+	_builder.Finish(req);
+
+	int ret = sendMessage(_builder.GetBufferPointer(), _builder.GetSize());
+	_builder.Clear();
+
+	if (ret != -1 && !_skipReply)
+		readData();
+
+	return ret;
+}
+
 int FlatBufferConnection::sendMessage(const uint8_t *buffer, uint32_t size)
 {
 	if (!_sockfd)

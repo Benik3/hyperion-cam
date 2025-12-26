@@ -5,9 +5,11 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <cstring>
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
 #include <opencv2/core/types.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "event_loop.h"
 #include "FlatBufferConnection.h"
@@ -17,6 +19,47 @@ using namespace libcamera;
 namespace po = boost::program_options;
 
 static std::shared_ptr<Camera> _camera;
+bool _useNv12 = false;
+
+static int _strideY = 0;
+static int _strideUV = 0;
+
+struct Nv12RingBuffer
+{
+	std::vector<std::vector<uint8_t>> y;
+	std::vector<std::vector<uint8_t>> uv;
+	std::size_t index{0};
+	int width{0};
+	int height{0};
+
+	void reset(int w, int h, std::size_t ringSize = 3)
+	{
+		width = w;
+		height = h;
+		index = 0;
+		y.assign(ringSize, std::vector<uint8_t>(static_cast<std::size_t>(w) * static_cast<std::size_t>(h)));
+		uv.assign(ringSize, std::vector<uint8_t>(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) / 2u));
+	}
+
+	struct View
+	{
+		uint8_t *y;
+		uint8_t *uv;
+		int strideY;
+		int strideUV;
+		int width;
+		int height;
+	};
+
+	View next()
+	{
+		std::size_t idx = index++ % y.size();
+		return View{y[idx].data(), uv[idx].data(), width, width, width, height};
+	}
+};
+
+static Nv12RingBuffer _nv12Out;
+
 std::map<libcamera::FrameBuffer *, std::vector<libcamera::Span<uint8_t>>> _mappedBuffers;
 static EventLoop _loop;
 static EventLoop _loopFb;
@@ -89,9 +132,36 @@ static void flatBufSend(const uint8_t *img)
 	}
 }
 
+static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, int strideUV, int width, int height)
+{
+	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+	{
+		if (_flatbuf.setNV12Image(y, uv, width, height, strideY, strideUV) < 0)
+		{
+			std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
+		}
+	}
+	else
+		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+
+	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
+	{
+		int64_t elapsedMicros = (nowNs() - _startSendNs.load(std::memory_order_acquire)) / 1000;
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+}
 void *transformLoop(void *arg)
 {
-	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend);
+	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend, _useNv12);
+	if (_useNv12)
+		_nv12Out.reset(_imgWidthToSend, _imgHeightToSend);
 	_loopTr.exec();
 	return 0;
 }
@@ -119,6 +189,64 @@ static void transformImg(uint8_t *img)
 	_loopFb.callLater([imgToSend]() { flatBufSend(imgToSend); });
 }
 
+static void transformImgNv12(uint8_t *y, uint8_t *uv)
+{
+	// Avoid NV12 <-> BGR conversions: warp Y and UV planes directly.
+	// UV is half-resolution, so use a homography computed in UV coordinate space.
+	static thread_local bool inited = false;
+	static thread_local cv::Mat warpY;
+	static thread_local cv::Mat warpUV;
+	if (!inited)
+	{
+		cv::Point2f dstQuadY[4] = {
+			cv::Point2f(0.f, 0.f),
+			cv::Point2f(static_cast<float>(_imgWidthToSend), 0.f),
+			cv::Point2f(0.f, static_cast<float>(_imgHeightToSend)),
+			cv::Point2f(static_cast<float>(_imgWidthToSend), static_cast<float>(_imgHeightToSend))};
+		warpY = cv::getPerspectiveTransform(_imgQuad, dstQuadY);
+
+		cv::Point2f srcQuadUV[4];
+		cv::Point2f dstQuadUV[4] = {
+			cv::Point2f(0.f, 0.f),
+			cv::Point2f(static_cast<float>(_imgWidthToSend) / 2.f, 0.f),
+			cv::Point2f(0.f, static_cast<float>(_imgHeightToSend) / 2.f),
+			cv::Point2f(static_cast<float>(_imgWidthToSend) / 2.f, static_cast<float>(_imgHeightToSend) / 2.f)};
+		for (int i = 0; i < 4; i++)
+			srcQuadUV[i] = cv::Point2f(_imgQuad[i].x / 2.f, _imgQuad[i].y / 2.f);
+		warpUV = cv::getPerspectiveTransform(srcQuadUV, dstQuadUV);
+
+		inited = true;
+	}
+
+	cv::Mat yIn(_imgHeight, _imgWidth, CV_8UC1, y, _strideY);
+	cv::Mat uvIn(_imgHeight / 2, _imgWidth / 2, CV_8UC2, uv, _strideUV);
+
+	auto view = _nv12Out.next();
+	cv::Mat yOut(_imgHeightToSend, _imgWidthToSend, CV_8UC1, view.y, view.strideY);
+	cv::Mat uvOut(_imgHeightToSend / 2, _imgWidthToSend / 2, CV_8UC2, view.uv, view.strideUV);
+
+	cv::warpPerspective(yIn, yOut, warpY, yOut.size(), cv::INTER_NEAREST);
+	cv::warpPerspective(uvIn, uvOut, warpUV, uvOut.size(), cv::INTER_NEAREST);
+
+	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
+	{
+		int64_t elapsedMicros = (nowNs() - _startProcessNs.load(std::memory_order_acquire)) / 1000;
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+
+	int after = _pendingSend.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (after == 1)
+		_startSendNs.store(nowNs(), std::memory_order_release);
+	_loopFb.callLater([view]() { flatBufSendNv12(view.y, view.uv, view.strideY, view.strideUV, view.width, view.height); });
+}
+
 static void processRequest(Request *request);
 
 static void requestComplete(Request *request)
@@ -135,29 +263,55 @@ static void processRequest(Request *request)
 	for (auto bufferPair : buffers)
 	{
 		FrameBuffer *buffer = bufferPair.second;
-		uint8_t *img = _mappedBuffers.find(buffer)->second[0].data();
+		auto it = _mappedBuffers.find(buffer);
+		if (it == _mappedBuffers.end() || it->second.empty())
+			continue;
 
 		if (_transformEn)
 		{
 			int after = _pendingProcess.fetch_add(1, std::memory_order_acq_rel) + 1;
 			if (after == 1)
 				_startProcessNs.store(nowNs(), std::memory_order_release);
-			_loopTr.callLater([img]() { transformImg(img); });
+
+			if (_useNv12)
+			{
+				if (it->second.size() < 2)
+					continue;
+				uint8_t *y = it->second[0].data();
+				uint8_t *uv = it->second[1].data();
+				_loopTr.callLater([y, uv]() { transformImgNv12(y, uv); });
+			}
+			else
+			{
+				uint8_t *img = it->second[0].data();
+				_loopTr.callLater([img]() { transformImg(img); });
+			}
 		}
 		else
 		{
 			int after = _pendingSend.fetch_add(1, std::memory_order_acq_rel) + 1;
 			if (after == 1)
 				_startSendNs.store(nowNs(), std::memory_order_release);
-			_loopFb.callLater([img]() { flatBufSend(img); });
+
+			if (_useNv12)
+			{
+				if (it->second.size() < 2)
+					continue;
+				uint8_t *y = it->second[0].data();
+				uint8_t *uv = it->second[1].data();
+				_loopFb.callLater([y, uv]() { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend); });
+			}
+			else
+			{
+				uint8_t *img = it->second[0].data();
+				_loopFb.callLater([img]() { flatBufSend(img); });
+			}
 		}
 	}
 
-	/* Re-queue the Request to the camera. */
 	request->reuse(Request::ReuseBuffers);
 	_camera->queueRequest(request);
 }
-
 // Main loop
 int main(int argc, char *argv[])
 {
@@ -173,6 +327,7 @@ int main(int argc, char *argv[])
 		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")													   //
 		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")										   //
 		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")		   //
+		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")			   //
 		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")										   //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
@@ -249,7 +404,7 @@ int main(int argc, char *argv[])
 		std::cout << std::endl;
 	}
 
-	streamConfig.pixelFormat = libcamera::formats::BGR888;
+	streamConfig.pixelFormat = _useNv12 ? libcamera::formats::NV12 : libcamera::formats::BGR888;
 	streamConfig.colorSpace = libcamera::ColorSpace::fromString("Rec709/Rec709/None/Full");
 
 	libcamera::Size mySize(_width, _height);
@@ -274,10 +429,32 @@ int main(int argc, char *argv[])
 				  << streamConfig.toString() << std::endl;
 	}
 
-	if (streamConfig.pixelFormat != libcamera::formats::BGR888)
+	if (_useNv12)
 	{
-		std::cout << "ERROR: BGR888 format is not supported" << std::endl;
-		return EXIT_FAILURE;
+		if (streamConfig.pixelFormat != libcamera::formats::NV12)
+		{
+			std::cout << "ERROR: NV12 format is not supported" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if ((streamConfig.size.width % 2) != 0 || (streamConfig.size.height % 2) != 0)
+		{
+			std::cout << "ERROR: NV12 requires even width and height" << std::endl;
+			return EXIT_FAILURE;
+		}
+		_strideY = static_cast<int>(streamConfig.stride);
+		_strideUV = static_cast<int>(streamConfig.stride);
+		if (_strideY <= 0)
+			_strideY = streamConfig.size.width;
+		if (_strideUV <= 0)
+			_strideUV = streamConfig.size.width;
+	}
+	else
+	{
+		if (streamConfig.pixelFormat != libcamera::formats::BGR888)
+		{
+			std::cout << "ERROR: BGR888 format is not supported" << std::endl;
+			return EXIT_FAILURE;
+		}
 	}
 
 	_imgHeight = streamConfig.size.height;
@@ -343,9 +520,13 @@ int main(int argc, char *argv[])
 	// Buffers memory mapping
 	for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : buffers)
 	{
-		const FrameBuffer::Plane &plane = buffer->planes().front();
-		void *memory = mmap(NULL, plane.length, PROT_READ | PROT_WRITE, MAP_SHARED, plane.fd.get(), 0);
-		_mappedBuffers[buffer.get()].push_back(libcamera::Span<uint8_t>(static_cast<uint8_t *>(memory), plane.length));
+		for (const FrameBuffer::Plane &plane : buffer->planes())
+		{
+			size_t mapLen = plane.offset + plane.length;
+			void *memory = mmap(NULL, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED, plane.fd.get(), 0);
+			uint8_t *planePtr = static_cast<uint8_t *>(memory) + plane.offset;
+			_mappedBuffers[buffer.get()].push_back(libcamera::Span<uint8_t>(planePtr, plane.length));
+		}
 	}
 
 	// controls the setting of camera
