@@ -8,17 +8,31 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 
 namespace
 {
+static constexpr uint32_t fourcc_code(char a, char b, char c, char d)
+{
+	return (static_cast<uint32_t>(a)) |
+		(static_cast<uint32_t>(b) << 8) |
+		(static_cast<uint32_t>(c) << 16) |
+		(static_cast<uint32_t>(d) << 24);
+}
+
+// Plane import formats
+static constexpr uint32_t DRM_FORMAT_R8 = fourcc_code('R', '8', ' ', ' ');
+static constexpr uint32_t DRM_FORMAT_GR88 = fourcc_code('G', 'R', '8', '8');
+
 static inline uint64_t monoNs()
 {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -195,6 +209,48 @@ struct GpuNv12Transform::Impl
 	GLuint texUVOut{0};
 	GLuint fboUV{0};
 
+	bool dmabufEnabled{false};
+	bool dmabufSupported{false};
+	bool dmabufWarnedOnce{false};
+	PFNEGLCREATEIMAGEKHRPROC p_eglCreateImageKHR{nullptr};
+	PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR{nullptr};
+	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_glEGLImageTargetTexture2DOES{nullptr};
+
+	struct DmabufKey
+	{
+		int fd;
+		int offset;
+		int stride;
+		int width;
+		int height;
+		uint32_t fourcc;
+
+		bool operator==(const DmabufKey &o) const
+		{
+			return fd == o.fd && offset == o.offset && stride == o.stride && width == o.width && height == o.height && fourcc == o.fourcc;
+		}
+	};
+
+	struct DmabufKeyHash
+	{
+		std::size_t operator()(const DmabufKey &k) const
+		{
+			std::size_t h = 1469598103934665603ull;
+			auto mix = [&](std::size_t v) {
+				h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+			};
+			mix(static_cast<std::size_t>(k.fd));
+			mix(static_cast<std::size_t>(k.offset));
+			mix(static_cast<std::size_t>(k.stride));
+			mix(static_cast<std::size_t>(k.width));
+			mix(static_cast<std::size_t>(k.height));
+			mix(static_cast<std::size_t>(k.fourcc));
+			return h;
+		}
+	};
+
+	std::unordered_map<DmabufKey, EGLImageKHR, DmabufKeyHash> dmabufImages;
+
 	// Optional pipelined readback via PBOs (reduces blocking on glReadPixels).
 	bool usePbo{false};
 	GLuint pboY[2]{0, 0};
@@ -238,6 +294,7 @@ struct GpuNv12Transform::Impl
 		profile = envEnabled("HYPERCAM_GL_PROFILE");
 		profileSync = envEnabled("HYPERCAM_GL_PROFILE_SYNC");
 		usePbo = envEnabled("HYPERCAM_NV12_PBO");
+		dmabufEnabled = true;
 		lastPrintNs = monoNs();
 
 		// EGL init (headless pbuffer). We try default display first, then fall back
@@ -282,6 +339,19 @@ struct GpuNv12Transform::Impl
 			throw std::runtime_error("eglCreateContext failed");
 		if (!eglMakeCurrent(dpy, surf, surf, ctx))
 			throw std::runtime_error("eglMakeCurrent failed");
+
+		{
+			const char *eglExt = eglQueryString(dpy, EGL_EXTENSIONS);
+			const char *glExt = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+			bool haveEgl = (eglExt && std::string(eglExt).find("EGL_EXT_image_dma_buf_import") != std::string::npos);
+			bool haveGl = (glExt && std::string(glExt).find("GL_OES_EGL_image") != std::string::npos);
+			p_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+			p_eglDestroyImageKHR = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+			p_glEGLImageTargetTexture2DOES = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+			dmabufSupported = haveEgl && haveGl && p_eglCreateImageKHR && p_eglDestroyImageKHR && p_glEGLImageTargetTexture2DOES;
+			if (!dmabufSupported)
+				std::cerr << "[gpuNv12] INFO: DMA-BUF import unavailable; using CPU upload" << std::endl;
+		}
 
 		glPixelStorei(GL_PACK_ALIGNMENT, 1);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -459,6 +529,16 @@ void main(){
 
 	~Impl()
 	{
+		if (dmabufSupported && p_eglDestroyImageKHR)
+		{
+			for (auto &kv : dmabufImages)
+			{
+				if (kv.second != EGL_NO_IMAGE_KHR)
+					p_eglDestroyImageKHR(dpy, kv.second);
+			}
+			dmabufImages.clear();
+		}
+
 		if (dpy != EGL_NO_DISPLAY)
 		{
 			eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -514,6 +594,96 @@ void main(){
 			return true;
 		EGLint r = glClientWaitSync(s, 0, 0);
 		return (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED);
+	}
+
+	EGLImageKHR getDmabufImage(const DmabufKey &k)
+	{
+		auto it = dmabufImages.find(k);
+		if (it != dmabufImages.end())
+			return it->second;
+
+		if (!dmabufSupported || !p_eglCreateImageKHR)
+			return EGL_NO_IMAGE_KHR;
+
+		EGLint attrs[] = {
+			EGL_WIDTH, k.width,
+			EGL_HEIGHT, k.height,
+			EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLint>(k.fourcc),
+			EGL_DMA_BUF_PLANE0_FD_EXT, static_cast<EGLint>(k.fd),
+			EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(k.offset),
+			EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(k.stride),
+			EGL_NONE};
+
+		EGLImageKHR img = p_eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
+		if (img == EGL_NO_IMAGE_KHR)
+		{
+			if (!dmabufWarnedOnce)
+			{
+				dmabufWarnedOnce = true;
+				std::cerr << "[gpuNv12] WARN: eglCreateImageKHR(dma-buf) failed; using CPU upload" << std::endl;
+			}
+			dmabufImages.emplace(k, EGL_NO_IMAGE_KHR);
+			return EGL_NO_IMAGE_KHR;
+		}
+
+		dmabufImages.emplace(k, img);
+		return img;
+	}
+
+	bool uploadNV12Dmabuf(int fdY, int offsetYBytes, int strideY, int fdUV, int offsetUVBytes, int strideUV)
+	{
+		uint64_t t0 = 0;
+		if (profile)
+			t0 = monoNs();
+
+		if (!dmabufEnabled || !dmabufSupported || !p_glEGLImageTargetTexture2DOES)
+		{
+			if (profile)
+				accUploadNs += (monoNs() - t0);
+			return false;
+		}
+
+		uint64_t ty0 = 0;
+		if (profile)
+			ty0 = monoNs();
+		DmabufKey ky{fdY, offsetYBytes, strideY, srcW, srcH, DRM_FORMAT_R8};
+		EGLImageKHR imgY = getDmabufImage(ky);
+		if (imgY == EGL_NO_IMAGE_KHR)
+		{
+			if (profile)
+				accUploadYNs += (monoNs() - ty0);
+			if (profile)
+				accUploadNs += (monoNs() - t0);
+			return false;
+		}
+		glBindTexture(GL_TEXTURE_2D, texY);
+		p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, reinterpret_cast<GLeglImageOES>(imgY));
+		if (profile)
+			accUploadYNs += (monoNs() - ty0);
+
+		uint64_t tuv0 = 0;
+		if (profile)
+			tuv0 = monoNs();
+		DmabufKey kuv{fdUV, offsetUVBytes, strideUV, srcW / 2, srcH / 2, DRM_FORMAT_GR88};
+		EGLImageKHR imgUV = getDmabufImage(kuv);
+		if (imgUV == EGL_NO_IMAGE_KHR)
+		{
+			if (profile)
+				accUploadUVNs += (monoNs() - tuv0);
+			if (profile)
+				accUploadNs += (monoNs() - t0);
+			return false;
+		}
+		glBindTexture(GL_TEXTURE_2D, texUV);
+		p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, reinterpret_cast<GLeglImageOES>(imgUV));
+		if (profile)
+			accUploadUVNs += (monoNs() - tuv0);
+
+		if (profileSync)
+			glFinish();
+		if (profile)
+			accUploadNs += (monoNs() - t0);
+		return true;
 	}
 
 	bool tryConsume(int idx, uint8_t *outY, uint8_t *outUV)
@@ -645,18 +815,8 @@ void main(){
 			accReadUVNs += (monoNs() - tRead0);
 	}
 
-	void transformNv12(const uint8_t *yPlane, const uint8_t *uvPlane, int strideY, int strideUV, uint8_t *outY, uint8_t *outUV)
+	void renderAfterUpload(uint64_t tXform0, uint64_t tTotal0, uint8_t *outY, uint8_t *outUV)
 	{
-		uint64_t tXform0 = 0;
-		uint64_t tTotal0 = 0;
-		if (profile)
-		{
-			tXform0 = monoNs();
-			tTotal0 = tXform0;
-		}
-
-		uploadNV12(yPlane, uvPlane, strideY, strideUV);
-
 		if (!usePbo)
 		{
 			renderY(outY);
@@ -804,6 +964,37 @@ void main(){
 			lastPrintNs = now;
 		}
 	}
+
+	void transformNv12(const uint8_t *yPlane, const uint8_t *uvPlane, int strideY, int strideUV, uint8_t *outY, uint8_t *outUV)
+	{
+		uint64_t tXform0 = 0;
+		uint64_t tTotal0 = 0;
+		if (profile)
+		{
+			tXform0 = monoNs();
+			tTotal0 = tXform0;
+		}
+
+		uploadNV12(yPlane, uvPlane, strideY, strideUV);
+		renderAfterUpload(tXform0, tTotal0, outY, outUV);
+	}
+
+	bool transformNv12Dmabuf(int fdY, int offsetYBytes, int strideY, int fdUV, int offsetUVBytes, int strideUV, uint8_t *outY, uint8_t *outUV)
+	{
+		uint64_t tXform0 = 0;
+		uint64_t tTotal0 = 0;
+		if (profile)
+		{
+			tXform0 = monoNs();
+			tTotal0 = tXform0;
+		}
+
+		if (!uploadNV12Dmabuf(fdY, offsetYBytes, strideY, fdUV, offsetUVBytes, strideUV))
+			return false;
+
+		renderAfterUpload(tXform0, tTotal0, outY, outUV);
+		return true;
+	}
 };
 
 GpuNv12Transform::GpuNv12Transform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight)
@@ -822,6 +1013,11 @@ void GpuNv12Transform::transform(const uint8_t *yPlane, const uint8_t *uvPlane, 
 	_impl->transformNv12(yPlane, uvPlane, strideY, strideUV, outY, outUV);
 }
 
+bool GpuNv12Transform::transformDmabuf(int fdY, int offsetYBytes, int strideY, int fdUV, int offsetUVBytes, int strideUV, uint8_t *outY, uint8_t *outUV)
+{
+	return _impl->transformNv12Dmabuf(fdY, offsetYBytes, strideY, fdUV, offsetUVBytes, strideUV, outY, outUV);
+}
+
 #else
 
 GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int)
@@ -832,5 +1028,10 @@ GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int)
 GpuNv12Transform::~GpuNv12Transform() {}
 
 void GpuNv12Transform::transform(const uint8_t *, const uint8_t *, int, int, uint8_t *, uint8_t *) {}
+
+bool GpuNv12Transform::transformDmabuf(int, int, int, int, int, int, uint8_t *, uint8_t *)
+{
+	return false;
+}
 
 #endif

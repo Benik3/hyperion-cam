@@ -27,6 +27,7 @@ namespace po = boost::program_options;
 static std::shared_ptr<Camera> _camera;
 bool _useNv12 = false;
 bool _useGpu = false;
+bool _cpuOnly = false;
 
 static int _strideY = 0;
 static int _strideUV = 0;
@@ -411,11 +412,15 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	_loopFb.callLater([view]() { flatBufSendNv12(view.y, view.uv, view.strideY, view.strideUV, view.width, view.height); });
 }
 
-static void transformImgNv12Gpu(uint8_t *y, uint8_t *uv)
+static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY, int fdUV, int offUV)
 {
 #ifndef HAVE_GPU_TRANSFORM
 	(void)y;
 	(void)uv;
+	(void)fdY;
+	(void)offY;
+	(void)fdUV;
+	(void)offUV;
 	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
 	_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	return;
@@ -430,7 +435,12 @@ static void transformImgNv12Gpu(uint8_t *y, uint8_t *uv)
 	}
 
 	auto view = _nv12Out.next();
-	_gpuNv12->transform(y, uv, _strideY, _strideUV, view.y, view.uv);
+	bool ok = _gpuNv12->transformDmabuf(fdY, offY, _strideY, fdUV, offUV, _strideUV, view.y, view.uv);
+	if (!ok)
+	{
+		// Fallback to CPU upload path if DMA-BUF import isn't supported.
+		_gpuNv12->transform(y, uv, _strideY, _strideUV, view.y, view.uv);
+	}
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -491,6 +501,48 @@ static void transformImgRgbGpu(uint8_t *img)
 #endif
 }
 
+static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
+{
+#ifndef HAVE_GPU_TRANSFORM
+	(void)fd;
+	(void)offsetBytes;
+	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
+	_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	return;
+#else
+	const int64_t startNs = nowNs();
+
+	if (!_gpuRgb)
+	{
+		std::cout << "ERROR: GPU transform not initialized" << std::endl;
+		_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+		return;
+	}
+
+	auto view = _rgbOut.next();
+	GpuRgbTransform::InputFormat fmt = GpuRgbTransform::InputFormat::Packed3;
+	if (_bppBgr == 4)
+		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
+	_gpuRgb->transformDmabuf(fd, offsetBytes, _strideBgr, fmt, view.rgb);
+
+	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
+	{
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+
+	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
+	_loopFb.callLater([view]() { flatBufSend(view.rgb); });
+#endif
+}
+
 static void processRequest(Request *request);
 
 static void requestComplete(Request *request)
@@ -522,7 +574,19 @@ static void processRequest(Request *request)
 				uint8_t *y = it->second[0].data();
 				uint8_t *uv = it->second[1].data();
 				if (_useGpu)
-					_loopTr.callLater([y, uv]() { transformImgNv12Gpu(y, uv); });
+				{
+					// Always try DMA-BUF import on the GPU NV12 path (falls back internally if unsupported)
+					if (true)
+					{
+						const FrameBuffer::Plane &p0 = buffer->planes()[0];
+						const FrameBuffer::Plane &p1 = buffer->planes()[1];
+						int fdY = p0.fd.get();
+						int fdUV = p1.fd.get();
+						int offY = static_cast<int>(p0.offset);
+						int offUV = static_cast<int>(p1.offset);
+						_loopTr.callLater([y, uv, fdY, offY, fdUV, offUV]() { transformImgNv12GpuDmabuf(y, uv, fdY, offY, fdUV, offUV); });
+					}
+				}
 				else
 					_loopTr.callLater([y, uv]() { transformImgNv12(y, uv); });
 			}
@@ -530,7 +594,20 @@ static void processRequest(Request *request)
 			{
 				uint8_t *img = it->second[0].data();
 				if (_useGpu)
-					_loopTr.callLater([img]() { transformImgRgbGpu(img); });
+				{
+					// Always try DMA-BUF import on the GPU RGB path when the camera format is 4 Bpp.
+					if (_bppBgr == 4)
+					{
+						const FrameBuffer::Plane &p0 = buffer->planes()[0];
+						int fd = p0.fd.get();
+						int off = static_cast<int>(p0.offset);
+						_loopTr.callLater([fd, off]() { transformImgRgbGpuDmabuf(fd, off); });
+					}
+					else
+					{
+						_loopTr.callLater([img]() { transformImgRgbGpu(img); });
+					}
+				}
 				else
 					_loopTr.callLater([img]() { transformImg(img); });
 			}
@@ -574,7 +651,7 @@ int main(int argc, char *argv[])
 		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")										   //
 		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")		   //
 		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")			   //
-		("gpu", po::bool_switch(&_useGpu)->default_value(false), "Use GPU for transform (requires --transform)")			   //
+		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")		   //
 		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")										   //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
@@ -604,18 +681,15 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (_useGpu)
-	{
-		if (!_transformEn)
-		{
-			std::cout << "ERROR: --gpu requires --transform" << std::endl;
-			return EXIT_FAILURE;
-		}
-#ifndef HAVE_GPU_TRANSFORM
-		std::cout << "ERROR: --gpu requested but GPU transform support was not compiled in" << std::endl;
-		return EXIT_FAILURE;
+	// GPU transform is the default when compiled in and --transform is used.
+	// Use --cpuonly to force the CPU path.
+#ifdef HAVE_GPU_TRANSFORM
+	_useGpu = (_transformEn && !_cpuOnly);
+#else
+	_useGpu = false;
+	if (_transformEn && !_cpuOnly && _verbose)
+		std::cout << "INFO: GPU transform support was not compiled in; using CPU transform" << std::endl;
 #endif
-	}
 
 	if (sscanf(_wbgainsStr.c_str(), "%f,%f", &_rGain, &_bGain) != 2)
 	{
@@ -678,46 +752,35 @@ int main(int argc, char *argv[])
 		_swapRb4 = false;
 		if (_useGpu)
 		{
-			// Empirically on some Pi/Mesa stacks, BGR888 + NEON pack is faster than
-			// pulling 4 Bpp from the camera. Allow opting into 4 Bpp via env var.
-			const bool prefer4bpp = envEnabled("HYPERCAM_GPU_PREFER_4BPP");
-			if (!prefer4bpp)
+			// In GPU mode, prefer 4 bytes/pixel formats to enable DMA-BUF import (zero-copy upload).
+			bool hasXbgr = false;
+			bool hasXrgb = false;
+			std::vector<PixelFormat> fmts = streamConfig.formats().pixelformats();
+			for (const PixelFormat &f : fmts)
+			{
+				if (f == libcamera::formats::XBGR8888)
+					hasXbgr = true;
+				else if (f == libcamera::formats::XRGB8888)
+					hasXrgb = true;
+			}
+
+			if (hasXbgr)
+			{
+				streamConfig.pixelFormat = libcamera::formats::XBGR8888;
+				_bppBgr = 4;
+				_swapRb4 = false;
+			}
+			else if (hasXrgb)
+			{
+				streamConfig.pixelFormat = libcamera::formats::XRGB8888;
+				_bppBgr = 4;
+				_swapRb4 = true;
+			}
+			else
 			{
 				streamConfig.pixelFormat = libcamera::formats::BGR888;
 				_bppBgr = 3;
 				_swapRb4 = false;
-			}
-			else
-			{
-				bool hasXbgr = false;
-				bool hasXrgb = false;
-				std::vector<PixelFormat> fmts = streamConfig.formats().pixelformats();
-				for (const PixelFormat &f : fmts)
-				{
-					if (f == libcamera::formats::XBGR8888)
-						hasXbgr = true;
-					else if (f == libcamera::formats::XRGB8888)
-						hasXrgb = true;
-				}
-
-				if (hasXbgr)
-				{
-					streamConfig.pixelFormat = libcamera::formats::XBGR8888;
-					_bppBgr = 4;
-					_swapRb4 = false;
-				}
-				else if (hasXrgb)
-				{
-					streamConfig.pixelFormat = libcamera::formats::XRGB8888;
-					_bppBgr = 4;
-					_swapRb4 = true;
-				}
-				else
-				{
-					streamConfig.pixelFormat = libcamera::formats::BGR888;
-					_bppBgr = 3;
-					_swapRb4 = false;
-				}
 			}
 		}
 		else

@@ -29,6 +29,17 @@ public:
 			   uint8_t *outY,
 			   uint8_t *outUV);
 
+	// DMA-BUF import path: avoids CPU upload by importing the input planes via EGLImage.
+	// Returns false if DMA-BUF import isn't available/enabled (caller may fall back to transform()).
+	bool transformDmabuf(int fdY,
+				 int offsetYBytes,
+				 int strideY,
+				 int fdUV,
+				 int offsetUVBytes,
+				 int strideUV,
+				 uint8_t *outY,
+				 uint8_t *outUV);
+
 private:
 	struct Impl;
 	Impl *_impl;

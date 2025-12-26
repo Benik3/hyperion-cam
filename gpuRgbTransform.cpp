@@ -8,12 +8,14 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 
 #include <array>
 #include <cstring>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 
@@ -23,6 +25,17 @@
 
 namespace
 {
+static constexpr uint32_t fourcc_code(char a, char b, char c, char d)
+{
+	return (static_cast<uint32_t>(a)) |
+		(static_cast<uint32_t>(b) << 8) |
+		(static_cast<uint32_t>(c) << 16) |
+		(static_cast<uint32_t>(d) << 24);
+}
+
+static constexpr uint32_t DRM_FORMAT_XRGB8888 = fourcc_code('X', 'R', '2', '4');
+static constexpr uint32_t DRM_FORMAT_XBGR8888 = fourcc_code('X', 'B', '2', '4');
+
 static inline uint64_t monoNs()
 {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -181,6 +194,15 @@ struct GpuRgbTransform::Impl
 	GLsync texFence[2]{0, 0};
 	int activeTex{0};
 	std::size_t uploadBytes{0};
+
+	bool dmabufEnabled{false};
+	bool dmabufSupported{false};
+	PFNEGLCREATEIMAGEKHRPROC p_eglCreateImageKHR{nullptr};
+	PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR{nullptr};
+	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_glEGLImageTargetTexture2DOES{nullptr};
+	std::unordered_map<int, EGLImageKHR> dmabufImages;
+	bool dmabufWarnedOnce{false};
+
 	GLuint texOut{0};
 	GLuint rboOut{0};
 	GLuint fbo{0};
@@ -216,6 +238,7 @@ struct GpuRgbTransform::Impl
 		profile = envEnabled("HYPERCAM_GL_PROFILE");
 		profileSync = envEnabled("HYPERCAM_GL_PROFILE_SYNC");
 		useRgb565 = envEnabled("HYPERCAM_GL_RGB565");
+		dmabufEnabled = true;
 		lastPrintNs = monoNs();
 
 		dpy = getEglDisplayHeadless();
@@ -257,6 +280,19 @@ struct GpuRgbTransform::Impl
 			throw std::runtime_error("eglCreateContext failed");
 		if (!eglMakeCurrent(dpy, surf, surf, ctx))
 			throw std::runtime_error("eglMakeCurrent failed");
+
+		{
+			const char *eglExt = eglQueryString(dpy, EGL_EXTENSIONS);
+			const char *glExt = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+			bool haveEgl = (eglExt && std::string(eglExt).find("EGL_EXT_image_dma_buf_import") != std::string::npos);
+			bool haveGl = (glExt && std::string(glExt).find("GL_OES_EGL_image") != std::string::npos);
+			p_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+			p_eglDestroyImageKHR = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+			p_glEGLImageTargetTexture2DOES = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+			dmabufSupported = haveEgl && haveGl && p_eglCreateImageKHR && p_eglDestroyImageKHR && p_glEGLImageTargetTexture2DOES;
+			if (!dmabufSupported)
+				std::cerr << "[gpuRgb] INFO: DMA-BUF import unavailable; using CPU upload" << std::endl;
+		}
 
 		glPixelStorei(GL_PACK_ALIGNMENT, 1);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -385,6 +421,16 @@ void main(){
 
 	~Impl()
 	{
+		if (dmabufSupported && p_eglDestroyImageKHR)
+		{
+			for (auto &kv : dmabufImages)
+			{
+				if (kv.second != EGL_NO_IMAGE_KHR)
+					p_eglDestroyImageKHR(dpy, kv.second);
+			}
+			dmabufImages.clear();
+		}
+
 		if (dpy != EGL_NO_DISPLAY)
 		{
 			eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -436,6 +482,89 @@ void main(){
 			return true;
 		EGLint r = glClientWaitSync(s, 0, 0);
 		return (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED);
+	}
+
+	EGLImageKHR getDmabufImage(int fd, int offsetBytes, int strideBytes, uint32_t fourcc)
+	{
+		auto it = dmabufImages.find(fd);
+		if (it != dmabufImages.end())
+			return it->second;
+
+		if (!dmabufSupported || !p_eglCreateImageKHR)
+			return EGL_NO_IMAGE_KHR;
+
+		EGLint attrs[] = {
+			EGL_WIDTH, srcW,
+			EGL_HEIGHT, srcH,
+			EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLint>(fourcc),
+			EGL_DMA_BUF_PLANE0_FD_EXT, static_cast<EGLint>(fd),
+			EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(offsetBytes),
+			EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(strideBytes),
+			EGL_NONE};
+
+		EGLImageKHR img = p_eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
+		if (img == EGL_NO_IMAGE_KHR)
+		{
+			if (!dmabufWarnedOnce)
+			{
+				dmabufWarnedOnce = true;
+				std::cerr << "[gpuRgb] WARN: eglCreateImageKHR(dma-buf) failed; falling back to CPU upload" << std::endl;
+			}
+			dmabufImages.emplace(fd, EGL_NO_IMAGE_KHR);
+			return EGL_NO_IMAGE_KHR;
+		}
+
+		dmabufImages.emplace(fd, img);
+		return img;
+	}
+
+	void uploadDmabuf(int fd, int offsetBytes, int strideBytes, GpuRgbTransform::InputFormat fmt)
+	{
+		uint64_t t0 = 0;
+		if (profile)
+			t0 = monoNs();
+
+		if (!dmabufEnabled || !dmabufSupported)
+		{
+			if (profile)
+				accUploadNs += (monoNs() - t0);
+			return;
+		}
+		if (fmt != GpuRgbTransform::InputFormat::Xbgr8888 && fmt != GpuRgbTransform::InputFormat::Xrgb8888)
+		{
+			if (profile)
+				accUploadNs += (monoNs() - t0);
+			return;
+		}
+
+		const int candidate = activeTex ^ 1;
+		if (!fenceReady(texFence[candidate]))
+		{
+			if (profile)
+				accUploadNs += (monoNs() - t0);
+			return;
+		}
+		if (texFence[candidate])
+		{
+			glDeleteSync(texFence[candidate]);
+			texFence[candidate] = 0;
+		}
+
+		uint32_t fourcc = (fmt == GpuRgbTransform::InputFormat::Xrgb8888) ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_XBGR8888;
+		EGLImageKHR img = getDmabufImage(fd, offsetBytes, strideBytes, fourcc);
+		if (img == EGL_NO_IMAGE_KHR)
+		{
+			if (profile)
+				accUploadNs += (monoNs() - t0);
+			return;
+		}
+
+		glBindTexture(GL_TEXTURE_2D, texIn[candidate]);
+		p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, reinterpret_cast<GLeglImageOES>(img));
+		activeTex = candidate;
+
+		if (profile)
+			accUploadNs += (monoNs() - t0);
 	}
 
 	void upload(const uint8_t *inRgb, int strideBytes)
@@ -824,6 +953,17 @@ void GpuRgbTransform::transform(const uint8_t *inPixels, int strideBytes, InputF
 	if (_impl->profile)
 		t0 = monoNs();
 	_impl->upload(inPixels, strideBytes, fmt);
+	_impl->render(outRgb);
+	if (_impl->profile)
+		_impl->accXformTotalNs += (monoNs() - t0);
+}
+
+void GpuRgbTransform::transformDmabuf(int fd, int offsetBytes, int strideBytes, InputFormat fmt, uint8_t *outRgb)
+{
+	uint64_t t0 = 0;
+	if (_impl->profile)
+		t0 = monoNs();
+	_impl->uploadDmabuf(fd, offsetBytes, strideBytes, fmt);
 	_impl->render(outRgb);
 	if (_impl->profile)
 		_impl->accXformTotalNs += (monoNs() - t0);
