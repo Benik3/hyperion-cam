@@ -305,7 +305,8 @@ bool FlatBufferConnection::parseReply(const hyperhdrnet::Reply *reply)
 		// We got a registered reply.
 		if (registered == _priority)
 		{
-			std::cout << "Client registered succesfully" << std::endl;
+			if (!_registered)
+				std::cout << "Client registered succesfully" << std::endl;
 			_registered = true;
 		}
 
