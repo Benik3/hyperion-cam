@@ -29,6 +29,12 @@ int EventLoop::exec()
 	while (!exit_.load(std::memory_order_acquire))
 	{
 		dispatchCalls();
+		// exit() may be called from a callLater() callback executed by dispatchCalls().
+		// In that case, event_base_loopbreak() can be issued before event_base_loop()
+		// starts, and the subsequent event_base_loop(EVLOOP_NO_EXIT_ON_EMPTY) may block.
+		// Re-check exit_ here to guarantee timely shutdown.
+		if (exit_.load(std::memory_order_acquire))
+			break;
 		event_base_loop(event_, EVLOOP_NO_EXIT_ON_EMPTY);
 	}
 

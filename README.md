@@ -4,7 +4,12 @@ Simple camera grabber for Hyperion using Libcamera, OpenCV and flatbuffer.
 ## How it works
 The app makes one stream from camera in full manual mode. There is no preview or any other output then to flatbuffer.  
 Received frames can be transformed using OpenCv to correct picture deformation.  
-Resulted frames are sent through flatbuffer connection to hyperion.
+Resulted frames are sent through flatbuffer connection to Hyperion/HyperHDR.
+
+The grabber supports:
+- RGB/BGR output (default)
+- NV12 output via `--nv12`
+- Optional GPU-accelerated transform (if compiled with EGL/GLES)
 
 ## How to use
 By simply running without any options starts the app with these settings:  
@@ -25,8 +30,23 @@ Settings can be adjusted by using command line options:
   -r [ --priority ] arg (=120)         Hyperion priority  
   -t [ --transform ] arg               Picture transformation in format   
                                        x1,y1:x2,y2:x3,y3:x4,y4  
+  --imgout arg                         Capture one image (RGB) to file (png/bmp/...) and exit
+  --nv12                               Enable NV12 format output (default is BGR888)
+  --cpuonly                            Force CPU transform even if GPU is available
   -v [ --verbose ]                     Verbose output  
   --help                               Print help  
+```
+
+### One-shot image capture (`--imgout`)
+Use `--imgout /path/file.png` to capture exactly one frame, save it, and exit.
+- If `--transform` is provided, the saved image is the transformed output.
+- `--imgout` always saves RGB/BGR images (there is no common still-image container for NV12). If `--nv12` is set, it is ignored.
+
+Examples:
+```
+./hyperion-cam --imgout /tmp/frame.png
+./hyperion-cam --transform "0,0:640,0:0,480:640,480" --imgout /tmp/frame.png
+./hyperion-cam --cpuonly --transform "..." --imgout /tmp/frame.png
 ```
 
 #### Shutter note:
@@ -39,6 +59,19 @@ I don't recommend to use the TCP connection over a network as you will probably 
 #### Picture transformation note:
 The app allows to make Perspective (projective) transformation of the picture in real time using OpenCV. Of course, it adds a little lag, but it's numbers of milliseconds.  
 The transformation is described by 4 points in the original picture. The result is cropped and transformed so the 4 points make new corners of image.
+
+### GPU transform (optional)
+If built with EGL + OpenGL ES support, GPU transform is used by default whenever `--transform` is provided.
+Use `--cpuonly` to force CPU transforms.
+
+### Performance / profiling knobs
+These are optional environment variables used mainly for profiling and tuning:
+- `HYPERCAM_CPU_PROFILE=1`: print average CPU transform time (RGB/NV12)
+- `HYPERCAM_GL_PROFILE=1`: print average GPU stage timings
+- `HYPERCAM_GL_PROFILE_SYNC=1`: GPU profiling with extra sync (more accurate, slower)
+- `HYPERCAM_NV12_PBO=1`: NV12 readback pipeline using PBO+fences (can change latency/jitter)
+
+GPU paths attempt DMA-BUF import automatically (zero-copy upload when supported) and fall back to CPU upload if not available.
 
 ## Credits
 The camera part is based on [simple-cam](https://git.libcamera.org/libcamera/simple-cam.git) example from libcamera  

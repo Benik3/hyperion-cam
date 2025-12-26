@@ -11,6 +11,7 @@
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
 #include <opencv2/core/types.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "event_loop.h"
@@ -133,9 +134,12 @@ std::string _conn;
 int _port;
 int _priority;
 std::string _transformStr;
+std::string _imgOutPath;
 bool _transformEn = false;
 bool _verbose = false;
 bool _help = false;
+
+static std::atomic<bool> _imgOutDone{false};
 
 static bool envEnabled(const char *name)
 {
@@ -188,6 +192,132 @@ static CpuProfileState _cpuNv12Prof{envEnabled("HYPERCAM_CPU_PROFILE")};
 
 static std::atomic<int> _pendingProcess{0};
 static std::atomic<int> _pendingSend{0};
+
+static inline void imgOutExit(int code)
+{
+	_loop.exit(code);
+	_loopFb.exit(code);
+	_loopTr.exit(code);
+}
+
+static bool imgOutWriteBgr(const uint8_t *bgr, int width, int height, int strideBytes)
+{
+	try
+	{
+		cv::Mat bgrMat(height, width, CV_8UC3, const_cast<uint8_t *>(bgr), static_cast<size_t>(strideBytes));
+		return cv::imwrite(_imgOutPath, bgrMat);
+	}
+	catch (const cv::Exception &e)
+	{
+		std::cout << "ERROR: Failed to write image: " << e.what() << std::endl;
+		return false;
+	}
+}
+
+static void imgOutSaveRaw(uint8_t *img)
+{
+	bool ok = false;
+	if (_bppBgr == 3)
+	{
+		// libcamera's 3-byte formats on some pipelines end up in RGB byte order.
+		// OpenCV expects BGR when encoding files, so convert to ensure correct colors.
+		cv::Mat in3(_imgHeightToSend, _imgWidthToSend, CV_8UC3, img, static_cast<size_t>(_strideBgr));
+		cv::Mat bgr;
+		cv::cvtColor(in3, bgr, cv::COLOR_RGB2BGR);
+		ok = cv::imwrite(_imgOutPath, bgr);
+	}
+	else if (_bppBgr == 4)
+	{
+		cv::Mat in4(_imgHeightToSend, _imgWidthToSend, CV_8UC4, img, static_cast<size_t>(_strideBgr));
+		cv::Mat bgr;
+		// XBGR8888 is RGBX in memory; XRGB8888 is BGRX in memory.
+		int code = _swapRb4 ? cv::COLOR_BGRA2BGR : cv::COLOR_RGBA2BGR;
+		cv::cvtColor(in4, bgr, code);
+		ok = cv::imwrite(_imgOutPath, bgr);
+	}
+	else
+	{
+		std::cout << "ERROR: Unsupported pixel format for --imgout" << std::endl;
+		ok = false;
+	}
+
+	if (!ok)
+	{
+		std::cout << "ERROR: Failed to write image to: " << _imgOutPath << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		return;
+	}
+
+	if (_verbose)
+		std::cout << "Saved image to: " << _imgOutPath << std::endl;
+	imgOutExit(EXIT_SUCCESS);
+}
+
+static void imgOutSaveTransformedCpu(uint8_t *img)
+{
+	if (!_transformation)
+	{
+		std::cout << "ERROR: Transform not initialized" << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		return;
+	}
+
+	std::vector<uint8_t> out(static_cast<std::size_t>(_imgWidthToSend) * static_cast<std::size_t>(_imgHeightToSend) * 3u);
+	_transformation->transformInto(img, _strideBgr, out.data(), _imgWidthToSend * 3);
+	bool ok = imgOutWriteBgr(out.data(), _imgWidthToSend, _imgHeightToSend, _imgWidthToSend * 3);
+	if (!ok)
+	{
+		std::cout << "ERROR: Failed to write image to: " << _imgOutPath << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		return;
+	}
+	if (_verbose)
+		std::cout << "Saved image to: " << _imgOutPath << std::endl;
+	imgOutExit(EXIT_SUCCESS);
+}
+
+static void imgOutSaveTransformedGpu(uint8_t *img, int fd, int off)
+{
+#ifndef HAVE_GPU_TRANSFORM
+	(void)img;
+	(void)fd;
+	(void)off;
+	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
+	imgOutExit(EXIT_FAILURE);
+	return;
+#else
+	if (!_gpuRgb)
+	{
+		std::cout << "ERROR: GPU transform not initialized" << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		return;
+	}
+
+	std::vector<uint8_t> rgb(static_cast<std::size_t>(_imgWidthToSend) * static_cast<std::size_t>(_imgHeightToSend) * 3u);
+	GpuRgbTransform::InputFormat fmt = GpuRgbTransform::InputFormat::Packed3;
+	if (_bppBgr == 4)
+		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
+
+	if (_bppBgr == 4)
+		_gpuRgb->transformDmabuf(fd, off, _strideBgr, fmt, rgb.data());
+	else
+		_gpuRgb->transform(img, _strideBgr, fmt, rgb.data());
+
+	cv::Mat rgbMat(_imgHeightToSend, _imgWidthToSend, CV_8UC3, rgb.data());
+	cv::Mat bgr;
+	cv::cvtColor(rgbMat, bgr, cv::COLOR_RGB2BGR);
+	bool ok = cv::imwrite(_imgOutPath, bgr);
+	if (!ok)
+	{
+		std::cout << "ERROR: Failed to write image to: " << _imgOutPath << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		return;
+	}
+	if (_verbose)
+		std::cout << "Saved image to: " << _imgOutPath << std::endl;
+	imgOutExit(EXIT_SUCCESS);
+#endif
+}
 
 void *flatLoop(void *arg)
 {
@@ -654,6 +784,40 @@ static void processRequest(Request *request)
 		if (it == _mappedBuffers.end() || it->second.empty())
 			continue;
 
+		if (!_imgOutPath.empty())
+		{
+			if (_imgOutDone.exchange(true))
+				return;
+
+			uint8_t *img = it->second[0].data();
+			if (_transformEn)
+			{
+				if (_useGpu)
+				{
+					int fd = -1;
+					int off = 0;
+					if (_bppBgr == 4)
+					{
+						const FrameBuffer::Plane &p0 = buffer->planes()[0];
+						fd = p0.fd.get();
+						off = static_cast<int>(p0.offset);
+					}
+					_loopTr.callLater([img, fd, off]() { imgOutSaveTransformedGpu(img, fd, off); });
+				}
+				else
+				{
+					_loopTr.callLater([img]() { imgOutSaveTransformedCpu(img); });
+				}
+			}
+			else
+			{
+				imgOutSaveRaw(img);
+			}
+
+			// Don't reuse/requeue: we are exiting.
+			return;
+		}
+
 		if (_transformEn)
 		{
 			_pendingProcess.fetch_add(1, std::memory_order_acq_rel);
@@ -744,6 +908,7 @@ int main(int argc, char *argv[])
 		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")			   //
 		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")		   //
 		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")										   //
+		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")			   //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
 
@@ -770,6 +935,14 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: Invalid value for transformation" << std::endl;
 			return EXIT_FAILURE;
 		}
+	}
+
+	if (!_imgOutPath.empty())
+	{
+		// Still image output uses RGB/BGR only.
+		if (_useNv12 && _verbose)
+			std::cout << "INFO: --imgout forces RGB output; ignoring --nv12" << std::endl;
+		_useNv12 = false;
 	}
 
 	// GPU transform is the default when compiled in and --transform is used.
@@ -1043,8 +1216,11 @@ int main(int argc, char *argv[])
 		_camera->queueRequest(request.get());
 
 	// Run thread for flatbuffer
-	pthread_t ptidFb;
-	pthread_create(&ptidFb, NULL, &flatLoop, NULL);
+	if (_imgOutPath.empty())
+	{
+		pthread_t ptidFb;
+		pthread_create(&ptidFb, NULL, &flatLoop, NULL);
+	}
 
 	// Run thread for opencv transformation
 	if (_transformEn)
