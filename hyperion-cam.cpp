@@ -7,6 +7,7 @@
 #include <ctime>
 #include <cstring>
 #include <cstdlib>
+#include <memory>
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
 #include <opencv2/core/types.hpp>
@@ -14,6 +15,7 @@
 
 #include "event_loop.h"
 #include "FlatBufferConnection.h"
+#include "hyperhdr_request_generated.h"
 #include "opencvTransform.h"
 
 #ifdef HAVE_GPU_TRANSFORM
@@ -246,6 +248,64 @@ static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, in
 		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
 	}
 }
+
+static void flatBufSendRequest(flatbuffers::DetachedBuffer &&req)
+{
+	const int64_t startNs = nowNs();
+	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+	{
+		if (_flatbuf.sendPrebuiltRequest(req.data(), static_cast<uint32_t>(req.size())) < 0)
+		{
+			std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
+		}
+	}
+	else
+		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+
+	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
+	{
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+}
+
+static flatbuffers::DetachedBuffer buildRawImageRequestUninitialized(uint16_t width, uint16_t height, uint8_t **outRgb)
+{
+	const size_t imgBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+	flatbuffers::FlatBufferBuilder builder(imgBytes + 1024u);
+
+	auto imgVec = builder.CreateUninitializedVector(imgBytes, outRgb);
+	auto rawImg = hyperhdrnet::CreateRawImage(builder, imgVec, width, height);
+	auto imageReq = hyperhdrnet::CreateImage(builder, hyperhdrnet::ImageType_RawImage, rawImg.Union(), -1);
+	auto req = hyperhdrnet::CreateRequest(builder, hyperhdrnet::Command_Image, imageReq.Union());
+	builder.Finish(req);
+
+	return builder.Release();
+}
+
+static flatbuffers::DetachedBuffer buildNV12ImageRequestUninitialized(uint16_t width, uint16_t height, uint16_t strideY, uint16_t strideUV,
+										  uint8_t **outY, uint8_t **outUV)
+{
+	const size_t yBytes = static_cast<size_t>(strideY) * static_cast<size_t>(height);
+	const size_t uvBytes = static_cast<size_t>(strideUV) * (static_cast<size_t>(height) / 2u);
+	flatbuffers::FlatBufferBuilder builder(yBytes + uvBytes + 1024u);
+
+	auto yVec = builder.CreateUninitializedVector(yBytes, outY);
+	auto uvVec = builder.CreateUninitializedVector(uvBytes, outUV);
+	auto nv12Img = hyperhdrnet::CreateNV12Image(builder, yVec, uvVec, width, height, strideY, strideUV);
+	auto imageReq = hyperhdrnet::CreateImage(builder, hyperhdrnet::ImageType_NV12Image, nv12Img.Union(), -1);
+	auto req = hyperhdrnet::CreateRequest(builder, hyperhdrnet::Command_Image, imageReq.Union());
+	builder.Finish(req);
+
+	return builder.Release();
+}
 void *transformLoop(void *arg)
 {
 	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend, _useNv12);
@@ -267,7 +327,11 @@ void *transformLoop(void *arg)
 static void transformImg(uint8_t *img)
 {
 	const int64_t startNs = nowNs();
-	uint8_t *imgToSend = _transformation->transform(img);
+	uint8_t *outRgb = nullptr;
+	const uint16_t outW = static_cast<uint16_t>(_imgWidthToSend);
+	const uint16_t outH = static_cast<uint16_t>(_imgHeightToSend);
+	auto req = buildRawImageRequestUninitialized(outW, outH, &outRgb);
+	_transformation->transformInto(img, _strideBgr, outRgb, static_cast<int>(outW) * 3);
 	cpuProfileTick(_cpuRgbProf, "[cpuRgb]", static_cast<uint64_t>(nowNs() - startNs));
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -284,7 +348,8 @@ static void transformImg(uint8_t *img)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([imgToSend]() { flatBufSend(imgToSend); });
+	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
+	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
 }
 
 static void transformImgNv12(uint8_t *y, uint8_t *uv)
@@ -387,9 +452,16 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	cv::Mat yIn(_imgHeight, _imgWidth, CV_8UC1, y, _strideY);
 	cv::Mat uvIn(_imgHeight / 2, _imgWidth / 2, CV_8UC2, uv, _strideUV);
 
-	auto view = _nv12Out.next();
-	cv::Mat yOut(_imgHeightToSend, _imgWidthToSend, CV_8UC1, view.y, view.strideY);
-	cv::Mat uvOut(_imgHeightToSend / 2, _imgWidthToSend / 2, CV_8UC2, view.uv, view.strideUV);
+	uint8_t *outY = nullptr;
+	uint8_t *outUV = nullptr;
+	const uint16_t outW = static_cast<uint16_t>(_imgWidthToSend);
+	const uint16_t outH = static_cast<uint16_t>(_imgHeightToSend);
+	const uint16_t outStrideY = outW;
+	const uint16_t outStrideUV = outW;
+	auto req = buildNV12ImageRequestUninitialized(outW, outH, outStrideY, outStrideUV, &outY, &outUV);
+
+	cv::Mat yOut(_imgHeightToSend, _imgWidthToSend, CV_8UC1, outY, outStrideY);
+	cv::Mat uvOut(_imgHeightToSend / 2, _imgWidthToSend / 2, CV_8UC2, outUV, outStrideUV);
 
 	cv::remap(yIn, yOut, mapYx, mapYy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
 	cv::remap(uvIn, uvOut, mapUVx, mapUVy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
@@ -409,7 +481,8 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([view]() { flatBufSendNv12(view.y, view.uv, view.strideY, view.strideUV, view.width, view.height); });
+	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
+	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
 }
 
 static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY, int fdUV, int offUV)
@@ -434,12 +507,19 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 		return;
 	}
 
-	auto view = _nv12Out.next();
-	bool ok = _gpuNv12->transformDmabuf(fdY, offY, _strideY, fdUV, offUV, _strideUV, view.y, view.uv);
+	uint8_t *outY = nullptr;
+	uint8_t *outUV = nullptr;
+	const uint16_t outW = static_cast<uint16_t>(_imgWidthToSend);
+	const uint16_t outH = static_cast<uint16_t>(_imgHeightToSend);
+	const uint16_t outStrideY = outW;
+	const uint16_t outStrideUV = outW;
+	auto req = buildNV12ImageRequestUninitialized(outW, outH, outStrideY, outStrideUV, &outY, &outUV);
+
+	bool ok = _gpuNv12->transformDmabuf(fdY, offY, _strideY, fdUV, offUV, _strideUV, outY, outUV);
 	if (!ok)
 	{
 		// Fallback to CPU upload path if DMA-BUF import isn't supported.
-		_gpuNv12->transform(y, uv, _strideY, _strideUV, view.y, view.uv);
+		_gpuNv12->transform(y, uv, _strideY, _strideUV, outY, outUV);
 	}
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -456,7 +536,8 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([view]() { flatBufSendNv12(view.y, view.uv, view.strideY, view.strideUV, view.width, view.height); });
+	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
+	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
 #endif
 }
 
@@ -477,11 +558,15 @@ static void transformImgRgbGpu(uint8_t *img)
 		return;
 	}
 
-	auto view = _rgbOut.next();
+	uint8_t *outRgb = nullptr;
+	const uint16_t outW = static_cast<uint16_t>(_imgWidthToSend);
+	const uint16_t outH = static_cast<uint16_t>(_imgHeightToSend);
+	auto req = buildRawImageRequestUninitialized(outW, outH, &outRgb);
+
 	GpuRgbTransform::InputFormat fmt = GpuRgbTransform::InputFormat::Packed3;
 	if (_bppBgr == 4)
 		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
-	_gpuRgb->transform(img, _strideBgr, fmt, view.rgb);
+	_gpuRgb->transform(img, _strideBgr, fmt, outRgb);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -497,7 +582,8 @@ static void transformImgRgbGpu(uint8_t *img)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([view]() { flatBufSend(view.rgb); });
+	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
+	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
 #endif
 }
 
@@ -519,11 +605,15 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
 		return;
 	}
 
-	auto view = _rgbOut.next();
+	uint8_t *outRgb = nullptr;
+	const uint16_t outW = static_cast<uint16_t>(_imgWidthToSend);
+	const uint16_t outH = static_cast<uint16_t>(_imgHeightToSend);
+	auto req = buildRawImageRequestUninitialized(outW, outH, &outRgb);
+
 	GpuRgbTransform::InputFormat fmt = GpuRgbTransform::InputFormat::Packed3;
 	if (_bppBgr == 4)
 		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
-	_gpuRgb->transformDmabuf(fd, offsetBytes, _strideBgr, fmt, view.rgb);
+	_gpuRgb->transformDmabuf(fd, offsetBytes, _strideBgr, fmt, outRgb);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -539,7 +629,8 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([view]() { flatBufSend(view.rgb); });
+	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
+	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
 #endif
 }
 

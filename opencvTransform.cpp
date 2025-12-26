@@ -71,10 +71,29 @@ OpencvTransform::OpencvTransform(int width, int height, cv::Point2f *points, int
 
 uint8_t *OpencvTransform::transform(uint8_t *img)
 {
+    return transform(img, _srcWidth * 3);
+}
+
+uint8_t *OpencvTransform::transform(uint8_t *img, int srcStrideBytes)
+{
     std::size_t idx = _dstIndex++ % _dstBuffers.size();
-    cv::Mat src(_srcHeight, _srcWidth, CV_8UC3, img);
+    if (srcStrideBytes <= 0)
+        srcStrideBytes = _srcWidth * 3;
+    cv::Mat src(_srcHeight, _srcWidth, CV_8UC3, img, static_cast<size_t>(srcStrideBytes));
     cv::remap(src, _dstBuffers[idx], _mapX, _mapY, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
     return _dstBuffers[idx].data;
+}
+
+void OpencvTransform::transformInto(const uint8_t *img, int srcStrideBytes, uint8_t *dst, int dstStrideBytes)
+{
+    if (srcStrideBytes <= 0)
+        srcStrideBytes = _srcWidth * 3;
+    if (dstStrideBytes <= 0)
+        dstStrideBytes = _dstBuffers[0].cols * 3;
+
+    cv::Mat src(_srcHeight, _srcWidth, CV_8UC3, const_cast<uint8_t *>(img), static_cast<size_t>(srcStrideBytes));
+    cv::Mat dstMat(_dstBuffers[0].rows, _dstBuffers[0].cols, CV_8UC3, dst, static_cast<size_t>(dstStrideBytes));
+    cv::remap(src, dstMat, _mapX, _mapY, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
 }
 
 OpencvTransform::~OpencvTransform()

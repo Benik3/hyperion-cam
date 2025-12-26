@@ -15,6 +15,8 @@ public:
 	~OpencvTransform();
 
 	uint8_t *transform(uint8_t *img);
+	uint8_t *transform(uint8_t *img, int srcStrideBytes);
+	void transformInto(const uint8_t *img, int srcStrideBytes, uint8_t *dst, int dstStrideBytes);
 
 private:
 	cv::Point2f *_srcQuad;

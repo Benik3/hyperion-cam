@@ -257,6 +257,21 @@ int FlatBufferConnection::setNV12Image(const uint8_t *yPlane, const uint8_t *uvP
 	return ret;
 }
 
+int FlatBufferConnection::sendPrebuiltRequest(const uint8_t *buffer, uint32_t size)
+{
+	if (!_registered)
+	{
+		if (setRegister(_origin, _priority) == -1)
+			return -1;
+	}
+
+	int ret = sendMessage(buffer, size);
+	if (ret != -1 && !_skipReply)
+		readData();
+
+	return ret;
+}
+
 int FlatBufferConnection::sendMessage(const uint8_t *buffer, uint32_t size)
 {
 	if (!_sockfd)

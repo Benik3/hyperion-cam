@@ -60,6 +60,15 @@ public:
 	/// Safe to call multiple times; it only grows the internal buffer.
 	void reserveBuilderBytes(size_t bytes);
 
+	/// @brief Send a prebuilt FlatBuffers Request message.
+	///
+	/// This avoids copying image payloads into FlatBufferConnection's internal
+	/// FlatBufferBuilder. The buffer must contain a complete HyperHDR Request
+	/// flatbuffer (without the 4-byte length prefix).
+	///
+	/// @return 0 = OK, -1 = failed
+	int sendPrebuiltRequest(const uint8_t *buffer, uint32_t size);
+
 private:
 	/// @brief Send data through socket
 	/// @param buffer
