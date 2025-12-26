@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <ctime>
 #include <cstring>
+#include <cstdlib>
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
 #include <opencv2/core/types.hpp>
@@ -15,14 +16,23 @@
 #include "FlatBufferConnection.h"
 #include "opencvTransform.h"
 
+#ifdef HAVE_GPU_TRANSFORM
+#include "gpuNv12Transform.h"
+#include "gpuRgbTransform.h"
+#endif
+
 using namespace libcamera;
 namespace po = boost::program_options;
 
 static std::shared_ptr<Camera> _camera;
 bool _useNv12 = false;
+bool _useGpu = false;
 
 static int _strideY = 0;
 static int _strideUV = 0;
+static int _strideBgr = 0;
+static int _bppBgr = 3;
+static bool _swapRb4 = false;
 
 struct Nv12RingBuffer
 {
@@ -60,12 +70,48 @@ struct Nv12RingBuffer
 
 static Nv12RingBuffer _nv12Out;
 
+struct RgbRingBuffer
+{
+	std::vector<std::vector<uint8_t>> rgb;
+	std::size_t index{0};
+	int width{0};
+	int height{0};
+
+	void reset(int w, int h, std::size_t ringSize = 3)
+	{
+		width = w;
+		height = h;
+		index = 0;
+		rgb.assign(ringSize, std::vector<uint8_t>(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u));
+	}
+
+	struct View
+	{
+		uint8_t *rgb;
+		int width;
+		int height;
+	};
+
+	View next()
+	{
+		std::size_t idx = index++ % rgb.size();
+		return View{rgb[idx].data(), width, height};
+	}
+};
+
+static RgbRingBuffer _rgbOut;
+
 std::map<libcamera::FrameBuffer *, std::vector<libcamera::Span<uint8_t>>> _mappedBuffers;
 static EventLoop _loop;
 static EventLoop _loopFb;
 static EventLoop _loopTr;
 FlatBufferConnection _flatbuf;
 OpencvTransform *_transformation;
+
+#ifdef HAVE_GPU_TRANSFORM
+GpuNv12Transform *_gpuNv12 = nullptr;
+GpuRgbTransform *_gpuRgb = nullptr;
+#endif
 cv::Point2f _imgQuad[4];
 int _imgWidth = 0;
 int _imgHeight = 0;
@@ -88,12 +134,54 @@ bool _transformEn = false;
 bool _verbose = false;
 bool _help = false;
 
+static bool envEnabled(const char *name)
+{
+	const char *v = std::getenv(name);
+	if (!v)
+		return false;
+	return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
 static inline int64_t nowNs()
 {
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(
 			   std::chrono::high_resolution_clock::now().time_since_epoch())
 		.count();
 }
+
+struct CpuProfileState
+{
+	bool enabled{false};
+	uint64_t lastPrintNs{0};
+	uint64_t frames{0};
+	uint64_t accXformNs{0};
+};
+
+static inline void cpuProfileTick(CpuProfileState &s, const char *tag, uint64_t xformNs)
+{
+	if (!s.enabled)
+		return;
+
+	s.accXformNs += xformNs;
+	s.frames++;
+
+	uint64_t now = static_cast<uint64_t>(nowNs());
+	if (s.lastPrintNs == 0)
+		s.lastPrintNs = now;
+
+	if (now - s.lastPrintNs > 1000000000ull)
+	{
+		double denom = s.frames ? static_cast<double>(s.frames) : 1.0;
+		double avgMs = (static_cast<double>(s.accXformNs) / denom) / 1e6;
+		std::cerr << tag << " avg ms: xform=" << avgMs << std::endl;
+		s.frames = 0;
+		s.accXformNs = 0;
+		s.lastPrintNs = now;
+	}
+}
+
+static CpuProfileState _cpuRgbProf{envEnabled("HYPERCAM_CPU_PROFILE")};
+static CpuProfileState _cpuNv12Prof{envEnabled("HYPERCAM_CPU_PROFILE")};
 
 static std::atomic<int> _pendingProcess{0};
 static std::atomic<int> _pendingSend{0};
@@ -162,6 +250,15 @@ void *transformLoop(void *arg)
 	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend, _useNv12);
 	if (_useNv12)
 		_nv12Out.reset(_imgWidthToSend, _imgHeightToSend);
+	else
+		_rgbOut.reset(_imgWidthToSend, _imgHeightToSend);
+
+#ifdef HAVE_GPU_TRANSFORM
+	if (_useNv12 && _useGpu)
+		_gpuNv12 = new GpuNv12Transform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend);
+	if (!_useNv12 && _useGpu)
+		_gpuRgb = new GpuRgbTransform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend);
+#endif
 	_loopTr.exec();
 	return 0;
 }
@@ -170,6 +267,7 @@ static void transformImg(uint8_t *img)
 {
 	const int64_t startNs = nowNs();
 	uint8_t *imgToSend = _transformation->transform(img);
+	cpuProfileTick(_cpuRgbProf, "[cpuRgb]", static_cast<uint64_t>(nowNs() - startNs));
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -294,6 +392,7 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 
 	cv::remap(yIn, yOut, mapYx, mapYy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
 	cv::remap(uvIn, uvOut, mapUVx, mapUVy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
+	cpuProfileTick(_cpuNv12Prof, "[cpuNv12]", static_cast<uint64_t>(nowNs() - startNs));
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -310,6 +409,86 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	_loopFb.callLater([view]() { flatBufSendNv12(view.y, view.uv, view.strideY, view.strideUV, view.width, view.height); });
+}
+
+static void transformImgNv12Gpu(uint8_t *y, uint8_t *uv)
+{
+#ifndef HAVE_GPU_TRANSFORM
+	(void)y;
+	(void)uv;
+	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
+	_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	return;
+#else
+	const int64_t startNs = nowNs();
+
+	if (!_gpuNv12)
+	{
+		std::cout << "ERROR: GPU transform not initialized" << std::endl;
+		_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+		return;
+	}
+
+	auto view = _nv12Out.next();
+	_gpuNv12->transform(y, uv, _strideY, _strideUV, view.y, view.uv);
+
+	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
+	{
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+
+	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
+	_loopFb.callLater([view]() { flatBufSendNv12(view.y, view.uv, view.strideY, view.strideUV, view.width, view.height); });
+#endif
+}
+
+static void transformImgRgbGpu(uint8_t *img)
+{
+#ifndef HAVE_GPU_TRANSFORM
+	(void)img;
+	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
+	_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	return;
+#else
+	const int64_t startNs = nowNs();
+
+	if (!_gpuRgb)
+	{
+		std::cout << "ERROR: GPU transform not initialized" << std::endl;
+		_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+		return;
+	}
+
+	auto view = _rgbOut.next();
+	GpuRgbTransform::InputFormat fmt = GpuRgbTransform::InputFormat::Packed3;
+	if (_bppBgr == 4)
+		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
+	_gpuRgb->transform(img, _strideBgr, fmt, view.rgb);
+
+	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
+	{
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
+
+		char strTime[100];
+		time_t t = time(NULL);
+		struct tm *p = localtime(&t);
+		strftime(strTime, 100, "%F %T", p);
+
+		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+	}
+
+	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
+	_loopFb.callLater([view]() { flatBufSend(view.rgb); });
+#endif
 }
 
 static void processRequest(Request *request);
@@ -342,12 +521,18 @@ static void processRequest(Request *request)
 					continue;
 				uint8_t *y = it->second[0].data();
 				uint8_t *uv = it->second[1].data();
-				_loopTr.callLater([y, uv]() { transformImgNv12(y, uv); });
+				if (_useGpu)
+					_loopTr.callLater([y, uv]() { transformImgNv12Gpu(y, uv); });
+				else
+					_loopTr.callLater([y, uv]() { transformImgNv12(y, uv); });
 			}
 			else
 			{
 				uint8_t *img = it->second[0].data();
-				_loopTr.callLater([img]() { transformImg(img); });
+				if (_useGpu)
+					_loopTr.callLater([img]() { transformImgRgbGpu(img); });
+				else
+					_loopTr.callLater([img]() { transformImg(img); });
 			}
 		}
 		else
@@ -389,6 +574,7 @@ int main(int argc, char *argv[])
 		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")										   //
 		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")		   //
 		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")			   //
+		("gpu", po::bool_switch(&_useGpu)->default_value(false), "Use GPU for transform (requires --transform)")			   //
 		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")										   //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
@@ -416,6 +602,19 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: Invalid value for transformation" << std::endl;
 			return EXIT_FAILURE;
 		}
+	}
+
+	if (_useGpu)
+	{
+		if (!_transformEn)
+		{
+			std::cout << "ERROR: --gpu requires --transform" << std::endl;
+			return EXIT_FAILURE;
+		}
+#ifndef HAVE_GPU_TRANSFORM
+		std::cout << "ERROR: --gpu requested but GPU transform support was not compiled in" << std::endl;
+		return EXIT_FAILURE;
+#endif
 	}
 
 	if (sscanf(_wbgainsStr.c_str(), "%f,%f", &_rGain, &_bGain) != 2)
@@ -465,7 +664,69 @@ int main(int argc, char *argv[])
 		std::cout << std::endl;
 	}
 
-	streamConfig.pixelFormat = _useNv12 ? libcamera::formats::NV12 : libcamera::formats::BGR888;
+	if (_useNv12)
+	{
+		streamConfig.pixelFormat = libcamera::formats::NV12;
+	}
+	else
+	{
+		// In GPU mode, try to get a 4 bytes/pixel format to reduce CPU packing costs.
+		// libcamera pixel formats map to DRM fourcc:
+		// - XBGR8888: memory is R,G,B,X (no swap needed)
+		// - XRGB8888: memory is B,G,R,X (swap R/B)
+		_bppBgr = 3;
+		_swapRb4 = false;
+		if (_useGpu)
+		{
+			// Empirically on some Pi/Mesa stacks, BGR888 + NEON pack is faster than
+			// pulling 4 Bpp from the camera. Allow opting into 4 Bpp via env var.
+			const bool prefer4bpp = envEnabled("HYPERCAM_GPU_PREFER_4BPP");
+			if (!prefer4bpp)
+			{
+				streamConfig.pixelFormat = libcamera::formats::BGR888;
+				_bppBgr = 3;
+				_swapRb4 = false;
+			}
+			else
+			{
+				bool hasXbgr = false;
+				bool hasXrgb = false;
+				std::vector<PixelFormat> fmts = streamConfig.formats().pixelformats();
+				for (const PixelFormat &f : fmts)
+				{
+					if (f == libcamera::formats::XBGR8888)
+						hasXbgr = true;
+					else if (f == libcamera::formats::XRGB8888)
+						hasXrgb = true;
+				}
+
+				if (hasXbgr)
+				{
+					streamConfig.pixelFormat = libcamera::formats::XBGR8888;
+					_bppBgr = 4;
+					_swapRb4 = false;
+				}
+				else if (hasXrgb)
+				{
+					streamConfig.pixelFormat = libcamera::formats::XRGB8888;
+					_bppBgr = 4;
+					_swapRb4 = true;
+				}
+				else
+				{
+					streamConfig.pixelFormat = libcamera::formats::BGR888;
+					_bppBgr = 3;
+					_swapRb4 = false;
+				}
+			}
+		}
+		else
+		{
+			streamConfig.pixelFormat = libcamera::formats::BGR888;
+			_bppBgr = 3;
+			_swapRb4 = false;
+		}
+	}
 	streamConfig.colorSpace = libcamera::ColorSpace::fromString("Rec709/Rec709/None/Full");
 
 	libcamera::Size mySize(_width, _height);
@@ -511,10 +772,29 @@ int main(int argc, char *argv[])
 	}
 	else
 	{
-		if (streamConfig.pixelFormat != libcamera::formats::BGR888)
+		if (_useGpu && _bppBgr == 4)
+		{
+			if (streamConfig.pixelFormat != libcamera::formats::XBGR8888 && streamConfig.pixelFormat != libcamera::formats::XRGB8888)
+			{
+				std::cout << "ERROR: 4 Bpp X*RGB8888 format is not supported" << std::endl;
+				return EXIT_FAILURE;
+			}
+			// If libcamera adjusted the format away from our preference, update swap flag.
+			_swapRb4 = (streamConfig.pixelFormat == libcamera::formats::XRGB8888);
+		}
+		else if (streamConfig.pixelFormat != libcamera::formats::BGR888)
 		{
 			std::cout << "ERROR: BGR888 format is not supported" << std::endl;
 			return EXIT_FAILURE;
+		}
+		_strideBgr = static_cast<int>(streamConfig.stride);
+		if (_strideBgr <= 0)
+			_strideBgr = static_cast<int>(streamConfig.size.width) * _bppBgr;
+		if (_verbose)
+		{
+			std::cout << "Using RGB pixel format: " << streamConfig.pixelFormat.toString()
+					  << " (bpp=" << _bppBgr << ", swapRB4=" << (_swapRb4 ? 1 : 0)
+					  << ")" << std::endl;
 		}
 	}
 

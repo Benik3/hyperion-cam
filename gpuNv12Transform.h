@@ -1,0 +1,35 @@
+#pragma once
+
+#include <cstdint>
+
+#include <opencv2/core/types.hpp>
+
+class GpuNv12Transform
+{
+public:
+	GpuNv12Transform(int srcWidth,
+				int srcHeight,
+				const cv::Point2f *srcQuad,
+				int dstWidth,
+				int dstHeight);
+	~GpuNv12Transform();
+
+	GpuNv12Transform(const GpuNv12Transform &) = delete;
+	GpuNv12Transform &operator=(const GpuNv12Transform &) = delete;
+
+	// Transforms NV12 planes into tightly packed output planes (stride == width).
+	// yPlane: pointer to Y (strideY bytes per row)
+	// uvPlane: pointer to UV (strideUV bytes per row), size height/2 x width/2 with 2 channels interleaved
+	// outY: must be dstWidth*dstHeight
+	// outUV: must be dstWidth*dstHeight/2
+	void transform(const uint8_t *yPlane,
+			   const uint8_t *uvPlane,
+			   int strideY,
+			   int strideUV,
+			   uint8_t *outY,
+			   uint8_t *outUV);
+
+private:
+	struct Impl;
+	Impl *_impl;
+};

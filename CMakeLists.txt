@@ -28,6 +28,39 @@ find_package(Threads REQUIRED)
 find_package(Boost COMPONENTS program_options REQUIRED )
 find_package(OpenCV REQUIRED)
 
+# Optional GPU accelerated NV12 transform (headless EGL + OpenGL ES 3)
+pkg_check_modules(EGL QUIET IMPORTED_TARGET egl)
+pkg_check_modules(GLESv2 QUIET IMPORTED_TARGET glesv2)
+
+message(STATUS "GPU transform deps (pkg-config):")
+if (EGL_FOUND)
+    message(STATUS "  - egl: FOUND (version: ${EGL_VERSION})")
+else()
+    message(STATUS "  - egl: NOT FOUND (install libegl1-mesa-dev)")
+endif()
+
+if (GLESv2_FOUND)
+    message(STATUS "  - glesv2: FOUND (version: ${GLESv2_VERSION})")
+else()
+    message(STATUS "  - glesv2: NOT FOUND (install libgles2-mesa-dev)")
+endif()
+
+set(HAVE_GPU_TRANSFORM 0)
+if (EGL_FOUND AND GLESv2_FOUND)
+    set(HAVE_GPU_TRANSFORM 1)
+    message(STATUS "GPU NV12 transform: ENABLED")
+    add_library(gpuNv12Transform
+        gpuNv12Transform.cpp
+        gpuNv12Transform.h
+        gpuRgbTransform.cpp
+        gpuRgbTransform.h
+    )
+    target_link_libraries(gpuNv12Transform PkgConfig::EGL PkgConfig::GLESv2)
+    target_compile_definitions(gpuNv12Transform PRIVATE HAVE_GPU_TRANSFORM=1)
+else()
+    message(STATUS "GPU NV12 transform: DISABLED")
+endif()
+
 add_library(FlatBuffer
     FlatBufferConnection.cpp
     FlatBufferConnection.h
@@ -49,3 +82,8 @@ target_link_libraries(hyperion-cam ${Boost_LIBRARIES})
 target_link_libraries(hyperion-cam ${OpenCV_LIBS})
 target_link_libraries(hyperion-cam FlatBuffer)
 target_link_libraries(hyperion-cam opencvTransform)
+
+if (HAVE_GPU_TRANSFORM)
+    target_compile_definitions(hyperion-cam PRIVATE HAVE_GPU_TRANSFORM=1)
+    target_link_libraries(hyperion-cam gpuNv12Transform)
+endif()
