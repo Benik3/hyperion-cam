@@ -2,6 +2,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
+#include <cstddef>
 
 #include "FlatBufferConnection.h"
 #include "hyperhdr_reply_generated.h"
@@ -15,6 +16,19 @@ FlatBufferConnection::FlatBufferConnection()
 FlatBufferConnection::~FlatBufferConnection()
 {
 	close(_sockfd);
+}
+
+void FlatBufferConnection::reserveBuilderBytes(size_t bytes)
+{
+	// Grow-only. We use PreAlign()+Clear() as a supported way to force the
+	// internal buffer to allocate enough capacity while leaving the builder empty.
+	if (bytes <= _reservedBuilderBytes)
+		return;
+
+	_builder.Clear();
+	_builder.PreAlign(bytes, 1);
+	_builder.Clear();
+	_reservedBuilderBytes = bytes;
 }
 
 int FlatBufferConnection::connectToServer(const char *origin, const char *host, uint16_t port, int priority, bool skipReply)
@@ -192,6 +206,12 @@ int FlatBufferConnection::setImage(const uint8_t *buffer, uint16_t width, uint16
 		if (setRegister(_origin, _priority) == -1)
 			return -1;
 	}
+
+	// Reduce FlatBufferBuilder realloc/memmove churn by pre-sizing once per
+	// (growing) frame size. This does NOT remove the required copy into the
+	// FlatBuffer, it just avoids repeated buffer growth.
+	const size_t imgBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+	reserveBuilderBytes(imgBytes + 1024u);
 
 	auto imgData = _builder.CreateVector(buffer, width * height * 3);
 	auto rawImg = hyperhdrnet::CreateRawImage(_builder, imgData, width, height);

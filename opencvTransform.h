@@ -1,12 +1,15 @@
-#include "opencv2/imgproc.hpp"
 
-using namespace cv;
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+#include "opencv2/imgproc.hpp"
 
 class OpencvTransform
 {
 public:
 	/// @brief Constructor
-	OpencvTransform(int width, int height, Point2f *points, int *widthOut, int *heightOut);
+	OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut);
 
 	/// @brief Destructor
 	~OpencvTransform();
@@ -14,10 +17,11 @@ public:
 	uint8_t *transform(uint8_t *img);
 
 private:
-	Point2f *_srcQuad;
-
-	Point2f _dstQuad[4];
-	Mat *_src;
-	Mat *_dst;
-	Mat _warp;
+	cv::Point2f *_srcQuad;
+	cv::Point2f _dstQuad[4];
+	cv::Mat _warp;
+	std::vector<cv::Mat> _dstBuffers;
+	std::size_t _dstIndex = 0;
+	int _srcWidth = 0;
+	int _srcHeight = 0;
 };

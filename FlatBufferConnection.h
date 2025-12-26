@@ -46,6 +46,10 @@ public:
 	/// @return 0 = OK, -1 = failed
 	int setImage(const uint8_t *buffer, uint16_t width, uint16_t height);
 
+	/// @brief Pre-size the internal FlatBufferBuilder to reduce reallocations.
+	/// Safe to call multiple times; it only grows the internal buffer.
+	void reserveBuilderBytes(size_t bytes);
+
 private:
 	/// @brief Send data through socket
 	/// @param buffer
@@ -81,6 +85,8 @@ private:
 	unsigned char recvBuff[1024];
 
 	flatbuffers::FlatBufferBuilder _builder;
+
+	size_t _reservedBuilderBytes{0};
 
 	bool _registered;
 

@@ -2,6 +2,9 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <ctime>
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
 #include <opencv2/core/types.hpp>
@@ -21,9 +24,6 @@ static EventLoop _loopTr;
 FlatBufferConnection _flatbuf;
 OpencvTransform *_transformation;
 cv::Point2f _imgQuad[4];
-
-void *_imgMem = nullptr;
-uint8_t *_imgMemToSend = nullptr;
 int _imgWidth = 0;
 int _imgHeight = 0;
 int _imgWidthToSend;
@@ -44,10 +44,18 @@ std::string _transformStr;
 bool _transformEn = false;
 bool _verbose = false;
 bool _help = false;
-int _frameToProcess = 0;
-int _frameToSend = 0;
-auto _startProces = std::chrono::high_resolution_clock::now();
-auto _startSend = std::chrono::high_resolution_clock::now();
+
+static inline int64_t nowNs()
+{
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+			   std::chrono::high_resolution_clock::now().time_since_epoch())
+		.count();
+}
+
+static std::atomic<int> _pendingProcess{0};
+static std::atomic<int> _pendingSend{0};
+static std::atomic<int64_t> _startProcessNs{0};
+static std::atomic<int64_t> _startSendNs{0};
 
 void *flatLoop(void *arg)
 {
@@ -55,11 +63,11 @@ void *flatLoop(void *arg)
 	return 0;
 }
 
-static void flatBufSend()
+static void flatBufSend(const uint8_t *img)
 {
 	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
-		if (_flatbuf.setImage(_imgMemToSend, _imgWidthToSend, _imgHeightToSend) < 0)
+		if (_flatbuf.setImage(img, _imgWidthToSend, _imgHeightToSend) < 0)
 		{
 			std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
 		}
@@ -67,10 +75,10 @@ static void flatBufSend()
 	else
 		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
 
-	if (_frameToSend > 1 && _verbose)
+	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
 	{
-		auto elapsed = std::chrono::high_resolution_clock::now() - _startSend;
-		long long elapsedMicros = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+		int64_t elapsedMicros = (nowNs() - _startSendNs.load(std::memory_order_acquire)) / 1000;
 
 		char strTime[100];
 		time_t t = time(NULL);
@@ -79,7 +87,6 @@ static void flatBufSend()
 
 		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
 	}
-	_frameToSend = 0;
 }
 
 void *transformLoop(void *arg)
@@ -89,14 +96,14 @@ void *transformLoop(void *arg)
 	return 0;
 }
 
-static void transformImg()
+static void transformImg(uint8_t *img)
 {
-	_imgMemToSend = _transformation->transform((uint8_t *)_imgMem);
+	uint8_t *imgToSend = _transformation->transform(img);
 
-	if (_frameToProcess > 1 && _verbose)
+	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
+	if (before > 1 && _verbose)
 	{
-		auto elapsed = std::chrono::high_resolution_clock::now() - _startProces;
-		long long elapsedMicros = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+		int64_t elapsedMicros = (nowNs() - _startProcessNs.load(std::memory_order_acquire)) / 1000;
 
 		char strTime[100];
 		time_t t = time(NULL);
@@ -105,12 +112,11 @@ static void transformImg()
 
 		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
 	}
-	_frameToProcess = 0;
 
-	_frameToSend++;
-	if (_frameToSend <= 1)
-		_startSend = std::chrono::high_resolution_clock::now();
-	_loopFb.callLater(std::bind(&flatBufSend));
+	int after = _pendingSend.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (after == 1)
+		_startSendNs.store(nowNs(), std::memory_order_release);
+	_loopFb.callLater([imgToSend]() { flatBufSend(imgToSend); });
 }
 
 static void processRequest(Request *request);
@@ -129,22 +135,21 @@ static void processRequest(Request *request)
 	for (auto bufferPair : buffers)
 	{
 		FrameBuffer *buffer = bufferPair.second;
+		uint8_t *img = _mappedBuffers.find(buffer)->second[0].data();
 
 		if (_transformEn)
 		{
-			_imgMem = _mappedBuffers.find(buffer)->second[0].data();
-			_frameToProcess++;
-			if (_frameToProcess <= 1)
-				_startProces = std::chrono::high_resolution_clock::now();
-			_loopTr.callLater(std::bind(&transformImg));
+			int after = _pendingProcess.fetch_add(1, std::memory_order_acq_rel) + 1;
+			if (after == 1)
+				_startProcessNs.store(nowNs(), std::memory_order_release);
+			_loopTr.callLater([img]() { transformImg(img); });
 		}
 		else
 		{
-			_imgMemToSend = _mappedBuffers.find(buffer)->second[0].data();
-			_frameToSend++;
-			if (_frameToSend <= 1)
-				_startSend = std::chrono::high_resolution_clock::now();
-			_loopFb.callLater(std::bind(&flatBufSend));
+			int after = _pendingSend.fetch_add(1, std::memory_order_acq_rel) + 1;
+			if (after == 1)
+				_startSendNs.store(nowNs(), std::memory_order_release);
+			_loopFb.callLater([img]() { flatBufSend(img); });
 		}
 	}
 
