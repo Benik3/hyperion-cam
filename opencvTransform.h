@@ -20,6 +20,8 @@ private:
 	cv::Point2f *_srcQuad;
 	cv::Point2f _dstQuad[4];
 	cv::Mat _warp;
+	cv::Mat _mapX;
+	cv::Mat _mapY;
 	std::vector<cv::Mat> _dstBuffers;
 	std::size_t _dstIndex = 0;
 	int _srcWidth = 0;

@@ -97,8 +97,6 @@ static inline int64_t nowNs()
 
 static std::atomic<int> _pendingProcess{0};
 static std::atomic<int> _pendingSend{0};
-static std::atomic<int64_t> _startProcessNs{0};
-static std::atomic<int64_t> _startSendNs{0};
 
 void *flatLoop(void *arg)
 {
@@ -108,6 +106,7 @@ void *flatLoop(void *arg)
 
 static void flatBufSend(const uint8_t *img)
 {
+	const int64_t startNs = nowNs();
 	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
 		if (_flatbuf.setImage(img, _imgWidthToSend, _imgHeightToSend) < 0)
@@ -121,7 +120,7 @@ static void flatBufSend(const uint8_t *img)
 	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
-		int64_t elapsedMicros = (nowNs() - _startSendNs.load(std::memory_order_acquire)) / 1000;
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
 
 		char strTime[100];
 		time_t t = time(NULL);
@@ -134,6 +133,7 @@ static void flatBufSend(const uint8_t *img)
 
 static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, int strideUV, int width, int height)
 {
+	const int64_t startNs = nowNs();
 	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
 		if (_flatbuf.setNV12Image(y, uv, width, height, strideY, strideUV) < 0)
@@ -147,7 +147,7 @@ static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, in
 	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
-		int64_t elapsedMicros = (nowNs() - _startSendNs.load(std::memory_order_acquire)) / 1000;
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
 
 		char strTime[100];
 		time_t t = time(NULL);
@@ -168,12 +168,13 @@ void *transformLoop(void *arg)
 
 static void transformImg(uint8_t *img)
 {
+	const int64_t startNs = nowNs();
 	uint8_t *imgToSend = _transformation->transform(img);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
-		int64_t elapsedMicros = (nowNs() - _startProcessNs.load(std::memory_order_acquire)) / 1000;
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
 
 		char strTime[100];
 		time_t t = time(NULL);
@@ -183,19 +184,18 @@ static void transformImg(uint8_t *img)
 		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
 	}
 
-	int after = _pendingSend.fetch_add(1, std::memory_order_acq_rel) + 1;
-	if (after == 1)
-		_startSendNs.store(nowNs(), std::memory_order_release);
+	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	_loopFb.callLater([imgToSend]() { flatBufSend(imgToSend); });
 }
 
 static void transformImgNv12(uint8_t *y, uint8_t *uv)
 {
+	const int64_t startNs = nowNs();
 	// Avoid NV12 <-> BGR conversions: warp Y and UV planes directly.
-	// UV is half-resolution, so use a homography computed in UV coordinate space.
+	// UV is half-resolution, so use maps computed in UV coordinate space.
 	static thread_local bool inited = false;
-	static thread_local cv::Mat warpY;
-	static thread_local cv::Mat warpUV;
+	static thread_local cv::Mat mapYx, mapYy;
+	static thread_local cv::Mat mapUVx, mapUVy;
 	if (!inited)
 	{
 		cv::Point2f dstQuadY[4] = {
@@ -203,7 +203,39 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 			cv::Point2f(static_cast<float>(_imgWidthToSend), 0.f),
 			cv::Point2f(0.f, static_cast<float>(_imgHeightToSend)),
 			cv::Point2f(static_cast<float>(_imgWidthToSend), static_cast<float>(_imgHeightToSend))};
-		warpY = cv::getPerspectiveTransform(_imgQuad, dstQuadY);
+		cv::Mat warpY = cv::getPerspectiveTransform(_imgQuad, dstQuadY);
+		cv::Mat warpYInv;
+		cv::invert(warpY, warpYInv);
+		mapYx.create(_imgHeightToSend, _imgWidthToSend, CV_32FC1);
+		mapYy.create(_imgHeightToSend, _imgWidthToSend, CV_32FC1);
+
+		const double y00 = warpYInv.at<double>(0, 0);
+		const double y01 = warpYInv.at<double>(0, 1);
+		const double y02 = warpYInv.at<double>(0, 2);
+		const double y10 = warpYInv.at<double>(1, 0);
+		const double y11 = warpYInv.at<double>(1, 1);
+		const double y12 = warpYInv.at<double>(1, 2);
+		const double y20 = warpYInv.at<double>(2, 0);
+		const double y21 = warpYInv.at<double>(2, 1);
+		const double y22 = warpYInv.at<double>(2, 2);
+
+		for (int dy = 0; dy < _imgHeightToSend; dy++)
+		{
+			float *mx = mapYx.ptr<float>(dy);
+			float *my = mapYy.ptr<float>(dy);
+			for (int dx = 0; dx < _imgWidthToSend; dx++)
+			{
+				const double denom = y20 * dx + y21 * dy + y22;
+				if (denom == 0.0)
+				{
+					mx[dx] = -1.f;
+					my[dx] = -1.f;
+					continue;
+				}
+				mx[dx] = static_cast<float>((y00 * dx + y01 * dy + y02) / denom);
+				my[dx] = static_cast<float>((y10 * dx + y11 * dy + y12) / denom);
+			}
+		}
 
 		cv::Point2f srcQuadUV[4];
 		cv::Point2f dstQuadUV[4] = {
@@ -213,7 +245,42 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 			cv::Point2f(static_cast<float>(_imgWidthToSend) / 2.f, static_cast<float>(_imgHeightToSend) / 2.f)};
 		for (int i = 0; i < 4; i++)
 			srcQuadUV[i] = cv::Point2f(_imgQuad[i].x / 2.f, _imgQuad[i].y / 2.f);
-		warpUV = cv::getPerspectiveTransform(srcQuadUV, dstQuadUV);
+		cv::Mat warpUV = cv::getPerspectiveTransform(srcQuadUV, dstQuadUV);
+		cv::Mat warpUVInv;
+		cv::invert(warpUV, warpUVInv);
+
+		const int uvW = _imgWidthToSend / 2;
+		const int uvH = _imgHeightToSend / 2;
+		mapUVx.create(uvH, uvW, CV_32FC1);
+		mapUVy.create(uvH, uvW, CV_32FC1);
+
+		const double u00 = warpUVInv.at<double>(0, 0);
+		const double u01 = warpUVInv.at<double>(0, 1);
+		const double u02 = warpUVInv.at<double>(0, 2);
+		const double u10 = warpUVInv.at<double>(1, 0);
+		const double u11 = warpUVInv.at<double>(1, 1);
+		const double u12 = warpUVInv.at<double>(1, 2);
+		const double u20 = warpUVInv.at<double>(2, 0);
+		const double u21 = warpUVInv.at<double>(2, 1);
+		const double u22 = warpUVInv.at<double>(2, 2);
+
+		for (int dy = 0; dy < uvH; dy++)
+		{
+			float *mx = mapUVx.ptr<float>(dy);
+			float *my = mapUVy.ptr<float>(dy);
+			for (int dx = 0; dx < uvW; dx++)
+			{
+				const double denom = u20 * dx + u21 * dy + u22;
+				if (denom == 0.0)
+				{
+					mx[dx] = -1.f;
+					my[dx] = -1.f;
+					continue;
+				}
+				mx[dx] = static_cast<float>((u00 * dx + u01 * dy + u02) / denom);
+				my[dx] = static_cast<float>((u10 * dx + u11 * dy + u12) / denom);
+			}
+		}
 
 		inited = true;
 	}
@@ -225,13 +292,13 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	cv::Mat yOut(_imgHeightToSend, _imgWidthToSend, CV_8UC1, view.y, view.strideY);
 	cv::Mat uvOut(_imgHeightToSend / 2, _imgWidthToSend / 2, CV_8UC2, view.uv, view.strideUV);
 
-	cv::warpPerspective(yIn, yOut, warpY, yOut.size(), cv::INTER_NEAREST);
-	cv::warpPerspective(uvIn, uvOut, warpUV, uvOut.size(), cv::INTER_NEAREST);
+	cv::remap(yIn, yOut, mapYx, mapYy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
+	cv::remap(uvIn, uvOut, mapUVx, mapUVy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
-		int64_t elapsedMicros = (nowNs() - _startProcessNs.load(std::memory_order_acquire)) / 1000;
+		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
 
 		char strTime[100];
 		time_t t = time(NULL);
@@ -241,9 +308,7 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
 	}
 
-	int after = _pendingSend.fetch_add(1, std::memory_order_acq_rel) + 1;
-	if (after == 1)
-		_startSendNs.store(nowNs(), std::memory_order_release);
+	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	_loopFb.callLater([view]() { flatBufSendNv12(view.y, view.uv, view.strideY, view.strideUV, view.width, view.height); });
 }
 
@@ -269,9 +334,7 @@ static void processRequest(Request *request)
 
 		if (_transformEn)
 		{
-			int after = _pendingProcess.fetch_add(1, std::memory_order_acq_rel) + 1;
-			if (after == 1)
-				_startProcessNs.store(nowNs(), std::memory_order_release);
+			_pendingProcess.fetch_add(1, std::memory_order_acq_rel);
 
 			if (_useNv12)
 			{
@@ -289,9 +352,7 @@ static void processRequest(Request *request)
 		}
 		else
 		{
-			int after = _pendingSend.fetch_add(1, std::memory_order_acq_rel) + 1;
-			if (after == 1)
-				_startSendNs.store(nowNs(), std::memory_order_release);
+			_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 
 			if (_useNv12)
 			{
