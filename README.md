@@ -35,6 +35,15 @@ Settings can be adjusted by using command line options:
   --cpuonly                            Force CPU transform even if GPU is available
   -v [ --verbose ]                     Verbose output  
   --help                               Print help  
+  --autowb                             One-shot auto white balance calibration (gray 127) and exit
+  --autogain                           One-shot auto gain calibration (gray 127) and exit
+  --autocalib                          One-shot auto white balance + gain calibration (gray 127) and exit
+  --autocalib-iters arg (=8)           Auto calibration max iterations
+  --autocalib-delay-ms arg (=500)      Delay between auto calibration updates (ms)
+  --autocalib-tol-wb arg (=2)          Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)
+  --autocalib-tol-grey arg (=3)        Auto gain convergence tolerance (abs avg RGB error from 127)
+  --autocalib-gain-samples arg (=8)    Auto gain samples (curve-fit)
+  --autocalib-gain-range arg (=4)      Auto gain range multiplier (min=gain/range, max=gain*range)
 ```
 
 ### One-shot image capture (`--imgout`)
@@ -55,6 +64,27 @@ The shutter speed modifies the exposition time of the camera and FPS. The camera
 #### Connection note:
 The app supports using of TCP connection or Unix Domain Socket (available when using [HyperHDR](https://github.com/awawa-dev/HyperHDR) at /tmp/hyperhdr-domain). If `--connection` is a valid IP address (IPv4/IPv6) it uses TCP (`--port` applies). Otherwise it treats the value as a Unix socket path. IPC has advantage of faster data exchange with lower overhead.  
 I don't recommend to use the TCP connection over a network as you will probably have lags (due to high packet size and packet framing). Maybe on ethernet network it would be usable, but over wifi it's unusable. Rather always install Hyperion locally and then send only the LED data to another Hyperion server (if you can't drive the LEDs directly).
+
+#### Auto calibration note:
+For one-time setup, the app can estimate white balance gains and/or analogue gain using a neutral gray target.
+
+- Display or place a uniform gray image with RGB value `127,127,127` in front of the camera.
+- The app captures frames in RGB mode (NV12 is ignored).
+- It measures the average color of the centered quarter of the (optionally transformed) image. Example: for 640x480 it measures a centered 320x240 ROI.
+- It iteratively adjusts `--wbgain` (R,B) to make R≈G≈B and `--gain` to reach ≈127 brightness, prints the final values and the final measured RGB, then exits.
+- It iteratively adjusts `--wbgain` (R,B) to make R≈G≈B and `--gain` to reach ≈127 brightness, prints the final values and the final measured RGB, then exits.
+  - Use `--autocalib-tol-wb` and `--autocalib-tol-grey` to require tighter convergence.
+
+Auto gain method:
+- Auto gain uses curve fitting: it samples multiple analogue gain values, fits a curve to the measured ROI brightness, solves for the gain that yields ~127, then confirms on a final frame.
+
+Examples:
+```
+./hyperion-cam --autowb
+./hyperion-cam --autogain
+./hyperion-cam --autocalib
+./hyperion-cam --transform "0,0:640,0:0,480:640,480" --autocalib
+```
 
 #### Picture transformation note:
 The app allows to make Perspective (projective) transformation of the picture in real time using OpenCV. Of course, it adds a little lag, but it's numbers of milliseconds.  

@@ -7,6 +7,9 @@
 #include <ctime>
 #include <cstring>
 #include <cstdlib>
+#include <algorithm>
+#include <cmath>
+#include <mutex>
 #include <memory>
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
@@ -141,6 +144,88 @@ bool _help = false;
 
 static std::atomic<bool> _imgOutDone{false};
 
+static bool _autoWb = false;
+static bool _autoGain = false;
+static bool _autoCalib = false;
+static int _autoCalibMaxIters = 8;
+static int _autoCalibWarmupFrames = 2;
+static int _autoCalibDelayMs = 500;
+static float _autoCalibTolWb = 2.0f;
+static float _autoCalibTolGrey = 3.0f;
+static int _autoGainSamples = 8;
+static float _autoGainRange = 4.0f;
+
+static std::atomic<bool> _autoCalibBusy{false};
+static std::atomic<int> _autoCalibFrameCount{0};
+static std::atomic<int> _autoCalibIterCount{0};
+static std::atomic<int64_t> _autoCalibNextAllowedNs{0};
+static std::atomic<int> _autoCalibStage{0}; // 0=init, 1=wb, 2=gain
+static std::mutex _autoCalibMutex;
+static float _autoLastR = 0.0f;
+static float _autoLastG = 0.0f;
+static float _autoLastB = 0.0f;
+
+// Auto-gain curve fitting state
+static int _autoGainCurvePhase = 0; // 0=off, 1=sampling, 2=confirm
+static std::vector<float> _autoGainCurveGains;
+static std::vector<float> _autoGainCurveYs;
+static size_t _autoGainCurveNextIdx = 0;
+
+static inline bool autoCalibEnabled()
+{
+	return _autoCalib || _autoWb || _autoGain;
+}
+
+static inline float clampf(float v, float lo, float hi)
+{
+	return std::max(lo, std::min(hi, v));
+}
+
+static bool fitGainLogLinear(const std::vector<float> &gains, const std::vector<float> &ys, float targetY, float &outGain)
+{
+	// Fit log(y) = a*log(gain) + b and solve for y=targetY.
+	if (gains.size() != ys.size() || gains.empty())
+		return false;
+	if (targetY <= 0.0f)
+		return false;
+
+	double sumX = 0.0, sumY = 0.0, sumXX = 0.0, sumXY = 0.0;
+	int n = 0;
+	for (size_t i = 0; i < gains.size(); i++)
+	{
+		const float g = gains[i];
+		const float y = ys[i];
+		// Filter unusable/saturated points.
+		if (!(g > 0.0f) || !(y > 1.0f) || y >= 254.5f)
+			continue;
+		const double x = std::log(static_cast<double>(g));
+		const double ly = std::log(static_cast<double>(y));
+		sumX += x;
+		sumY += ly;
+		sumXX += x * x;
+		sumXY += x * ly;
+		n++;
+	}
+	if (n < 2)
+		return false;
+
+	const double denom = (static_cast<double>(n) * sumXX) - (sumX * sumX);
+	if (std::fabs(denom) < 1e-9)
+		return false;
+	const double a = ((static_cast<double>(n) * sumXY) - (sumX * sumY)) / denom;
+	const double b = (sumY - a * sumX) / static_cast<double>(n);
+	if (!(a > 0.0))
+		return false;
+
+	const double tgt = std::log(static_cast<double>(targetY));
+	const double xT = (tgt - b) / a;
+	const double gT = std::exp(xT);
+	if (!std::isfinite(gT) || gT <= 0.0)
+		return false;
+	outGain = static_cast<float>(gT);
+	return true;
+}
+
 static bool envEnabled(const char *name)
 {
 	const char *v = std::getenv(name);
@@ -212,6 +297,354 @@ static bool imgOutWriteBgr(const uint8_t *bgr, int width, int height, int stride
 		std::cout << "ERROR: Failed to write image: " << e.what() << std::endl;
 		return false;
 	}
+}
+
+static void autoCalibProcessBgr(const cv::Mat &bgr)
+{
+	const int w = bgr.cols;
+	const int h = bgr.rows;
+	if (w <= 0 || h <= 0)
+	{
+		std::cout << "ERROR: Invalid image size for auto calibration" << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		return;
+	}
+
+	// Central quarter: half width/height, centered.
+	const int roiW = w / 2;
+	const int roiH = h / 2;
+	const int roiX = (w - roiW) / 2;
+	const int roiY = (h - roiH) / 2;
+	if (roiW <= 0 || roiH <= 0)
+	{
+		std::cout << "ERROR: Invalid ROI size for auto calibration" << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		return;
+	}
+
+	cv::Scalar meanBgr = cv::mean(bgr(cv::Rect(roiX, roiY, roiW, roiH)));
+	const float b = static_cast<float>(meanBgr[0]);
+	const float g = static_cast<float>(meanBgr[1]);
+	const float r = static_cast<float>(meanBgr[2]);
+
+	{
+		std::lock_guard<std::mutex> lock(_autoCalibMutex);
+		_autoLastR = r;
+		_autoLastG = g;
+		_autoLastB = b;
+	}
+
+	int frames = _autoCalibFrameCount.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (frames <= _autoCalibWarmupFrames)
+	{
+		if (_verbose)
+			std::cout << "AutoCalib warmup frame " << frames << ": avg RGB=" << r << "," << g << "," << b << std::endl;
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return;
+	}
+
+	const float avg = (r + g + b) / 3.0f;
+	const float tolCh = std::max(0.1f, _autoCalibTolWb);
+	const float tolGrey = std::max(0.1f, _autoCalibTolGrey);
+	const bool wbOk = (std::fabs(r - g) <= tolCh) && (std::fabs(b - g) <= tolCh);
+	int iters = _autoCalibIterCount.load(std::memory_order_acquire);
+
+	const bool needWb = (_autoWb || _autoCalib);
+	const bool needGain = (_autoGain || _autoCalib);
+	const float targetGrey = 127.0f;
+	const float gainRef = needWb ? g : avg;
+	const float gainOkRef = avg;
+	const bool gainOk2 = (std::fabs(gainOkRef - targetGrey) <= tolGrey);
+
+	int stage = _autoCalibStage.load(std::memory_order_acquire);
+	if (needWb && needGain)
+	{
+		if (stage == 0)
+		{
+			stage = 1;
+			_autoCalibStage.store(1, std::memory_order_release);
+		}
+	}
+	else if (needWb)
+	{
+		stage = 1;
+		_autoCalibStage.store(1, std::memory_order_release);
+	}
+	else if (needGain)
+	{
+		stage = 2;
+		_autoCalibStage.store(2, std::memory_order_release);
+	}
+
+	if (needWb && needGain)
+	{
+		if (stage == 2 && wbOk && gainOk2)
+		{
+			std::cout << "AutoCalib done: gain=" << _gain << " wbgain=" << _rGain << "," << _bGain
+					  << " avg RGB=" << r << "," << g << "," << b << std::endl;
+			imgOutExit(EXIT_SUCCESS);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+	}
+	else if (needWb && wbOk)
+	{
+		std::cout << "AutoWB done: wbgain=" << _rGain << "," << _bGain << " avg RGB=" << r << "," << g << "," << b << std::endl;
+		imgOutExit(EXIT_SUCCESS);
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return;
+	}
+	else if (needGain && gainOk2)
+	{
+		std::cout << "AutoGain done: gain=" << _gain << " avg RGB=" << r << "," << g << "," << b << std::endl;
+		imgOutExit(EXIT_SUCCESS);
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return;
+	}
+
+	// AutoCalib staging: do WB first; once WB is locked, reset iteration counter for gain stage.
+	if (needWb && needGain)
+	{
+		if (stage == 1)
+		{
+			if (wbOk)
+			{
+				_autoCalibStage.store(2, std::memory_order_release);
+				_autoCalibIterCount.store(0, std::memory_order_release);
+				_autoGainCurvePhase = 0;
+				_autoGainCurveGains.clear();
+				_autoGainCurveYs.clear();
+				_autoGainCurveNextIdx = 0;
+				if (_verbose)
+					std::cout << "AutoCalib WB locked: wbgain=" << _rGain << "," << _bGain
+							  << " (measured avg RGB=" << r << "," << g << "," << b << ")" << std::endl;
+				if (_autoCalibDelayMs > 0)
+					_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+				_autoCalibBusy.store(false, std::memory_order_release);
+				return;
+			}
+
+			if (iters >= _autoCalibMaxIters)
+			{
+				std::cout << "AutoCalib reached max iterations (WB stage): gain=" << _gain << " wbgain=" << _rGain << "," << _bGain
+						  << " avg RGB=" << r << "," << g << "," << b << std::endl;
+				imgOutExit(EXIT_SUCCESS);
+				_autoCalibBusy.store(false, std::memory_order_release);
+				return;
+			}
+
+			{
+				std::lock_guard<std::mutex> lock(_autoCalibMutex);
+				if (r > 1e-3f && b > 1e-3f)
+				{
+					_rGain = clampf(_rGain * (g / r), 0.05f, 32.0f);
+					_bGain = clampf(_bGain * (g / b), 0.05f, 32.0f);
+				}
+			}
+			_autoCalibIterCount.fetch_add(1, std::memory_order_acq_rel);
+			if (_verbose)
+				std::cout << "AutoWB iter " << (iters + 1) << ": set wbgain=" << _rGain << "," << _bGain
+						  << " (measured avg RGB=" << r << "," << g << "," << b << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+	}
+
+	if (needGain)
+	{
+		// Gain stage max-iteration check.
+		// Curve-fitting uses multiple frames for sampling; don't count those as "iterations".
+		// Only enforce the cap once we've moved into the confirm phase.
+		const bool enforceMaxIters = (_autoGainCurvePhase == 2);
+		if (enforceMaxIters && iters >= _autoCalibMaxIters)
+		{
+			const char *stageName = (needWb && needGain) ? "GAIN stage" : "gain";
+			std::cout << "AutoCalib reached max iterations (" << stageName << "): gain=" << _gain << " wbgain=" << _rGain << "," << _bGain
+					  << " avg RGB=" << r << "," << g << "," << b << std::endl;
+			imgOutExit(EXIT_SUCCESS);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+	}
+
+	// Gain calibration (curve-fit only).
+	if (needGain)
+	{
+		// Initialize the sampling plan once.
+		if (_autoGainCurvePhase == 0)
+		{
+			_autoGainCurvePhase = 1;
+			_autoGainCurveGains.clear();
+			_autoGainCurveYs.clear();
+			_autoGainCurveNextIdx = 0;
+
+			const float minG = clampf(_gain / std::max(1.01f, _autoGainRange), 0.05f, 32.0f);
+			const float maxG = clampf(_gain * std::max(1.01f, _autoGainRange), 0.05f, 32.0f);
+			const int samples = std::max(3, _autoGainSamples);
+			_autoGainCurveGains.resize(static_cast<size_t>(samples));
+			for (int i = 0; i < samples; i++)
+			{
+				const double t = (samples == 1) ? 0.0 : (static_cast<double>(i) / static_cast<double>(samples - 1));
+				const double gLog = std::log(static_cast<double>(minG)) + t * (std::log(static_cast<double>(maxG)) - std::log(static_cast<double>(minG)));
+				_autoGainCurveGains[static_cast<size_t>(i)] = static_cast<float>(std::exp(gLog));
+			}
+			// Force the first sample to be the current gain for a quick first datapoint.
+			_autoGainCurveGains[0] = _gain;
+			// Ensure strictly positive and within bounds.
+			for (float &gg : _autoGainCurveGains)
+				gg = clampf(gg, 0.05f, 32.0f);
+			if (_verbose)
+				std::cout << "AutoGain: sampling " << samples << " points in [" << minG << "," << maxG << "]" << std::endl;
+		}
+
+		if (_autoGainCurvePhase == 2)
+		{
+			// Confirmation measurement at predicted gain. Only finish when we're close enough to target.
+			if (gainOk2)
+			{
+				std::cout << "AutoGain done: gain=" << _gain << " wbgain=" << _rGain << "," << _bGain
+						  << " avg RGB=" << r << "," << g << "," << b << std::endl;
+				imgOutExit(EXIT_SUCCESS);
+				_autoCalibBusy.store(false, std::memory_order_release);
+				return;
+			}
+
+			// Predicted gain was off; do a corrective multiplicative update and confirm again next frame.
+			const float ref = gainOkRef;
+			if (ref > 1e-3f)
+			{
+				const float ratio = clampf(targetGrey / ref, 0.5f, 2.0f);
+				_gain = clampf(_gain * ratio, 0.05f, 32.0f);
+			}
+			_autoCalibIterCount.fetch_add(1, std::memory_order_acq_rel);
+			if (_verbose)
+				std::cout << "AutoGain confirm adjust: set gain=" << _gain
+						  << " (measured avg=" << gainOkRef << ", target " << targetGrey << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		// Record the current measurement for the current gain.
+		_autoGainCurveYs.push_back(gainRef);
+		if (_verbose)
+			std::cout << "AutoGain sample: gain=" << _gain << " ref=" << gainRef << " (avg RGB=" << r << "," << g << "," << b << ")" << std::endl;
+
+		// Schedule next gain sample or fit.
+		_autoGainCurveNextIdx++;
+		if (_autoGainCurveNextIdx < _autoGainCurveGains.size())
+		{
+			_gain = _autoGainCurveGains[_autoGainCurveNextIdx];
+			if (_verbose)
+				std::cout << "AutoGain set next gain=" << _gain << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		// Fit using the sampled (gain,y) pairs.
+		float predicted = 0.0f;
+		if (!fitGainLogLinear(_autoGainCurveGains, _autoGainCurveYs, targetGrey, predicted))
+		{
+			std::cout << "AutoGain: fit failed" << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+		else
+		{
+			predicted = clampf(predicted, 0.05f, 32.0f);
+			_gain = predicted;
+			_autoGainCurvePhase = 2;
+			if (_verbose)
+				std::cout << "AutoGain predicted gain=" << _gain << " (target " << targetGrey << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+	}
+}
+
+static void autoCalibFromRaw(uint8_t *img)
+{
+	if (_bppBgr == 3)
+	{
+		cv::Mat in3(_imgHeightToSend, _imgWidthToSend, CV_8UC3, img, static_cast<size_t>(_strideBgr));
+		cv::Mat bgr;
+		cv::cvtColor(in3, bgr, cv::COLOR_RGB2BGR);
+		autoCalibProcessBgr(bgr);
+	}
+	else if (_bppBgr == 4)
+	{
+		cv::Mat in4(_imgHeightToSend, _imgWidthToSend, CV_8UC4, img, static_cast<size_t>(_strideBgr));
+		cv::Mat bgr;
+		int code = _swapRb4 ? cv::COLOR_BGRA2BGR : cv::COLOR_RGBA2BGR;
+		cv::cvtColor(in4, bgr, code);
+		autoCalibProcessBgr(bgr);
+	}
+	else
+	{
+		std::cout << "ERROR: Unsupported pixel format for auto calibration" << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		_autoCalibBusy.store(false, std::memory_order_release);
+	}
+}
+
+static void autoCalibFromTransformedCpu(uint8_t *img)
+{
+	if (!_transformation)
+	{
+		std::cout << "ERROR: Transform not initialized" << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return;
+	}
+
+	std::vector<uint8_t> out(static_cast<std::size_t>(_imgWidthToSend) * static_cast<std::size_t>(_imgHeightToSend) * 3u);
+	_transformation->transformInto(img, _strideBgr, out.data(), _imgWidthToSend * 3);
+	cv::Mat bgr(_imgHeightToSend, _imgWidthToSend, CV_8UC3, out.data());
+	autoCalibProcessBgr(bgr);
+}
+
+static void autoCalibFromTransformedGpu(uint8_t *img, int fd, int off)
+{
+#ifndef HAVE_GPU_TRANSFORM
+	(void)img;
+	(void)fd;
+	(void)off;
+	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
+	imgOutExit(EXIT_FAILURE);
+	_autoCalibBusy.store(false, std::memory_order_release);
+	return;
+#else
+	if (!_gpuRgb)
+	{
+		std::cout << "ERROR: GPU transform not initialized" << std::endl;
+		imgOutExit(EXIT_FAILURE);
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return;
+	}
+
+	std::vector<uint8_t> rgb(static_cast<std::size_t>(_imgWidthToSend) * static_cast<std::size_t>(_imgHeightToSend) * 3u);
+	GpuRgbTransform::InputFormat fmt = GpuRgbTransform::InputFormat::Packed3;
+	if (_bppBgr == 4)
+		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
+
+	if (_bppBgr == 4)
+		_gpuRgb->transformDmabuf(fd, off, _strideBgr, fmt, rgb.data());
+	else
+		_gpuRgb->transform(img, _strideBgr, fmt, rgb.data());
+
+	cv::Mat rgbMat(_imgHeightToSend, _imgWidthToSend, CV_8UC3, rgb.data());
+	cv::Mat bgr;
+	cv::cvtColor(rgbMat, bgr, cv::COLOR_RGB2BGR);
+	autoCalibProcessBgr(bgr);
+#endif
 }
 
 static void imgOutSaveRaw(uint8_t *img)
@@ -784,6 +1217,43 @@ static void processRequest(Request *request)
 		if (it == _mappedBuffers.end() || it->second.empty())
 			continue;
 
+		if (autoCalibEnabled())
+		{
+			const int64_t now = nowNs();
+			const int64_t nextOk = _autoCalibNextAllowedNs.load(std::memory_order_acquire);
+			if (now >= nextOk)
+			{
+				// Only process one frame at a time.
+				if (!_autoCalibBusy.exchange(true, std::memory_order_acq_rel))
+				{
+					uint8_t *img = it->second[0].data();
+					if (_transformEn)
+					{
+						if (_useGpu)
+						{
+							int fd = -1;
+							int off = 0;
+							if (_bppBgr == 4)
+							{
+								const FrameBuffer::Plane &p0 = buffer->planes()[0];
+								fd = p0.fd.get();
+								off = static_cast<int>(p0.offset);
+							}
+							_loopTr.callLater([img, fd, off]() { autoCalibFromTransformedGpu(img, fd, off); });
+						}
+						else
+						{
+							_loopTr.callLater([img]() { autoCalibFromTransformedCpu(img); });
+						}
+					}
+					else
+					{
+						autoCalibFromRaw(img);
+					}
+				}
+			}
+		}
+
 		if (!_imgOutPath.empty())
 		{
 			if (_imgOutDone.exchange(true))
@@ -888,6 +1358,17 @@ static void processRequest(Request *request)
 	}
 
 	request->reuse(Request::ReuseBuffers);
+	if (autoCalibEnabled())
+	{
+		// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
+		// without restarting the camera.
+		ControlList &c = request->controls();
+		c.set(controls::AeEnable, false);
+		c.set(controls::AwbEnable, false);
+		c.set(controls::ExposureTime, _shutter);
+		c.set(controls::AnalogueGain, _gain);
+		c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
+	}
 	_camera->queueRequest(request);
 }
 // Main loop
@@ -909,6 +1390,15 @@ int main(int argc, char *argv[])
 		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")		   //
 		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")										   //
 		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")			   //
+		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit") //
+		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit") //
+		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit") //
+		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations") //
+		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)") //
+		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)") //
+		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)") //
+		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)") //
+		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)") //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
 
@@ -943,6 +1433,39 @@ int main(int argc, char *argv[])
 		if (_useNv12 && _verbose)
 			std::cout << "INFO: --imgout forces RGB output; ignoring --nv12" << std::endl;
 		_useNv12 = false;
+	}
+
+	if (autoCalibEnabled())
+	{
+		if (!_imgOutPath.empty())
+		{
+			std::cout << "ERROR: --imgout cannot be used together with auto calibration" << std::endl;
+			return EXIT_FAILURE;
+		}
+
+		if (_useNv12 && _verbose)
+			std::cout << "INFO: auto calibration forces RGB output; ignoring --nv12" << std::endl;
+		_useNv12 = false;
+
+		if (_autoCalibMaxIters < 1)
+			_autoCalibMaxIters = 1;
+		if (_autoCalibDelayMs < 0)
+			_autoCalibDelayMs = 0;
+
+		if (_autoGainSamples < 3)
+			_autoGainSamples = 3;
+		if (_autoGainRange < 1.01f)
+			_autoGainRange = 1.01f;
+
+		// Reset curve state on start.
+		_autoGainCurvePhase = 0;
+		_autoGainCurveGains.clear();
+		_autoGainCurveYs.clear();
+		_autoGainCurveNextIdx = 0;
+		_autoCalibStage.store(0, std::memory_order_release);
+		_autoCalibIterCount.store(0, std::memory_order_release);
+		_autoCalibFrameCount.store(0, std::memory_order_release);
+		_autoCalibNextAllowedNs.store(0, std::memory_order_release);
 	}
 
 	// GPU transform is the default when compiled in and --transform is used.
