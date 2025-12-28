@@ -901,7 +901,7 @@ int main(int argc, char *argv[])
 		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")													   //
 		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")						   //
 		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")							   //
-		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or /tmp/hyperhdr-domain") //
+		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or Unix socket path)") //
 		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")													   //
 		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")										   //
 		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")		   //

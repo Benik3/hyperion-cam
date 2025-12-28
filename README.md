@@ -25,7 +25,7 @@ Settings can be adjusted by using command line options:
   -g [ --gain ] arg (=1)               Camera gain  
   -b [ --wbgain ] arg (=1.0,1.0)       White balance gains  
   -o [ --origin ] arg (=camera)        Name of the origin  
-  -c [ --connection ] arg (=127.0.0.1) Socket address (IP or /tmp/hyperhdr-domain)  
+  -c [ --connection ] arg (=127.0.0.1) Socket address (IP or Unix socket path)  
   -p [ --port ] arg (=19400)           TCP port  
   -r [ --priority ] arg (=120)         Hyperion priority  
   -t [ --transform ] arg               Picture transformation in format   
@@ -53,7 +53,7 @@ Examples:
 The shutter speed modifies the exposition time of the camera and FPS. The camera doesn't have fixed FPS, but the frames are released as soon as they are available. The value is in micro seconds.
 
 #### Connection note:
-The app supports using of TCP connection or Unix Domain Socket (available when using [HyperHDR](https://github.com/awawa-dev/HyperHDR) ). By specifying "/tmp/hyperhdr-domain" instead of IP automatically switch the app to IPC. IPC has advantage of faster data exchange with lower overhead.  
+The app supports using of TCP connection or Unix Domain Socket (available when using [HyperHDR](https://github.com/awawa-dev/HyperHDR) at /tmp/hyperhdr-domain). If `--connection` is a valid IP address (IPv4/IPv6) it uses TCP (`--port` applies). Otherwise it treats the value as a Unix socket path. IPC has advantage of faster data exchange with lower overhead.  
 I don't recommend to use the TCP connection over a network as you will probably have lags (due to high packet size and packet framing). Maybe on ethernet network it would be usable, but over wifi it's unusable. Rather always install Hyperion locally and then send only the LED data to another Hyperion server (if you can't drive the LEDs directly).
 
 #### Picture transformation note:

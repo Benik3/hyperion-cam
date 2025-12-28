@@ -3,6 +3,32 @@
 #include <arpa/inet.h>
 #include <sys/un.h>
 #include <cstddef>
+#include <cstring>
+
+namespace
+{
+bool parseIpAddressFamily(const char *host, int &outFamily)
+{
+	if (host == nullptr || *host == '\0')
+		return false;
+
+	in_addr addr4;
+	if (inet_pton(AF_INET, host, &addr4) == 1)
+	{
+		outFamily = AF_INET;
+		return true;
+	}
+
+	in6_addr addr6;
+	if (inet_pton(AF_INET6, host, &addr6) == 1)
+	{
+		outFamily = AF_INET6;
+		return true;
+	}
+
+	return false;
+}
+} // namespace
 
 #include "FlatBufferConnection.h"
 #include "hyperhdr_reply_generated.h"
@@ -46,17 +72,12 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 		_sockfd = 0;
 		_skipReply = skipReply;
 		struct sockaddr_in serv_addr;
+		struct sockaddr_in6 serv_addr6;
 		struct sockaddr_un serv_unaddr;
-		int domain;
-
-		if (strcmp(host, "/tmp/hyperhdr-domain") == 0)
-		{
-			domain = AF_UNIX;
-		}
-		else
-		{
-			domain = AF_INET;
-		}
+		int domain = AF_UNIX;
+		int ipFamily = AF_UNIX;
+		if (parseIpAddressFamily(host, ipFamily))
+			domain = ipFamily;
 
 		if ((_sockfd = socket(domain, SOCK_STREAM, 0)) == -1)
 		{
@@ -85,11 +106,11 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 		}
 
 		memset(&serv_addr, '0', sizeof(serv_addr));
+		memset(&serv_addr6, '0', sizeof(serv_addr6));
 		memset(&serv_unaddr, '0', sizeof(serv_unaddr));
 
-		if (domain == AF_INET)
+		if (domain == AF_INET || domain == AF_INET6)
 		{
-			serv_addr.sin_family = AF_INET;
 			int flags = 1;
 			if (setsockopt(_sockfd, SOL_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags)))
 			{
@@ -98,20 +119,39 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 				return 0;
 			}
 
-			serv_addr.sin_port = htons(port);
-
-			if (inet_pton(AF_INET, host, &serv_addr.sin_addr) <= 0)
+			if (domain == AF_INET)
 			{
-				std::cerr << "ERROR: Failed to parse IP address: " << host << std::endl;
-				connectionDestroy();
-				return 0;
+				serv_addr.sin_family = AF_INET;
+				serv_addr.sin_port = htons(port);
+				if (inet_pton(AF_INET, host, &serv_addr.sin_addr) != 1)
+				{
+					std::cerr << "ERROR: Failed to parse IPv4 address: " << host << std::endl;
+					connectionDestroy();
+					return 0;
+				}
+				if (connect(_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+				{
+					std::cerr << "ERROR: Connection Failed " << std::endl;
+					connectionDestroy();
+					return 0;
+				}
 			}
-
-			if (connect(_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+			else
 			{
-				std::cerr << "ERROR: Connection Failed " << std::endl;
-				connectionDestroy();
-				return 0;
+				serv_addr6.sin6_family = AF_INET6;
+				serv_addr6.sin6_port = htons(port);
+				if (inet_pton(AF_INET6, host, &serv_addr6.sin6_addr) != 1)
+				{
+					std::cerr << "ERROR: Failed to parse IPv6 address: " << host << std::endl;
+					connectionDestroy();
+					return 0;
+				}
+				if (connect(_sockfd, (struct sockaddr *)&serv_addr6, sizeof(serv_addr6)) < 0)
+				{
+					std::cerr << "ERROR: Connection Failed " << std::endl;
+					connectionDestroy();
+					return 0;
+				}
 			}
 		}
 		else
