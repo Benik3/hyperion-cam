@@ -25,6 +25,7 @@ Settings can be adjusted by using command line options:
   -g [ --gain ] arg (=1)               Camera gain  
   -b [ --wbgain ] arg (=1.0,1.0)       White balance gains  
   -f [ --focus ] arg (=-1)             Manual focus lens position (-1 keeps default)
+  --saturation arg (=1)                Camera saturation
   -o [ --origin ] arg (=camera)        Name of the origin  
   -c [ --connection ] arg (=127.0.0.1) Socket address (IP or Unix socket path)  
   -p [ --port ] arg (=19400)           TCP port  
@@ -39,6 +40,8 @@ Settings can be adjusted by using command line options:
   --autowb                             One-shot auto white balance calibration (gray 127) and exit
   --autogain                           One-shot auto gain calibration (gray 127) and exit
   --autocalib                          One-shot auto white balance + gain calibration (gray 127) and exit
+  --autosat arg                        One-shot auto saturation calibration using a target color (R,G,B, default) and exit
+  --autosat-iters arg (=24)            Auto saturation max iterations
   --autocalib-iters arg (=8)           Auto calibration max iterations
   --autocalib-delay-ms arg (=500)      Delay between auto calibration updates (ms)
   --autocalib-tol-wb arg (=2)          Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)
@@ -80,7 +83,6 @@ For one-time setup, the app can estimate white balance gains and/or analogue gai
 - The app captures frames in RGB mode (NV12 is ignored).
 - It measures the average color of the centered quarter of the (optionally transformed) image. Example: for 640x480 it measures a centered 320x240 ROI.
 - It iteratively adjusts `--wbgain` (R,B) to make R≈G≈B and `--gain` to reach ≈127 brightness, prints the final values and the final measured RGB, then exits.
-- It iteratively adjusts `--wbgain` (R,B) to make R≈G≈B and `--gain` to reach ≈127 brightness, prints the final values and the final measured RGB, then exits.
   - Use `--autocalib-tol-wb` and `--autocalib-tol-grey` to require tighter convergence.
 
 Auto gain method:
@@ -92,6 +94,25 @@ Examples:
 ./hyperion-cam --autogain
 ./hyperion-cam --autocalib
 ./hyperion-cam --transform "0,0:640,0:0,480:640,480" --autocalib
+```
+
+#### Auto saturation note:
+For one-time setup, the app can estimate camera saturation using a target color.
+
+- Display or place a uniform target image with RGB value `230,50,50` in front of the camera.
+  - You can override the target color by passing `R,G,B` to `--autosat`, e.g. `--autosat 50,230,50` for green.
+- The app captures frames in RGB mode (NV12 is ignored).
+- It measures the average color of the centered quarter of the (optionally transformed) image.
+- It searches saturation so the measured ROI color matches the target color (within a small tolerance), then prints the final saturation and final measured RGB, then exits.
+- Don't use values near end because of clipping (like 255, 0, 0)
+- for some reason with blue target it doesn't work so well, with red and green I have the same result.
+
+Examples:
+```
+./hyperion-cam --autosat
+./hyperion-cam --autosat 50,230,50
+./hyperion-cam --transform "0,0:640,0:0,480:640,480" --autosat
+./hyperion-cam --transform "0,0:640,0:0,480:640,480" --autosat 50,230,50
 ```
 
 #### Picture transformation note:

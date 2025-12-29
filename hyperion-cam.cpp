@@ -133,6 +133,7 @@ std::string _wbgainsStr;
 float _rGain;
 float _bGain;
 float _focus = -1.0f;
+float _saturation = 1.0f;
 std::string _origin;
 std::string _conn;
 int _port;
@@ -153,6 +154,11 @@ static std::atomic<bool> _imgOutDone{false};
 static bool _autoWb = false;
 static bool _autoGain = false;
 static bool _autoCalib = false;
+static bool _autoSat = false;
+static std::string _autoSatTargetSpec;
+static int _autoSatTargetR = 230;
+static int _autoSatTargetG = 50;
+static int _autoSatTargetB = 50;
 static int _autoCalibMaxIters = 8;
 static int _autoCalibWarmupFrames = 2;
 static int _autoCalibDelayMs = 500;
@@ -160,6 +166,11 @@ static float _autoCalibTolWb = 2.0f;
 static float _autoCalibTolGrey = 3.0f;
 static int _autoGainSamples = 8;
 static float _autoGainRange = 4.0f;
+
+static int _autoSatMaxIters = 24;
+static int _autoSatPhase = 0; // 0=init, 1=search-up, 2=bisect
+static float _autoSatLo = 0.0f;
+static float _autoSatHi = 0.0f;
 
 static std::atomic<bool> _autoCalibBusy{false};
 static std::atomic<int> _autoCalibFrameCount{0};
@@ -179,12 +190,35 @@ static size_t _autoGainCurveNextIdx = 0;
 
 static inline bool autoCalibEnabled()
 {
-	return _autoCalib || _autoWb || _autoGain;
+	return _autoCalib || _autoWb || _autoGain || _autoSat;
 }
 
 static inline float clampf(float v, float lo, float hi)
 {
 	return std::max(lo, std::min(hi, v));
+}
+
+static inline bool parseRgbTriplet(std::string spec, int &outR, int &outG, int &outB)
+{
+	if (spec.empty())
+		return false;
+	for (char &ch : spec)
+	{
+		if (ch == ';' || ch == ':')
+			ch = ',';
+	}
+
+	int r = 0, g = 0, b = 0;
+	if (sscanf(spec.c_str(), " %d , %d , %d ", &r, &g, &b) != 3)
+		return false;
+	if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255)
+		return false;
+	if (r == g && g == b)
+		return false;
+	outR = r;
+	outG = g;
+	outB = b;
+	return true;
 }
 
 static inline void applyFocusControls(ControlList &c)
@@ -416,6 +450,183 @@ static void autoCalibProcessBgr(const cv::Mat &bgr)
 
 	const bool needWb = (_autoWb || _autoCalib);
 	const bool needGain = (_autoGain || _autoCalib);
+	const bool needSat = _autoSat;
+
+	// Auto saturation calibration (one-shot).
+	// Show a uniform target color (default RGB=230,25,25). Low saturation drives the ROI towards
+	// grey; high saturation overshoots/starts clipping. We search for a saturation value that yields
+	// the target ROI color.
+	if (needSat)
+	{
+		if (needWb || needGain)
+		{
+			std::cout << "ERROR: --autosat must be run alone (do not combine with --autowb/--autogain/--autocalib)" << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		if (iters >= _autoSatMaxIters)
+		{
+			std::cout << "AutoSat reached max iterations: saturation=" << _saturation
+					  << " avg RGB=" << r << "," << g << "," << b << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		constexpr float satMax = 32.0f;
+		constexpr float satTol = 0.02f;
+		constexpr float clip = 254.5f;
+		constexpr float tolRgb = 3.0f;
+		const float targetR = static_cast<float>(_autoSatTargetR);
+		const float targetG = static_cast<float>(_autoSatTargetG);
+		const float targetB = static_cast<float>(_autoSatTargetB);
+		const bool clipped = (r >= clip) || (g >= clip) || (b >= clip);
+		const bool rgbOk = (std::fabs(r - targetR) <= tolRgb) && (std::fabs(g - targetG) <= tolRgb) && (std::fabs(b - targetB) <= tolRgb);
+		// Metric for bisection/bracketing:
+		// Saturation tends to scale chroma around a neutral axis. For general targets (e.g. green),
+		// use the projection of measured chroma onto target chroma direction.
+		const float y = (r + g + b) / 3.0f;
+		const float cr = r - y;
+		const float cg = g - y;
+		const float cb = b - y;
+		const float ty = (targetR + targetG + targetB) / 3.0f;
+		const float tcr = targetR - ty;
+		const float tcg = targetG - ty;
+		const float tcb = targetB - ty;
+		const float metric = (cr * tcr) + (cg * tcg) + (cb * tcb);
+		const float metricTarget = (tcr * tcr) + (tcg * tcg) + (tcb * tcb);
+		if (metricTarget < 1e-3f)
+		{
+			std::cout << "ERROR: --autosat target must not be grey (R,G,B all equal)" << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		std::lock_guard<std::mutex> lock(_autoCalibMutex);
+		const float curSat = clampf(_saturation, 0.0f, satMax);
+		_saturation = curSat;
+
+		if (_autoSatPhase == 0)
+		{
+			_autoSatPhase = 1;
+			_autoSatLo = 0.0f;
+			_autoSatHi = 0.0f;
+			_saturation = 0.0f;
+			_autoCalibIterCount.store(0, std::memory_order_release);
+			if (_verbose)
+				std::cout << "AutoSat init: target RGB=" << targetR << "," << targetG << "," << targetB
+						  << " set saturation=" << _saturation << " (avg RGB=" << r << "," << g << "," << b << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		if (rgbOk)
+		{
+			std::cout << "AutoSat done: saturation=" << _saturation << " avg RGB=" << r << "," << g << "," << b << std::endl;
+			imgOutExit(EXIT_SUCCESS);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		if (_autoSatPhase == 1)
+		{
+			// Bracket the solution: find lo where metric < metricTarget and hi where metric >= metricTarget (or clipped).
+			if (clipped || metric >= metricTarget)
+			{
+				if (curSat <= 1e-3f)
+				{
+					std::cout << "AutoSat failed: target already reached at saturation=" << curSat
+							  << " (reduce exposure/gain or use a darker target)" << std::endl;
+					imgOutExit(EXIT_FAILURE);
+					_autoCalibBusy.store(false, std::memory_order_release);
+					return;
+				}
+
+				_autoSatHi = curSat;
+				// _autoSatLo should already be the last saturation below target chroma.
+				if (_autoSatLo >= _autoSatHi)
+					_autoSatLo = std::max(0.0f, _autoSatHi * 0.5f);
+				_autoSatPhase = 2;
+
+				_saturation = clampf((_autoSatLo + _autoSatHi) * 0.5f, 0.0f, satMax);
+				_autoCalibIterCount.fetch_add(1, std::memory_order_acq_rel);
+				if (_verbose)
+					std::cout << "AutoSat bracket: lo=" << _autoSatLo << " hi=" << _autoSatHi
+							  << " -> next saturation=" << _saturation
+							  << " (metric=" << metric << " target=" << metricTarget << ")" << std::endl;
+				if (_autoCalibDelayMs > 0)
+					_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+				_autoCalibBusy.store(false, std::memory_order_release);
+				return;
+			}
+
+			// Still below target and not clipped: step saturation upward.
+			_autoSatLo = curSat;
+			float next = (curSat <= 1e-3f) ? 0.25f : (curSat * 1.5f);
+			next = clampf(next, 0.0f, satMax);
+			if (next <= curSat + 1e-6f)
+				next = clampf(curSat + 0.1f, 0.0f, satMax);
+
+			if (next >= satMax - 1e-6f && metric < metricTarget)
+			{
+				std::cout << "AutoSat failed: did not reach target up to saturation=" << satMax
+						  << " (avg RGB=" << r << "," << g << "," << b << ", metric=" << metric << ")" << std::endl;
+				imgOutExit(EXIT_FAILURE);
+				_autoCalibBusy.store(false, std::memory_order_release);
+				return;
+			}
+
+			_saturation = next;
+			_autoCalibIterCount.fetch_add(1, std::memory_order_acq_rel);
+			if (_verbose)
+				std::cout << "AutoSat step: set saturation=" << _saturation
+						  << " (avg RGB=" << r << "," << g << "," << b << ", metric=" << metric << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		// Phase 2: bisect within [lo,hi]. Current measurement corresponds to current saturation.
+		if (_autoSatPhase == 2)
+		{
+			if (clipped || metric >= metricTarget)
+				_autoSatHi = curSat;
+			else
+				_autoSatLo = curSat;
+
+			if ((_autoSatHi - _autoSatLo) <= satTol)
+			{
+				_saturation = clampf(_autoSatHi, 0.0f, satMax);
+				std::cout << "AutoSat done: saturation=" << _saturation
+						  << " avg RGB=" << r << "," << g << "," << b << std::endl;
+				imgOutExit(EXIT_SUCCESS);
+				_autoCalibBusy.store(false, std::memory_order_release);
+				return;
+			}
+
+			_saturation = clampf((_autoSatLo + _autoSatHi) * 0.5f, 0.0f, satMax);
+			_autoCalibIterCount.fetch_add(1, std::memory_order_acq_rel);
+			if (_verbose)
+				std::cout << "AutoSat bisect: lo=" << _autoSatLo << " hi=" << _autoSatHi
+						  << " -> next saturation=" << _saturation
+						  << " (metric=" << metric << " target=" << metricTarget << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		// Should not happen.
+		_autoSatPhase = 0;
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return;
+	}
 	const float targetGrey = 127.0f;
 	const float gainRef = needWb ? g : avg;
 	const float gainOkRef = avg;
@@ -1426,6 +1637,7 @@ static void processRequest(Request *request)
 
 	request->reuse(Request::ReuseBuffers);
 	applyFocusControls(request->controls());
+	request->controls().set(controls::Saturation, _saturation);
 	if (autoCalibEnabled())
 	{
 		// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
@@ -1437,6 +1649,7 @@ static void processRequest(Request *request)
 		c.set(controls::ExposureTime, _shutter);
 		c.set(controls::AnalogueGain, _gain);
 		c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
+		c.set(controls::Saturation, _saturation);
 	}
 	_camera->queueRequest(request);
 }
@@ -1462,6 +1675,8 @@ int main(int argc, char *argv[])
 		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit") //
 		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit") //
 		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit") //
+		("autosat", po::value<std::string>(&_autoSatTargetSpec)->implicit_value(""), "One-shot auto saturation calibration and exit (optional arg: R,G,B target; default 230,50,50)") //
+		("autosat-iters", po::value<int>(&_autoSatMaxIters)->default_value(24), "Auto saturation max iterations") //
 		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations") //
 		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)") //
 		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)") //
@@ -1470,12 +1685,30 @@ int main(int argc, char *argv[])
 		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)") //
 		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus") //
 		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)") //
+		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation") //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
 
 	po::variables_map vm;
 	po::store(po::parse_command_line(argc, argv, options), vm);
 	po::notify(vm);
+
+	_autoSat = (vm.count("autosat") > 0);
+	if (_autoSat)
+	{
+		if (!_autoSatTargetSpec.empty())
+		{
+			int tr = 0, tg = 0, tb = 0;
+			if (!parseRgbTriplet(_autoSatTargetSpec, tr, tg, tb))
+			{
+				std::cout << "ERROR: Invalid --autosat target. Use R,G,B with 0..255 (non-grey), e.g. --autosat 230,25,25" << std::endl;
+				return EXIT_FAILURE;
+			}
+			_autoSatTargetR = tr;
+			_autoSatTargetG = tg;
+			_autoSatTargetB = tb;
+		}
+	}
 
 	if (_help)
 	{
@@ -1781,6 +2014,7 @@ int main(int argc, char *argv[])
 		applyFocusControls(controls);
 		controls.set(controls::AwbEnable, false);
 		controls.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
+		controls.set(controls::Saturation, _saturation);
 
 		requests.push_back(std::move(request));
 	}
@@ -1809,7 +2043,7 @@ int main(int argc, char *argv[])
 	controls.set(controls::Contrast, 1.0);
 	controls.set(controls::AwbEnable, false);
 	controls.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
-	controls.set(controls::Saturation, 1.0);
+	controls.set(controls::Saturation, _saturation);
 	controls.set(controls::Sharpness, 0.0);
 	controls.set(controls::FrameDurationLimits, libcamera::Span<const int64_t, 2>({INT64_C(100), INT64_C(1000000)}));
 
