@@ -24,6 +24,7 @@ Settings can be adjusted by using command line options:
   -s [ --shutter ] arg (=16666)        Shutter speed in us  
   -g [ --gain ] arg (=1)               Camera gain  
   -b [ --wbgain ] arg (=1.0,1.0)       White balance gains  
+  -f [ --focus ] arg (=-1)             Manual focus lens position (-1 keeps default)
   -o [ --origin ] arg (=camera)        Name of the origin  
   -c [ --connection ] arg (=127.0.0.1) Socket address (IP or Unix socket path)  
   -p [ --port ] arg (=19400)           TCP port  
@@ -44,6 +45,7 @@ Settings can be adjusted by using command line options:
   --autocalib-tol-grey arg (=3)        Auto gain convergence tolerance (abs avg RGB error from 127)
   --autocalib-gain-samples arg (=8)    Auto gain samples (curve-fit)
   --autocalib-gain-range arg (=4)      Auto gain range multiplier (min=gain/range, max=gain*range)
+  --autofocus-once                     Run autofocus once at startup, print focus value, then lock manual focus
 ```
 
 ### One-shot image capture (`--imgout`)
@@ -57,6 +59,12 @@ Examples:
 ./hyperion-cam --transform "0,0:640,0:0,480:640,480" --imgout /tmp/frame.png
 ./hyperion-cam --cpuonly --transform "..." --imgout /tmp/frame.png
 ```
+
+#### Focus note:
+For autofocus-capable cameras (e.g. Camera Module 3), the app forces autofocus into manual mode.
+Use `--focus` to set the manual lens position.
+
+Use `--autofocus-once` to run autofocus once, print the resulting focus position, and then lock to manual focus. You can reuse then this auto value with the `--focus` option
 
 #### Shutter note:
 The shutter speed modifies the exposition time of the camera and FPS. The camera doesn't have fixed FPS, but the frames are released as soon as they are available. The value is in micro seconds.

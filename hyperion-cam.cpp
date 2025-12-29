@@ -132,6 +132,7 @@ float _gain;
 std::string _wbgainsStr;
 float _rGain;
 float _bGain;
+float _focus = -1.0f;
 std::string _origin;
 std::string _conn;
 int _port;
@@ -141,6 +142,11 @@ std::string _imgOutPath;
 bool _transformEn = false;
 bool _verbose = false;
 bool _help = false;
+
+static bool _autoFocusOnce = false;
+static std::atomic<int> _autoFocusPhase{0}; // 0=disabled, 1=running, 2=locked
+static std::atomic<bool> _autoFocusTriggerSent{false};
+static std::atomic<float> _autoFocusLockedPos{-1.0f};
 
 static std::atomic<bool> _imgOutDone{false};
 
@@ -179,6 +185,65 @@ static inline bool autoCalibEnabled()
 static inline float clampf(float v, float lo, float hi)
 {
 	return std::max(lo, std::min(hi, v));
+}
+
+static inline void applyFocusControls(ControlList &c)
+{
+	if (_autoFocusOnce)
+	{
+		const int phase = _autoFocusPhase.load(std::memory_order_acquire);
+		if (phase == 1)
+		{
+			c.set(controls::AfMode, controls::AfModeEnum::AfModeAuto);
+			if (!_autoFocusTriggerSent.exchange(true, std::memory_order_acq_rel))
+				c.set(controls::AfTrigger, controls::AfTriggerEnum::AfTriggerStart);
+			return;
+		}
+
+		if (phase == 2)
+		{
+			c.set(controls::AfMode, controls::AfModeEnum::AfModeManual);
+			const float pos = _autoFocusLockedPos.load(std::memory_order_acquire);
+			if (pos >= 0.0f)
+				c.set(controls::LensPosition, pos);
+			return;
+		}
+	}
+
+	// Default: manual focus.
+	c.set(controls::AfMode, controls::AfModeEnum::AfModeManual);
+	if (_focus >= 0.0f)
+		c.set(controls::LensPosition, _focus);
+}
+
+static inline void handleAutoFocusMetadata(Request *request)
+{
+	if (!_autoFocusOnce)
+		return;
+	if (_autoFocusPhase.load(std::memory_order_acquire) != 1)
+		return;
+
+	ControlList &md = request->metadata();
+	auto afStateOpt = md.get(controls::AfState);
+	if (!afStateOpt)
+		return;
+
+	const auto afState = static_cast<controls::AfStateEnum>(*afStateOpt);
+	if (afState != controls::AfStateEnum::AfStateFocused && afState != controls::AfStateEnum::AfStateFailed)
+		return;
+
+	float pos = -1.0f;
+	auto posOpt = md.get(controls::LensPosition);
+	if (posOpt)
+		pos = *posOpt;
+
+	_autoFocusLockedPos.store(pos, std::memory_order_release);
+	_autoFocusPhase.store(2, std::memory_order_release);
+
+	if (pos >= 0.0f)
+		std::cout << "AutoFocus done: focus=" << pos << std::endl;
+	else
+		std::cout << "AutoFocus done: LensPosition unavailable" << std::endl;
 }
 
 static bool fitGainLogLinear(const std::vector<float> &gains, const std::vector<float> &ys, float targetY, float &outGain)
@@ -1204,6 +1269,8 @@ static void requestComplete(Request *request)
 	if (request->status() == Request::RequestCancelled)
 		return;
 
+	handleAutoFocusMetadata(request);
+
 	_loop.callLater(std::bind(&processRequest, request));
 }
 
@@ -1358,6 +1425,7 @@ static void processRequest(Request *request)
 	}
 
 	request->reuse(Request::ReuseBuffers);
+	applyFocusControls(request->controls());
 	if (autoCalibEnabled())
 	{
 		// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
@@ -1365,6 +1433,7 @@ static void processRequest(Request *request)
 		ControlList &c = request->controls();
 		c.set(controls::AeEnable, false);
 		c.set(controls::AwbEnable, false);
+		applyFocusControls(c);
 		c.set(controls::ExposureTime, _shutter);
 		c.set(controls::AnalogueGain, _gain);
 		c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
@@ -1399,6 +1468,8 @@ int main(int argc, char *argv[])
 		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)") //
 		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)") //
 		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)") //
+		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus") //
+		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)") //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
 
@@ -1411,6 +1482,13 @@ int main(int argc, char *argv[])
 		std::cout << std::endl
 				  << options << std::endl;
 		return 0;
+	}
+
+	if (_autoFocusOnce)
+	{
+		_autoFocusPhase.store(1, std::memory_order_release);
+		_autoFocusTriggerSent.store(false, std::memory_order_release);
+		_autoFocusLockedPos.store(-1.0f, std::memory_order_release);
 	}
 
 	if (vm.count("transform"))
@@ -1700,6 +1778,7 @@ int main(int argc, char *argv[])
 		}
 
 		ControlList &controls = request->controls();
+		applyFocusControls(controls);
 		controls.set(controls::AwbEnable, false);
 		controls.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 
@@ -1723,6 +1802,7 @@ int main(int argc, char *argv[])
 	// controls the setting of camera
 	ControlList controls;
 	controls.set(controls::AeEnable, false);
+	applyFocusControls(controls);
 	controls.set(controls::ExposureTime, _shutter);
 	controls.set(controls::AnalogueGain, _gain);
 	controls.set(controls::Brightness, 0.0);
