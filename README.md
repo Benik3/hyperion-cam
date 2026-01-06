@@ -26,6 +26,7 @@ Settings can be adjusted by using command line options:
   -b [ --wbgain ] arg (=1.0,1.0)       White balance gains  
   -f [ --focus ] arg (=-1)             Manual focus lens position (-1 keeps default)
   --saturation arg (=1)                Camera saturation
+  --contrast arg (=1)                  Camera contrast
   -o [ --origin ] arg (=camera)        Name of the origin  
   -c [ --connection ] arg (=127.0.0.1) Socket address (IP or Unix socket path)  
   -p [ --port ] arg (=19400)           TCP port  
@@ -36,6 +37,7 @@ Settings can be adjusted by using command line options:
   --nv12                               Enable NV12 format output (default is BGR888)
   --cpuonly                            Force CPU transform even if GPU is available
   -v [ --verbose ]                     Verbose output  
+  --version                            Print version and exit
   --help                               Print help  
   --autowb                             One-shot auto white balance calibration (gray 127) and exit
   --autogain                           One-shot auto gain calibration (gray 127) and exit

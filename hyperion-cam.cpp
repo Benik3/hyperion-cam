@@ -115,6 +115,8 @@ static EventLoop _loopTr;
 FlatBufferConnection _flatbuf;
 OpencvTransform *_transformation;
 
+static constexpr const char *HYPERCAM_VERSION = "1.0.0";
+
 #ifdef HAVE_GPU_TRANSFORM
 GpuNv12Transform *_gpuNv12 = nullptr;
 GpuRgbTransform *_gpuRgb = nullptr;
@@ -134,6 +136,7 @@ float _rGain;
 float _bGain;
 float _focus = -1.0f;
 float _saturation = 1.0f;
+float _contrast = 1.0f;
 std::string _origin;
 std::string _conn;
 int _port;
@@ -143,6 +146,7 @@ std::string _imgOutPath;
 bool _transformEn = false;
 bool _verbose = false;
 bool _help = false;
+bool _version = false;
 
 static bool _autoFocusOnce = false;
 static std::atomic<int> _autoFocusPhase{0}; // 0=disabled, 1=running, 2=locked
@@ -1638,6 +1642,7 @@ static void processRequest(Request *request)
 	request->reuse(Request::ReuseBuffers);
 	applyFocusControls(request->controls());
 	request->controls().set(controls::Saturation, _saturation);
+	request->controls().set(controls::Contrast, _contrast);
 	if (autoCalibEnabled())
 	{
 		// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
@@ -1650,6 +1655,7 @@ static void processRequest(Request *request)
 		c.set(controls::AnalogueGain, _gain);
 		c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 		c.set(controls::Saturation, _saturation);
+		c.set(controls::Contrast, _contrast);
 	}
 	_camera->queueRequest(request);
 }
@@ -1686,6 +1692,8 @@ int main(int argc, char *argv[])
 		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus") //
 		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)") //
 		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation") //
+		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast") //
+		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit") //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
 		;
 
@@ -1710,12 +1718,20 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (_version)
+	{
+		std::cout << "hyperion-cam " << HYPERCAM_VERSION << std::endl;
+		return 0;
+	}
+
 	if (_help)
 	{
 		std::cout << std::endl
 				  << options << std::endl;
 		return 0;
 	}
+
+	std::cout << "INFO: hyperion-cam version " << HYPERCAM_VERSION << std::endl;
 
 	if (_autoFocusOnce)
 	{
@@ -2015,6 +2031,7 @@ int main(int argc, char *argv[])
 		controls.set(controls::AwbEnable, false);
 		controls.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 		controls.set(controls::Saturation, _saturation);
+		controls.set(controls::Contrast, _contrast);
 
 		requests.push_back(std::move(request));
 	}
@@ -2040,7 +2057,7 @@ int main(int argc, char *argv[])
 	controls.set(controls::ExposureTime, _shutter);
 	controls.set(controls::AnalogueGain, _gain);
 	controls.set(controls::Brightness, 0.0);
-	controls.set(controls::Contrast, 1.0);
+	controls.set(controls::Contrast, _contrast);
 	controls.set(controls::AwbEnable, false);
 	controls.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 	controls.set(controls::Saturation, _saturation);
