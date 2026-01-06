@@ -413,19 +413,24 @@ static void autoCalibProcessBgr(const cv::Mat &bgr)
 		return;
 	}
 
-	// Central quarter: half width/height, centered.
-	const int roiW = w / 2;
-	const int roiH = h / 2;
-	const int roiX = (w - roiW) / 2;
-	const int roiY = (h - roiH) / 2;
-	if (roiW <= 0 || roiH <= 0)
+	// Outline box ROI: edge strips (top/bottom/left/right), thickness = 1/8 of image.
+	// This focuses calibration on the picture edges rather than the center.
+	const int tX = std::max(1, w / 8);
+	const int tY = std::max(1, h / 8);
+	if (tX <= 0 || tY <= 0 || tX > w || tY > h)
 	{
-		std::cout << "ERROR: Invalid ROI size for auto calibration" << std::endl;
+		std::cout << "ERROR: Invalid ROI thickness for auto calibration" << std::endl;
 		imgOutExit(EXIT_FAILURE);
 		return;
 	}
 
-	cv::Scalar meanBgr = cv::mean(bgr(cv::Rect(roiX, roiY, roiW, roiH)));
+	cv::Mat mask(h, w, CV_8UC1, cv::Scalar(0));
+	mask(cv::Rect(0, 0, w, tY)).setTo(255);
+	mask(cv::Rect(0, h - tY, w, tY)).setTo(255);
+	mask(cv::Rect(0, 0, tX, h)).setTo(255);
+	mask(cv::Rect(w - tX, 0, tX, h)).setTo(255);
+
+	cv::Scalar meanBgr = cv::mean(bgr, mask);
 	const float b = static_cast<float>(meanBgr[0]);
 	const float g = static_cast<float>(meanBgr[1]);
 	const float r = static_cast<float>(meanBgr[2]);

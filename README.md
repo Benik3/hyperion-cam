@@ -83,7 +83,8 @@ For one-time setup, the app can estimate white balance gains and/or analogue gai
 
 - Display or place a uniform gray image with RGB value `127,127,127` in front of the camera.
 - The app captures frames in RGB mode (NV12 is ignored).
-- It measures the average color of the centered quarter of the (optionally transformed) image. Example: for 640x480 it measures a centered 320x240 ROI.
+- It measures the average color of an outline box ROI made from the image edges (optionally transformed): top/bottom/left/right strips, each with thickness = 1/8 of image size.
+  - Example: for 640x480 it uses 80px strips (top/bottom) and 60px strips (left/right).
 - It iteratively adjusts `--wbgain` (R,B) to make R≈G≈B and `--gain` to reach ≈127 brightness, prints the final values and the final measured RGB, then exits.
   - Use `--autocalib-tol-wb` and `--autocalib-tol-grey` to require tighter convergence.
 
@@ -104,7 +105,7 @@ For one-time setup, the app can estimate camera saturation using a target color.
 - Display or place a uniform target image with RGB value `230,50,50` in front of the camera.
   - You can override the target color by passing `R,G,B` to `--autosat`, e.g. `--autosat 50,230,50` for green.
 - The app captures frames in RGB mode (NV12 is ignored).
-- It measures the average color of the centered quarter of the (optionally transformed) image.
+- It measures the average color of an outline box ROI made from the image edges (optionally transformed): top/bottom/left/right strips, each with thickness = 1/8 of image size.
 - It searches saturation so the measured ROI color matches the target color (within a small tolerance), then prints the final saturation and final measured RGB, then exits.
 - Don't use values near end because of clipping (like 255, 0, 0)
 - for some reason with blue target it doesn't work so well, with red and green I have the same result.
