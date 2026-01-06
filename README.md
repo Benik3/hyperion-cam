@@ -134,6 +134,32 @@ These are optional environment variables used mainly for profiling and tuning:
 
 GPU paths attempt DMA-BUF import automatically (zero-copy upload when supported) and fall back to CPU upload if not available.
 
+## How to build
+This project uses CMake and pkg-config.
+
+Dependencies (Debian/Ubuntu/Raspberry Pi OS):
+```
+sudo apt update
+sudo apt install -y \
+  build-essential cmake pkg-config \
+  libcamera-dev libevent-dev libboost-program-options-dev libopencv-dev
+```
+
+Optional but recommended (GPU transform support):
+```
+sudo apt install -y libegl1-mesa-dev libgles2-mesa-dev
+```
+
+Build:
+```
+mkdir -p Release
+cd Release
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j
+```
+
+The binary will be at `Release/hyperion-cam`.
+
 ## Credits
 The camera part is based on [simple-cam](https://git.libcamera.org/libcamera/simple-cam.git) example from libcamera  
 The OpenCV part is based on [OpenCV example](https://docs.opencv.org/3.4/da/d6e/tutorial_py_geometric_transformations.html)  
