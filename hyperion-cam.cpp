@@ -1139,7 +1139,7 @@ static flatbuffers::DetachedBuffer buildRawImageRequestUninitialized(uint16_t wi
 }
 
 static flatbuffers::DetachedBuffer buildNV12ImageRequestUninitialized(uint16_t width, uint16_t height, uint16_t strideY, uint16_t strideUV,
-										  uint8_t **outY, uint8_t **outUV)
+																	  uint8_t **outY, uint8_t **outUV)
 {
 	const size_t yBytes = static_cast<size_t>(strideY) * static_cast<size_t>(height);
 	const size_t uvBytes = static_cast<size_t>(strideUV) * (static_cast<size_t>(height) / 2u);
@@ -1197,7 +1197,8 @@ static void transformImg(uint8_t *img)
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([reqPtr]() mutable
+					  { flatBufSendRequest(std::move(*reqPtr)); });
 }
 
 static void transformImgNv12(uint8_t *y, uint8_t *uv)
@@ -1330,7 +1331,8 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([reqPtr]() mutable
+					  { flatBufSendRequest(std::move(*reqPtr)); });
 }
 
 static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY, int fdUV, int offUV)
@@ -1385,7 +1387,8 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([reqPtr]() mutable
+					  { flatBufSendRequest(std::move(*reqPtr)); });
 #endif
 }
 
@@ -1431,7 +1434,8 @@ static void transformImgRgbGpu(uint8_t *img)
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([reqPtr]() mutable
+					  { flatBufSendRequest(std::move(*reqPtr)); });
 #endif
 }
 
@@ -1478,7 +1482,8 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([reqPtr]() mutable
+					  { flatBufSendRequest(std::move(*reqPtr)); });
 #endif
 }
 
@@ -1526,11 +1531,13 @@ static void processRequest(Request *request)
 								fd = p0.fd.get();
 								off = static_cast<int>(p0.offset);
 							}
-							_loopTr.callLater([img, fd, off]() { autoCalibFromTransformedGpu(img, fd, off); });
+							_loopTr.callLater([img, fd, off]()
+											  { autoCalibFromTransformedGpu(img, fd, off); });
 						}
 						else
 						{
-							_loopTr.callLater([img]() { autoCalibFromTransformedCpu(img); });
+							_loopTr.callLater([img]()
+											  { autoCalibFromTransformedCpu(img); });
 						}
 					}
 					else
@@ -1559,11 +1566,13 @@ static void processRequest(Request *request)
 						fd = p0.fd.get();
 						off = static_cast<int>(p0.offset);
 					}
-					_loopTr.callLater([img, fd, off]() { imgOutSaveTransformedGpu(img, fd, off); });
+					_loopTr.callLater([img, fd, off]()
+									  { imgOutSaveTransformedGpu(img, fd, off); });
 				}
 				else
 				{
-					_loopTr.callLater([img]() { imgOutSaveTransformedCpu(img); });
+					_loopTr.callLater([img]()
+									  { imgOutSaveTransformedCpu(img); });
 				}
 			}
 			else
@@ -1596,11 +1605,13 @@ static void processRequest(Request *request)
 						int fdUV = p1.fd.get();
 						int offY = static_cast<int>(p0.offset);
 						int offUV = static_cast<int>(p1.offset);
-						_loopTr.callLater([y, uv, fdY, offY, fdUV, offUV]() { transformImgNv12GpuDmabuf(y, uv, fdY, offY, fdUV, offUV); });
+						_loopTr.callLater([y, uv, fdY, offY, fdUV, offUV]()
+										  { transformImgNv12GpuDmabuf(y, uv, fdY, offY, fdUV, offUV); });
 					}
 				}
 				else
-					_loopTr.callLater([y, uv]() { transformImgNv12(y, uv); });
+					_loopTr.callLater([y, uv]()
+									  { transformImgNv12(y, uv); });
 			}
 			else
 			{
@@ -1613,15 +1624,18 @@ static void processRequest(Request *request)
 						const FrameBuffer::Plane &p0 = buffer->planes()[0];
 						int fd = p0.fd.get();
 						int off = static_cast<int>(p0.offset);
-						_loopTr.callLater([fd, off]() { transformImgRgbGpuDmabuf(fd, off); });
+						_loopTr.callLater([fd, off]()
+										  { transformImgRgbGpuDmabuf(fd, off); });
 					}
 					else
 					{
-						_loopTr.callLater([img]() { transformImgRgbGpu(img); });
+						_loopTr.callLater([img]()
+										  { transformImgRgbGpu(img); });
 					}
 				}
 				else
-					_loopTr.callLater([img]() { transformImg(img); });
+					_loopTr.callLater([img]()
+									  { transformImg(img); });
 			}
 		}
 		else
@@ -1634,12 +1648,14 @@ static void processRequest(Request *request)
 					continue;
 				uint8_t *y = it->second[0].data();
 				uint8_t *uv = it->second[1].data();
-				_loopFb.callLater([y, uv]() { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend); });
+				_loopFb.callLater([y, uv]()
+								  { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend); });
 			}
 			else
 			{
 				uint8_t *img = it->second[0].data();
-				_loopFb.callLater([img]() { flatBufSend(img); });
+				_loopFb.callLater([img]()
+								  { flatBufSend(img); });
 			}
 		}
 	}
@@ -1668,38 +1684,38 @@ static void processRequest(Request *request)
 int main(int argc, char *argv[])
 {
 	po::options_description options("Options");
-	options.add_options()																										   //
-		("width,w", po::value<int>(&_width)->default_value(640), "Width")														   //
-		("height,h", po::value<int>(&_height)->default_value(480), "Height")													   //
-		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")								   //
-		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")													   //
-		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")						   //
-		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")							   //
-		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or Unix socket path)") //
-		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")													   //
-		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")										   //
-		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")		   //
-		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")			   //
-		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")		   //
-		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")										   //
-		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")			   //
-		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit") //
-		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit") //
-		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit") //
+	options.add_options()																																							  //
+		("width,w", po::value<int>(&_width)->default_value(640), "Width")																											  //
+		("height,h", po::value<int>(&_height)->default_value(480), "Height")																										  //
+		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")																					  //
+		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")																										  //
+		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")																			  //
+		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")																				  //
+		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or Unix socket path)")														  //
+		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")																										  //
+		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")																							  //
+		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")															  //
+		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")																	  //
+		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")																  //
+		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")																							  //
+		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")																	  //
+		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit")													  //
+		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit")														  //
+		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit")										  //
 		("autosat", po::value<std::string>(&_autoSatTargetSpec)->implicit_value(""), "One-shot auto saturation calibration and exit (optional arg: R,G,B target; default 230,50,50)") //
-		("autosat-iters", po::value<int>(&_autoSatMaxIters)->default_value(24), "Auto saturation max iterations") //
-		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations") //
-		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)") //
-		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)") //
-		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)") //
-		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)") //
-		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)") //
-		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus") //
-		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)") //
-		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation") //
-		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast") //
-		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit") //
-		("help", po::bool_switch(&_help)->default_value(false), "Print help")													   //
+		("autosat-iters", po::value<int>(&_autoSatMaxIters)->default_value(24), "Auto saturation max iterations")																	  //
+		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations")																  //
+		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)")												  //
+		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)")							  //
+		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)")							  //
+		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)")															  //
+		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)")								  //
+		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus")							  //
+		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)")																  //
+		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation")																					  //
+		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast")																							  //
+		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																						  //
+		("help", po::bool_switch(&_help)->default_value(false), "Print help")																										  //
 		;
 
 	po::variables_map vm;
@@ -1909,7 +1925,15 @@ int main(int argc, char *argv[])
 			_swapRb4 = false;
 		}
 	}
-	streamConfig.colorSpace = libcamera::ColorSpace::fromString("Rec709/Rec709/None/Full");
+
+	if (_useNv12)
+	{
+		streamConfig.colorSpace = libcamera::ColorSpace::Smpte170m;
+	}
+	else
+	{
+		streamConfig.colorSpace = libcamera::ColorSpace::Rec709;
+	}
 
 	libcamera::Size mySize(_width, _height);
 	streamConfig.size = mySize;
