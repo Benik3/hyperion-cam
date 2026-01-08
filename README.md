@@ -22,6 +22,7 @@ Settings can be adjusted by using command line options:
   -w [ --width ] arg (=640)            Width  
   -h [ --height ] arg (=480)           Height  
   -s [ --shutter ] arg (=16666)        Shutter speed in us  
+  --fps arg (=0)                       Target FPS limit (0=disabled, adds delay to maintain frame rate)
   -g [ --gain ] arg (=1)               Camera gain  
   -b [ --wbgain ] arg (=1.0,1.0)       White balance gains  
   -f [ --focus ] arg (=-1)             Manual focus lens position (-1 keeps default)
@@ -70,6 +71,15 @@ For autofocus-capable cameras (e.g. Camera Module 3), the app forces autofocus i
 Use `--focus` to set the manual lens position.
 
 Use `--autofocus-once` to run autofocus once, print the resulting focus position, and then lock to manual focus. You can reuse then this auto value with the `--focus` option
+
+#### FPS note:
+The `--fps` option limits the maximum frame rate using libcamera's `FrameDurationLimits` control. When set, the camera will maintain the specified frame rate.
+
+**Important:** FPS also limits the maximum shutter speed. The shutter speed will never be longer than the time available for a single frame at the specified FPS. For example:
+- At 30 FPS, the frame duration is ~33.3ms, so shutter speed cannot exceed 33333 µs
+- At 60 FPS, the frame duration is ~16.7ms, so shutter speed cannot exceed 16666 µs
+
+If you need longer exposure times for low-light conditions, use a lower FPS value or set `--fps 0` to disable the frame rate limit.
 
 #### Shutter note:
 The shutter speed modifies the exposition time of the camera and FPS. The camera doesn't have fixed FPS, but the frames are released as soon as they are available. The value is in micro seconds.

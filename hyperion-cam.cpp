@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <thread>
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -154,6 +155,9 @@ static std::atomic<bool> _autoFocusTriggerSent{false};
 static std::atomic<float> _autoFocusLockedPos{-1.0f};
 
 static std::atomic<bool> _imgOutDone{false};
+
+// FPS control
+static float _targetFps = 0.0f; // 0 = disabled (no FPS limit)
 
 static bool _autoWb = false;
 static bool _autoGain = false;
@@ -1661,23 +1665,31 @@ static void processRequest(Request *request)
 	}
 
 	request->reuse(Request::ReuseBuffers);
-	applyFocusControls(request->controls());
-	request->controls().set(controls::Saturation, _saturation);
-	request->controls().set(controls::Contrast, _contrast);
-	if (autoCalibEnabled())
+	
+	// Only update controls per-frame when auto-calibration/focus features are enabled
+	if (autoCalibEnabled() || _autoFocusOnce)
 	{
-		// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
-		// without restarting the camera.
 		ControlList &c = request->controls();
-		c.set(controls::AeEnable, false);
-		c.set(controls::AwbEnable, false);
+		
+		// Apply focus controls (changes when auto-focus is active)
 		applyFocusControls(c);
-		c.set(controls::ExposureTime, _shutter);
-		c.set(controls::AnalogueGain, _gain);
-		c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
+		
+		// Apply saturation/contrast (changes when auto-saturation is active)
 		c.set(controls::Saturation, _saturation);
 		c.set(controls::Contrast, _contrast);
+		
+		if (autoCalibEnabled())
+		{
+			// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
+			// without restarting the camera.
+			c.set(controls::AeEnable, false);
+			c.set(controls::AwbEnable, false);
+			c.set(controls::ExposureTime, _shutter);
+			c.set(controls::AnalogueGain, _gain);
+			c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
+		}
 	}
+	
 	_camera->queueRequest(request);
 }
 // Main loop
@@ -1688,6 +1700,7 @@ int main(int argc, char *argv[])
 		("width,w", po::value<int>(&_width)->default_value(640), "Width")																											  //
 		("height,h", po::value<int>(&_height)->default_value(480), "Height")																										  //
 		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")																					  //
+		("fps", po::value<float>(&_targetFps)->default_value(0.0f), "Target FPS limit (0=disabled, adds delay to maintain frame rate)")											  //
 		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")																										  //
 		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")																			  //
 		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")																				  //
@@ -2083,7 +2096,9 @@ int main(int argc, char *argv[])
 	ControlList controls;
 	controls.set(controls::AeEnable, false);
 	applyFocusControls(controls);
+	controls.set(controls::ExposureTimeMode, controls::ExposureTimeModeEnum::ExposureTimeModeManual );
 	controls.set(controls::ExposureTime, _shutter);
+	controls.set(controls::AnalogueGainMode, controls::AnalogueGainModeEnum::AnalogueGainModeManual );
 	controls.set(controls::AnalogueGain, _gain);
 	controls.set(controls::Brightness, 0.0);
 	controls.set(controls::Contrast, _contrast);
@@ -2091,7 +2106,22 @@ int main(int argc, char *argv[])
 	controls.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 	controls.set(controls::Saturation, _saturation);
 	controls.set(controls::Sharpness, 0.0);
-	controls.set(controls::FrameDurationLimits, libcamera::Span<const int64_t, 2>({INT64_C(100), INT64_C(1000000)}));
+	
+	// Set frame duration limits based on target FPS
+	if (_targetFps > 0.0f)
+	{
+		// Convert FPS to frame duration in microseconds
+		int64_t frameDurationUs = static_cast<int64_t>(1000000.0 / _targetFps);
+		// Set both min and max to the same value to enforce specific FPS
+		controls.set(controls::FrameDurationLimits, libcamera::Span<const int64_t, 2>({frameDurationUs, frameDurationUs}));
+		if (_verbose)
+			std::cout << "FPS limit set to " << _targetFps << " (frame duration: " << frameDurationUs << " us)\n";
+	}
+	else
+	{
+		// Default: allow 100us to 1s frame duration (10000 FPS to 1 FPS)
+		controls.set(controls::FrameDurationLimits, libcamera::Span<const int64_t, 2>({INT64_C(100), INT64_C(1000000)}));
+	}
 
 	// Start Capture
 	_camera->start(&controls);
