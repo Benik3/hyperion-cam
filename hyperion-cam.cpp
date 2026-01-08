@@ -138,6 +138,7 @@ float _bGain;
 float _focus = -1.0f;
 float _saturation = 1.0f;
 float _contrast = 1.0f;
+float _gamma = 0.0f;
 std::string _origin;
 std::string _conn;
 int _port;
@@ -1674,9 +1675,11 @@ static void processRequest(Request *request)
 		// Apply focus controls (changes when auto-focus is active)
 		applyFocusControls(c);
 		
-		// Apply saturation/contrast (changes when auto-saturation is active)
+		// Apply saturation/contrast/gamma (changes when auto-saturation is active)
 		c.set(controls::Saturation, _saturation);
 		c.set(controls::Contrast, _contrast);
+		if (_gamma > 0.0f)
+			c.set(controls::Gamma, _gamma);
 		
 		if (autoCalibEnabled())
 		{
@@ -1727,6 +1730,7 @@ int main(int argc, char *argv[])
 		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)")																  //
 		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation")																					  //
 		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast")																							  //
+		("gamma", po::value<float>(&_gamma)->default_value(0.0f), "Camera gamma (0.0=use camera default)")																			  //
 		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																						  //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")																										  //
 		;
@@ -2095,6 +2099,7 @@ int main(int argc, char *argv[])
 	// controls the setting of camera
 	ControlList controls;
 	controls.set(controls::AeEnable, false);
+	controls.set(controls::AeFlickerMode, controls::AeFlickerModeEnum::FlickerOff);
 	applyFocusControls(controls);
 	controls.set(controls::ExposureTimeMode, controls::ExposureTimeModeEnum::ExposureTimeModeManual );
 	controls.set(controls::ExposureTime, _shutter);
@@ -2105,6 +2110,8 @@ int main(int argc, char *argv[])
 	controls.set(controls::AwbEnable, false);
 	controls.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 	controls.set(controls::Saturation, _saturation);
+	if (_gamma > 0.0f)
+		controls.set(controls::Gamma, _gamma);
 	controls.set(controls::Sharpness, 0.0);
 	
 	// Set frame duration limits based on target FPS
