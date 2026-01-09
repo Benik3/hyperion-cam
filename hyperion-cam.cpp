@@ -139,6 +139,9 @@ float _focus = -1.0f;
 float _saturation = 1.0f;
 float _contrast = 1.0f;
 float _gamma = 0.0f;
+bool _hflip = false;
+bool _vflip = false;
+int _rotate = 0;
 std::string _origin;
 std::string _conn;
 int _port;
@@ -1666,21 +1669,21 @@ static void processRequest(Request *request)
 	}
 
 	request->reuse(Request::ReuseBuffers);
-	
+
 	// Only update controls per-frame when auto-calibration/focus features are enabled
 	if (autoCalibEnabled() || _autoFocusOnce)
 	{
 		ControlList &c = request->controls();
-		
+
 		// Apply focus controls (changes when auto-focus is active)
 		applyFocusControls(c);
-		
+
 		// Apply saturation/contrast/gamma (changes when auto-saturation is active)
 		c.set(controls::Saturation, _saturation);
 		c.set(controls::Contrast, _contrast);
 		if (_gamma > 0.0f)
 			c.set(controls::Gamma, _gamma);
-		
+
 		if (autoCalibEnabled())
 		{
 			// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
@@ -1692,7 +1695,7 @@ static void processRequest(Request *request)
 			c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 		}
 	}
-	
+
 	_camera->queueRequest(request);
 }
 // Main loop
@@ -1703,7 +1706,7 @@ int main(int argc, char *argv[])
 		("width,w", po::value<int>(&_width)->default_value(640), "Width")																											  //
 		("height,h", po::value<int>(&_height)->default_value(480), "Height")																										  //
 		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")																					  //
-		("fps", po::value<float>(&_targetFps)->default_value(0.0f), "Target FPS limit (0=disabled, adds delay to maintain frame rate)")											  //
+		("fps", po::value<float>(&_targetFps)->default_value(0.0f), "Target FPS limit (0=disabled, adds delay to maintain frame rate)")												  //
 		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")																										  //
 		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")																			  //
 		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")																				  //
@@ -1731,6 +1734,9 @@ int main(int argc, char *argv[])
 		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation")																					  //
 		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast")																							  //
 		("gamma", po::value<float>(&_gamma)->default_value(0.0f), "Camera gamma (0.0=use camera default)")																			  //
+		("hflip", po::bool_switch(&_hflip)->default_value(false), "Horizontal flip (native camera transform)")																		  //
+		("vflip", po::bool_switch(&_vflip)->default_value(false), "Vertical flip (native camera transform)")																		  //
+		("rotate", po::value<int>(&_rotate)->default_value(0), "Rotation in degrees: 0, 90, 180, 270 (native camera transform)")													  //
 		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																						  //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")																										  //
 		;
@@ -1876,6 +1882,70 @@ int main(int argc, char *argv[])
 	std::unique_ptr<CameraConfiguration> config =
 		_camera->generateConfiguration({StreamRole::Viewfinder});
 
+	// Apply native libcamera transform (rotation + horizontal/vertical flip)
+	if (_rotate != 0 || _hflip || _vflip)
+	{
+		// Validate rotation value
+		if (_rotate != 0 && _rotate != 90 && _rotate != 180 && _rotate != 270)
+		{
+			std::cout << "ERROR: Invalid rotation value. Use 0, 90, 180, or 270 degrees." << std::endl;
+			return EXIT_FAILURE;
+		}
+
+		libcamera::Orientation orientation;
+
+		// Map rotation + flip combinations to libcamera Orientation
+		if (_rotate == 0)
+		{
+			if (!_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate0;
+			else if (_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate0Mirror;
+			else if (!_hflip && _vflip)
+				orientation = libcamera::Orientation::Rotate180Mirror;
+			else // both hflip and vflip
+				orientation = libcamera::Orientation::Rotate180;
+		}
+		else if (_rotate == 90)
+		{
+			if (!_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate90;
+			else if (_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate90Mirror;
+			else if (!_hflip && _vflip)
+				orientation = libcamera::Orientation::Rotate270Mirror;
+			else // both hflip and vflip
+				orientation = libcamera::Orientation::Rotate270;
+		}
+		else if (_rotate == 180)
+		{
+			if (!_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate180;
+			else if (_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate180Mirror; // same as vflip at 0°
+			else if (!_hflip && _vflip)
+				orientation = libcamera::Orientation::Rotate0Mirror; // same as hflip at 0°
+			else													 // both hflip and vflip
+				orientation = libcamera::Orientation::Rotate0;		 // 180° + both flips = identity
+		}
+		else // _rotate == 270
+		{
+			if (!_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate270;
+			else if (_hflip && !_vflip)
+				orientation = libcamera::Orientation::Rotate270Mirror;
+			else if (!_hflip && _vflip)
+				orientation = libcamera::Orientation::Rotate90Mirror;
+			else // both hflip and vflip
+				orientation = libcamera::Orientation::Rotate90;
+		}
+
+		config->orientation = orientation;
+		if (_verbose)
+			std::cout << "INFO: Native transform set: Rotate=" << _rotate << "°, HFlip=" << (_hflip ? "Yes" : "No")
+					  << ", VFlip=" << (_vflip ? "Yes" : "No") << " (Orientation: " << orientation << ")" << std::endl;
+	}
+
 	// Stream configuration
 	StreamConfiguration &streamConfig = config->at(0);
 
@@ -1955,23 +2025,21 @@ int main(int argc, char *argv[])
 	libcamera::Size mySize(_width, _height);
 	streamConfig.size = mySize;
 
+	// Store original configuration string for comparison if adjusted
+	std::string requestedConfig = streamConfig.toString();
+
 	auto valRet = config->validate();
 	if (valRet == CameraConfiguration::Status::Adjusted)
 	{
-		std::cout << "WARNING: Configuration Adjusted" << std::endl;
-		std::cout << "Color space: " << libcamera::ColorSpace::toString(streamConfig.colorSpace) << std::endl;
-		std::cout << "Configuration: " << streamConfig.toString() << std::endl;
+		std::string adjustedConfig = streamConfig.toString();
+		std::cout << "WARNING: Configuration Adjusted by camera" << std::endl;
+		std::cout << "  Requested: " << requestedConfig << std::endl;
+		std::cout << "  Adjusted:  " << adjustedConfig << std::endl;
 	}
 	else if (valRet == CameraConfiguration::Status::Invalid)
 	{
 		std::cout << "ERROR: Configuration invalid" << std::endl;
 		return EXIT_FAILURE;
-	}
-
-	if (_verbose)
-	{
-		std::cout << "Validated viewfinder configuration is: "
-				  << streamConfig.toString() << std::endl;
 	}
 
 	if (_useNv12)
@@ -2101,9 +2169,9 @@ int main(int argc, char *argv[])
 	controls.set(controls::AeEnable, false);
 	controls.set(controls::AeFlickerMode, controls::AeFlickerModeEnum::FlickerOff);
 	applyFocusControls(controls);
-	controls.set(controls::ExposureTimeMode, controls::ExposureTimeModeEnum::ExposureTimeModeManual );
+	controls.set(controls::ExposureTimeMode, controls::ExposureTimeModeEnum::ExposureTimeModeManual);
 	controls.set(controls::ExposureTime, _shutter);
-	controls.set(controls::AnalogueGainMode, controls::AnalogueGainModeEnum::AnalogueGainModeManual );
+	controls.set(controls::AnalogueGainMode, controls::AnalogueGainModeEnum::AnalogueGainModeManual);
 	controls.set(controls::AnalogueGain, _gain);
 	controls.set(controls::Brightness, 0.0);
 	controls.set(controls::Contrast, _contrast);
@@ -2113,7 +2181,7 @@ int main(int argc, char *argv[])
 	if (_gamma > 0.0f)
 		controls.set(controls::Gamma, _gamma);
 	controls.set(controls::Sharpness, 0.0);
-	
+
 	// Set frame duration limits based on target FPS
 	if (_targetFps > 0.0f)
 	{

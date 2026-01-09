@@ -29,6 +29,9 @@ Settings can be adjusted by using command line options:
   --saturation arg (=1)                Camera saturation
   --contrast arg (=1)                  Camera contrast
   --gamma arg (=0)                     Camera gamma (0.0=use camera default)
+  --hflip                              Horizontal flip (native camera transform)
+  --vflip                              Vertical flip (native camera transform)
+  --rotate arg (=0)                    Rotation in degrees: 0, 90, 180, 270 (native camera transform)
   -o [ --origin ] arg (=camera)        Name of the origin  
   -c [ --connection ] arg (=127.0.0.1) Socket address (IP or Unix socket path)  
   -p [ --port ] arg (=19400)           TCP port  
@@ -72,6 +75,28 @@ For autofocus-capable cameras (e.g. Camera Module 3), the app forces autofocus i
 Use `--focus` to set the manual lens position.
 
 Use `--autofocus-once` to run autofocus once, print the resulting focus position, and then lock to manual focus. You can reuse then this auto value with the `--focus` option
+
+#### Flip note:
+The `--hflip` and `--vflip` options use libcamera's native Transform control to flip the image horizontally or vertically at the hardware level (sensor or ISP). These are zero-overhead operations and work with all pixel formats (RGB, NV12). They can be combined with `--transform` for perspective correction.
+
+#### Rotation note:
+The `--rotate` option provides hardware-accelerated rotation (0°, 90°, 180°, 270°) using libcamera's native Transform. This can be combined with `--hflip` and `--vflip` for complex orientations:
+
+Examples:
+```
+./hyperion-cam --rotate 90                    # 90° clockwise
+./hyperion-cam --rotate 180                   # 180° rotation
+./hyperion-cam --rotate 90 --hflip            # 90° + horizontal flip
+./hyperion-cam --hflip --vflip                # Both flips (same as --rotate 180)
+```
+
+**Note:** Some combinations of rotation and flip produce the same result:
+- `--rotate 180` = `--hflip --vflip` (both result in 180° rotation)
+- `--rotate 180 --hflip` = `--vflip` alone
+- `--rotate 180 --vflip` = `--hflip` alone
+- `--rotate 180 --hflip --vflip` = no transform (identity)
+
+The code handles these redundancies automatically and applies the correct libcamera Orientation.
 
 #### Shutter speed and FPS note:
 The `--shutter` speed modifies the exposition time of the camera. When used alone, it defines also the FPS, frame is released immediatelly after capture (recommended mode).
