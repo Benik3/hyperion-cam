@@ -2,7 +2,7 @@
 Simple camera grabber for Hyperion using Libcamera, OpenCV and flatbuffer.
 
 ## How it works
-The app makes one stream from camera in full manual mode. There is no preview or any other output then to flatbuffer.  
+The app makes one stream from camera in full manual mode. There is no preview or any other output than to flatbuffer.  
 Received frames can be transformed using OpenCv to correct picture deformation.  
 Resulted frames are sent through flatbuffer connection to Hyperion/HyperHDR.
 
@@ -28,6 +28,7 @@ Settings can be adjusted by using command line options:
   -f [ --focus ] arg (=-1)             Manual focus lens position (-1 keeps default)
   --saturation arg (=1)                Camera saturation
   --contrast arg (=1)                  Camera contrast
+  --gamma arg (=0)                     Camera gamma (0.0=use camera default)
   -o [ --origin ] arg (=camera)        Name of the origin  
   -c [ --connection ] arg (=127.0.0.1) Socket address (IP or Unix socket path)  
   -p [ --port ] arg (=19400)           TCP port  
@@ -72,21 +73,19 @@ Use `--focus` to set the manual lens position.
 
 Use `--autofocus-once` to run autofocus once, print the resulting focus position, and then lock to manual focus. You can reuse then this auto value with the `--focus` option
 
-#### FPS note:
-The `--fps` option limits the maximum frame rate using libcamera's `FrameDurationLimits` control. When set, the camera will maintain the specified frame rate.
+#### Shutter speed and FPS note:
+The `--shutter` speed modifies the exposition time of the camera. When used alone, it defines also the FPS, frame is released immediatelly after capture (recommended mode).
+The `--fps` option specify exact frame rate using libcamera's `FrameDurationLimits` control. When set, the camera will maintain the specified frame rate.
 
 **Important:** FPS also limits the maximum shutter speed. The shutter speed will never be longer than the time available for a single frame at the specified FPS. For example:
 - At 30 FPS, the frame duration is ~33.3ms, so shutter speed cannot exceed 33333 µs
 - At 60 FPS, the frame duration is ~16.7ms, so shutter speed cannot exceed 16666 µs
 
-If you need longer exposure times for low-light conditions, use a lower FPS value or set `--fps 0` to disable the frame rate limit.
-
-#### Shutter note:
-The shutter speed modifies the exposition time of the camera and FPS. The camera doesn't have fixed FPS, but the frames are released as soon as they are available. The value is in micro seconds.
+But you can use faster shutter speed together with lower FPS, in such case next frame is delayed to maintain the desired FPS.
 
 #### Connection note:
-The app supports using of TCP connection or Unix Domain Socket (available when using [HyperHDR](https://github.com/awawa-dev/HyperHDR) at /tmp/hyperhdr-domain). If `--connection` is a valid IP address (IPv4/IPv6) it uses TCP (`--port` applies). Otherwise it treats the value as a Unix socket path. IPC has advantage of faster data exchange with lower overhead.  
-I don't recommend to use the TCP connection over a network as you will probably have lags (due to high packet size and packet framing). Maybe on ethernet network it would be usable, but over wifi it's unusable. Rather always install Hyperion locally and then send only the LED data to another Hyperion server (if you can't drive the LEDs directly).
+The app supports the use of a TCP connection or Unix Domain Socket (available when using [HyperHDR](https://github.com/awawa-dev/HyperHDR) at /tmp/hyperhdr-domain). If `--connection` is a valid IP address (IPv4/IPv6) it uses TCP (`--port` applies). Otherwise it treats the value as a Unix socket path. IPC has advantage of faster data exchange with lower overhead.  
+I don't recommend to use the TCP connection over a network as you will probably have lags (due to high packet size and packet framing). Maybe on an ethernet network it would be usable, but over wifi it's unusable. Rather always install Hyperion locally and then send only the LED data to another Hyperion server (if you can't drive the LEDs directly).
 
 #### Auto calibration note:
 For one-time setup, the app can estimate white balance gains and/or analogue gain using a neutral gray target.
@@ -117,8 +116,8 @@ For one-time setup, the app can estimate camera saturation using a target color.
 - The app captures frames in RGB mode (NV12 is ignored).
 - It measures the average color of an outline box ROI made from the image edges (optionally transformed): top/bottom/left/right strips, each with thickness = 1/8 of image size.
 - It searches saturation so the measured ROI color matches the target color (within a small tolerance), then prints the final saturation and final measured RGB, then exits.
-- Don't use values near end because of clipping (like 255, 0, 0)
-- for some reason with blue target it doesn't work so well, with red and green I have the same result.
+- Don't use values near the end because of clipping (like 255, 0, 0)
+- For some reason a blue target doesn't work as well, but with red and green targets I get the same result.
 
 Examples:
 ```
