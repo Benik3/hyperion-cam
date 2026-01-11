@@ -32,13 +32,16 @@ Settings can be adjusted by using command line options:
   --hflip                              Horizontal flip (native camera transform)
   --vflip                              Vertical flip (native camera transform)
   --rotate arg (=0)                    Rotation in degrees: 0, 90, 180, 270 (native camera transform)
+  --crop arg                           Sensor-level crop in format x,y,width,height (absolute sensor coordinates)
   -o [ --origin ] arg (=camera)        Name of the origin  
   -c [ --connection ] arg (=127.0.0.1) Socket address (IP or Unix socket path)  
   -p [ --port ] arg (=19400)           TCP port  
   -r [ --priority ] arg (=120)         Hyperion priority  
   -t [ --transform ] arg               Picture transformation in format   
                                        x1,y1:x2,y2:x3,y3:x4,y4  
+  --output-crop arg                    Output crop in format x,y,width,height (applied after transform)
   --imgout arg                         Capture one image (RGB) to file (png/bmp/...) and exit
+  --imgout-crophelp arg                Capture image showing sensor area used at requested resolution (helps determine --crop coordinates)
   --nv12                               Enable NV12 format output (default is BGR888)
   --cpuonly                            Force CPU transform even if GPU is available
   -v [ --verbose ]                     Verbose output  
@@ -62,12 +65,15 @@ Settings can be adjusted by using command line options:
 Use `--imgout /path/file.png` to capture exactly one frame, save it, and exit.
 - If `--transform` is provided, the saved image is the transformed output.
 - `--imgout` always saves RGB/BGR images (there is no common still-image container for NV12). If `--nv12` is set, it is ignored.
+- Use `--imgout-crophelp /path/file.png` together with `-w` and `-h` to see what sensor area the camera uses at that resolution. This helps determine the correct coordinates for `--crop`. The camera automatically crops to the center when using lower resolutions, and this option shows you exactly what area is being captured, making it easier to adjust the crop position with `--crop x,y,width,height`.
 
 Examples:
 ```
 ./hyperion-cam --imgout /tmp/frame.png
 ./hyperion-cam --transform "0,0:640,0:0,480:640,480" --imgout /tmp/frame.png
 ./hyperion-cam --cpuonly --transform "..." --imgout /tmp/frame.png
+./hyperion-cam --imgout-crophelp /tmp/crop-area.png -w 640 -h 480       # See what 640x480 sensor area is used
+./hyperion-cam --imgout-crophelp /tmp/crop-area.png -w 1920 -h 1080 -v  # Verbose shows ScalerCropMaximum coordinates
 ```
 
 #### Focus note:
@@ -97,6 +103,46 @@ Examples:
 - `--rotate 180 --hflip --vflip` = no transform (identity)
 
 The code handles these redundancies automatically and applies the correct libcamera Orientation.
+
+#### Crop note:
+The app provides two levels of cropping for different use cases:
+
+**Sensor-level crop (`--crop`):**
+- Uses libcamera's ScalerCrop control to crop at the sensor/ISP level
+- Coordinates are in **absolute sensor coordinates** (not relative to (0,0))
+- Applied before any transforms, rotation, or flip operations on chip level
+- Hardware-accelerated, very efficient
+- Can be combined with `-w` and `-h` for downscaling: sensor crop happens first (reducing bandwidth), then the output is scaled to requested resolution
+- Format: `x,y,width,height` (e.g., `--crop 768,432,1920,1080`)
+- Use `-v` to see `ScalerCropMaximum` which shows the valid sensor coordinate range (e.g., `(768, 432)/3072x1728`)
+- Examples:
+  ```bash
+  ./hyperion-cam --crop 768,432,1920,1080                    # Crop 1920x1080 region, output 640x480 (default, downscaled)
+  ./hyperion-cam --crop 768,432,1920,1080 -w 1920 -h 1080    # Crop 1920x1080 region, output 1920x1080 (1:1, no scaling)
+  ./hyperion-cam --crop 768,432,2000,2000 -w 500 -h 500      # Crop 2000x2000, downscale to 500x500
+  ./hyperion-cam -v --crop 768,432,1000,1000 -w 640 -h 640   # Verbose shows ScalerCropMaximum
+  ```
+
+**Output-level crop (`--output-crop`):**
+- Crops the final output image (only for non-transformed images)
+- **Cannot be used with `--transform`** (they are mutually exclusive)
+  - If using perspective correction, adjust the 4-point transform coordinates instead
+  - The transform already defines your output region via perspective mapping
+- Coordinates are relative to the camera output (after rotation/flip if used)
+- Software-based crop, adds minimal overhead (simple memcpy)
+- Useful for cropping raw camera output to specific region of interest
+- Format: `x,y,width,height` (e.g., `--output-crop 10,10,620,460`)
+- Example:
+  ```bash
+  # Crop 640x480 raw output to center 540x380 region
+  ./hyperion-cam -w 640 -h 480 --output-crop 50,50,540,380
+  ```
+
+**When to use each:**
+- Use `--crop` for selecting a specific sensor region before any processing
+- Use `--output-crop` for cropping final output when NOT using `--transform`
+- For perspective correction, use `--transform` alone (defines output region via 4 points)
+- `--crop` and `--output-crop` can be combined, but `--output-crop` and `--transform` cannot
 
 #### Shutter speed and FPS note:
 The `--shutter` speed modifies the exposition time of the camera. When used alone, it defines also the FPS, frame is released immediatelly after capture (recommended mode).

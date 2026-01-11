@@ -128,6 +128,9 @@ int _imgHeight = 0;
 int _imgWidthToSend;
 int _imgHeightToSend;
 
+// Output crop buffer (used when output-crop is enabled)
+static std::vector<uint8_t> _outputCropBuffer;
+
 int _width;
 int _height;
 int32_t _shutter;
@@ -148,10 +151,30 @@ int _port;
 int _priority;
 std::string _transformStr;
 std::string _imgOutPath;
+std::string _imgOutCropHelpPath;
+std::string _cropStr;
+std::string _outputCropStr;
 bool _transformEn = false;
+bool _cropEn = false;
+int _cropX = 0;
+int _cropY = 0;
+int _cropWidth = 0;
+int _cropHeight = 0;
+bool _outputCropEn = false;
+int _outputCropX = 0;
+int _outputCropY = 0;
+int _outputCropWidth = 0;
+int _outputCropHeight = 0;
 bool _verbose = false;
 bool _help = false;
 bool _version = false;
+
+// For --imgout-crophelp: store the auto-crop rectangle to draw on full sensor image
+static bool _imgOutCropHelpDrawRect = false;
+static int _imgOutCropHelpRectX = 0;
+static int _imgOutCropHelpRectY = 0;
+static int _imgOutCropHelpRectWidth = 0;
+static int _imgOutCropHelpRectHeight = 0;
 
 static bool _autoFocusOnce = false;
 static std::atomic<int> _autoFocusPhase{0}; // 0=disabled, 1=running, 2=locked
@@ -401,6 +424,23 @@ static bool imgOutWriteBgr(const uint8_t *bgr, int width, int height, int stride
 	try
 	{
 		cv::Mat bgrMat(height, width, CV_8UC3, const_cast<uint8_t *>(bgr), static_cast<size_t>(strideBytes));
+
+		// For --imgout-crophelp, draw red rectangle showing the auto-crop area
+		if (_imgOutCropHelpDrawRect)
+		{
+			cv::rectangle(bgrMat,
+						  cv::Point(_imgOutCropHelpRectX, _imgOutCropHelpRectY),
+						  cv::Point(_imgOutCropHelpRectX + _imgOutCropHelpRectWidth,
+									_imgOutCropHelpRectY + _imgOutCropHelpRectHeight),
+						  cv::Scalar(0, 0, 255), // Red color in BGR
+						  4);					 // Thickness
+			if (_verbose)
+			{
+				std::cout << "INFO: Drew crop area rectangle at (" << _imgOutCropHelpRectX << "," << _imgOutCropHelpRectY
+						  << ") size " << _imgOutCropHelpRectWidth << "x" << _imgOutCropHelpRectHeight << std::endl;
+			}
+		}
+
 		return cv::imwrite(_imgOutPath, bgrMat);
 	}
 	catch (const cv::Exception &e)
@@ -940,32 +980,50 @@ static void autoCalibFromTransformedGpu(uint8_t *img, int fd, int off)
 #endif
 }
 
+// Forward declaration
+static std::vector<uint8_t> cropRgb(const uint8_t *src, int srcWidth, int srcHeight, int srcStride,
+									int cropX, int cropY, int cropWidth, int cropHeight);
+
 static void imgOutSaveRaw(uint8_t *img)
 {
 	bool ok = false;
+	cv::Mat bgr;
+
 	if (_bppBgr == 3)
 	{
 		// libcamera's 3-byte formats on some pipelines end up in RGB byte order.
 		// OpenCV expects BGR when encoding files, so convert to ensure correct colors.
 		cv::Mat in3(_imgHeightToSend, _imgWidthToSend, CV_8UC3, img, static_cast<size_t>(_strideBgr));
-		cv::Mat bgr;
 		cv::cvtColor(in3, bgr, cv::COLOR_RGB2BGR);
-		ok = cv::imwrite(_imgOutPath, bgr);
 	}
 	else if (_bppBgr == 4)
 	{
 		cv::Mat in4(_imgHeightToSend, _imgWidthToSend, CV_8UC4, img, static_cast<size_t>(_strideBgr));
-		cv::Mat bgr;
 		// XBGR8888 is RGBX in memory; XRGB8888 is BGRX in memory.
 		int code = _swapRb4 ? cv::COLOR_BGRA2BGR : cv::COLOR_RGBA2BGR;
 		cv::cvtColor(in4, bgr, code);
-		ok = cv::imwrite(_imgOutPath, bgr);
 	}
 	else
 	{
 		std::cout << "ERROR: Unsupported pixel format for --imgout" << std::endl;
-		ok = false;
+		imgOutExit(EXIT_FAILURE);
+		return;
 	}
+
+	// Apply output crop if enabled
+	if (_outputCropEn)
+	{
+		if (_outputCropX + _outputCropWidth > bgr.cols || _outputCropY + _outputCropHeight > bgr.rows)
+		{
+			std::cout << "ERROR: Output crop region exceeds image dimensions" << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			return;
+		}
+		cv::Rect roi(_outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
+		bgr = bgr(roi);
+	}
+
+	ok = cv::imwrite(_imgOutPath, bgr);
 
 	if (!ok)
 	{
@@ -990,7 +1048,29 @@ static void imgOutSaveTransformedCpu(uint8_t *img)
 
 	std::vector<uint8_t> out(static_cast<std::size_t>(_imgWidthToSend) * static_cast<std::size_t>(_imgHeightToSend) * 3u);
 	_transformation->transformInto(img, _strideBgr, out.data(), _imgWidthToSend * 3);
-	bool ok = imgOutWriteBgr(out.data(), _imgWidthToSend, _imgHeightToSend, _imgWidthToSend * 3);
+
+	int outputWidth = _imgWidthToSend;
+	int outputHeight = _imgHeightToSend;
+	const uint8_t *outputData = out.data();
+	int outputStride = _imgWidthToSend * 3;
+
+	std::vector<uint8_t> cropped;
+	if (_outputCropEn)
+	{
+		cropped = cropRgb(out.data(), _imgWidthToSend, _imgHeightToSend, _imgWidthToSend * 3,
+						  _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
+		if (cropped.empty())
+		{
+			imgOutExit(EXIT_FAILURE);
+			return;
+		}
+		outputWidth = _outputCropWidth;
+		outputHeight = _outputCropHeight;
+		outputData = cropped.data();
+		outputStride = _outputCropWidth * 3;
+	}
+
+	bool ok = imgOutWriteBgr(outputData, outputWidth, outputHeight, outputStride);
 	if (!ok)
 	{
 		std::cout << "ERROR: Failed to write image to: " << _imgOutPath << std::endl;
@@ -1032,6 +1112,20 @@ static void imgOutSaveTransformedGpu(uint8_t *img, int fd, int off)
 	cv::Mat rgbMat(_imgHeightToSend, _imgWidthToSend, CV_8UC3, rgb.data());
 	cv::Mat bgr;
 	cv::cvtColor(rgbMat, bgr, cv::COLOR_RGB2BGR);
+
+	// Apply output crop if enabled
+	if (_outputCropEn)
+	{
+		if (_outputCropX + _outputCropWidth > bgr.cols || _outputCropY + _outputCropHeight > bgr.rows)
+		{
+			std::cout << "ERROR: Output crop region exceeds image dimensions" << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			return;
+		}
+		cv::Rect roi(_outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
+		bgr = bgr(roi);
+	}
+
 	bool ok = cv::imwrite(_imgOutPath, bgr);
 	if (!ok)
 	{
@@ -1049,6 +1143,37 @@ void *flatLoop(void *arg)
 {
 	_loopFb.exec();
 	return 0;
+}
+
+// Crop RGB24 image data
+static std::vector<uint8_t> cropRgb(const uint8_t *src, int srcWidth, int srcHeight, int srcStride,
+									int cropX, int cropY, int cropWidth, int cropHeight)
+{
+	// Validate crop region
+	if (cropX < 0 || cropY < 0 || cropWidth <= 0 || cropHeight <= 0)
+	{
+		std::cout << "ERROR: Invalid crop parameters: x=" << cropX << ", y=" << cropY
+				  << ", width=" << cropWidth << ", height=" << cropHeight << std::endl;
+		return std::vector<uint8_t>();
+	}
+
+	if (cropX + cropWidth > srcWidth || cropY + cropHeight > srcHeight)
+	{
+		std::cout << "ERROR: Crop region (" << cropX << "," << cropY << "," << cropWidth << "," << cropHeight
+				  << ") exceeds source dimensions (" << srcWidth << "x" << srcHeight << ")" << std::endl;
+		return std::vector<uint8_t>();
+	}
+
+	std::vector<uint8_t> result(static_cast<size_t>(cropWidth) * static_cast<size_t>(cropHeight) * 3u);
+
+	for (int y = 0; y < cropHeight; y++)
+	{
+		const uint8_t *srcRow = src + ((cropY + y) * srcStride) + (cropX * 3);
+		uint8_t *dstRow = result.data() + (y * cropWidth * 3);
+		std::memcpy(dstRow, srcRow, static_cast<size_t>(cropWidth) * 3u);
+	}
+
+	return result;
 }
 
 static void flatBufSend(const uint8_t *img)
@@ -1662,8 +1787,43 @@ static void processRequest(Request *request)
 			else
 			{
 				uint8_t *img = it->second[0].data();
-				_loopFb.callLater([img]()
-								  { flatBufSend(img); });
+				if (_outputCropEn)
+				{
+					// Crop the raw image before sending
+					std::vector<uint8_t> cropped = cropRgb(img, _imgWidthToSend, _imgHeightToSend, _strideBgr,
+														   _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
+					auto croppedPtr = std::make_shared<std::vector<uint8_t>>(std::move(cropped));
+					_loopFb.callLater([croppedPtr]()
+									  {
+						const int64_t startNs = nowNs();
+						if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+						{
+							if (_flatbuf.setImage(croppedPtr->data(), _outputCropWidth, _outputCropHeight) < 0)
+							{
+								std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
+							}
+						}
+						else
+							std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+
+						int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+						if (before > 1 && _verbose)
+						{
+							int64_t elapsedMicros = (nowNs() - startNs) / 1000;
+
+							char strTime[100];
+							time_t t = time(NULL);
+							struct tm *p = localtime(&t);
+							strftime(strTime, 100, "%F %T", p);
+
+							std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+						} });
+				}
+				else
+				{
+					_loopFb.callLater([img]()
+									  { flatBufSend(img); });
+				}
 			}
 		}
 	}
@@ -1714,10 +1874,12 @@ int main(int argc, char *argv[])
 		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")																										  //
 		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")																							  //
 		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")															  //
+		("output-crop", po::value<std::string>(&_outputCropStr), "Output crop in format x,y,width,height (applied after transform)")												  //
 		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")																	  //
 		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")																  //
 		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")																							  //
 		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")																	  //
+		("imgout-crophelp", po::value<std::string>(&_imgOutCropHelpPath), "Capture image showing sensor area used at requested resolution (helps determine --crop coordinates)")	  //
 		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit")													  //
 		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit")														  //
 		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit")										  //
@@ -1737,6 +1899,7 @@ int main(int argc, char *argv[])
 		("hflip", po::bool_switch(&_hflip)->default_value(false), "Horizontal flip (native camera transform)")																		  //
 		("vflip", po::bool_switch(&_vflip)->default_value(false), "Vertical flip (native camera transform)")																		  //
 		("rotate", po::value<int>(&_rotate)->default_value(0), "Rotation in degrees: 0, 90, 180, 270 (native camera transform)")													  //
+		("crop", po::value<std::string>(&_cropStr), "Crop region in format x,y,width,height (native camera ScalerCrop)")															  //
 		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																						  //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")																										  //
 		;
@@ -1798,6 +1961,71 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (vm.count("crop"))
+	{
+		if (sscanf(_cropStr.c_str(), "%d,%d,%d,%d", &_cropX, &_cropY, &_cropWidth, &_cropHeight) == 4)
+		{
+			if (_cropWidth <= 0 || _cropHeight <= 0)
+			{
+				std::cout << "ERROR: Crop width and height must be positive" << std::endl;
+				return EXIT_FAILURE;
+			}
+			_cropEn = true;
+			if (_verbose)
+				std::cout << "INFO: Crop enabled: x=" << _cropX << ", y=" << _cropY
+						  << ", width=" << _cropWidth << ", height=" << _cropHeight << std::endl;
+		}
+		else
+		{
+			std::cout << "ERROR: Invalid crop format. Use x,y,width,height" << std::endl;
+			return EXIT_FAILURE;
+		}
+	}
+
+	if (vm.count("output-crop"))
+	{
+		if (sscanf(_outputCropStr.c_str(), "%d,%d,%d,%d", &_outputCropX, &_outputCropY, &_outputCropWidth, &_outputCropHeight) == 4)
+		{
+			if (_outputCropWidth <= 0 || _outputCropHeight <= 0)
+			{
+				std::cout << "ERROR: Output crop width and height must be positive" << std::endl;
+				return EXIT_FAILURE;
+			}
+			if (_outputCropX < 0 || _outputCropY < 0)
+			{
+				std::cout << "ERROR: Output crop x and y must be non-negative" << std::endl;
+				return EXIT_FAILURE;
+			}
+			_outputCropEn = true;
+			if (_verbose)
+			{
+				std::cout << "INFO: Output crop enabled: x=" << _outputCropX << ", y=" << _outputCropY
+						  << ", width=" << _outputCropWidth << ", height=" << _outputCropHeight << std::endl;
+			}
+		}
+		else
+		{
+			std::cout << "ERROR: Invalid output-crop format. Use x,y,width,height" << std::endl;
+			return EXIT_FAILURE;
+		}
+	}
+
+	// Handle --imgout-crophelp (replaces --imgout)
+	if (!_imgOutCropHelpPath.empty())
+	{
+		if (!_imgOutPath.empty())
+		{
+			std::cout << "WARNING: Both --imgout and --imgout-crophelp specified, using --imgout-crophelp" << std::endl;
+		}
+		_imgOutPath = _imgOutCropHelpPath;
+		// crophelp disables transforms and crops to show actual sensor area used
+		_transformEn = false;
+		_cropEn = false;
+		_outputCropEn = false;
+		if (_verbose)
+			std::cout << "INFO: --imgout-crophelp enabled, will capture at sensor area used for requested resolution" << std::endl;
+	}
+
 	if (!_imgOutPath.empty())
 	{
 		// Still image output uses RGB/BGR only.
@@ -1839,6 +2067,14 @@ int main(int argc, char *argv[])
 		_autoCalibNextAllowedNs.store(0, std::memory_order_release);
 	}
 
+	// Validate mutually exclusive options
+	if (_transformEn && _outputCropEn)
+	{
+		std::cout << "ERROR: --transform and --output-crop are mutually exclusive" << std::endl;
+		std::cout << "       If using transform, adjust the transform coordinates instead of cropping" << std::endl;
+		return EXIT_FAILURE;
+	}
+
 	// GPU transform is the default when compiled in and --transform is used.
 	// Use --cpuonly to force the CPU path.
 #ifdef HAVE_GPU_TRANSFORM
@@ -1877,6 +2113,62 @@ int main(int argc, char *argv[])
 	std::string cameraId = cm->cameras()[0]->id();
 	_camera = cm->get(cameraId);
 	_camera->acquire();
+
+	// For --imgout-crophelp, configure at requested resolution to see what sensor area is used
+	if (!_imgOutCropHelpPath.empty())
+	{
+		std::unique_ptr<CameraConfiguration> tempConfig =
+			_camera->generateConfiguration({StreamRole::Viewfinder});
+		if (tempConfig && !tempConfig->empty())
+		{
+			// First: Configure camera with requested resolution to get auto-crop area
+			StreamConfiguration &tempStreamConfig = tempConfig->at(0);
+			tempStreamConfig.size = libcamera::Size(_width, _height);
+			tempConfig->validate();
+			_camera->configure(tempConfig.get());
+
+			// Query ScalerCropMaximum to see what sensor area is actually being used
+			const ControlList &props = _camera->properties();
+			auto cropMax = props.get(properties::ScalerCropMaximum);
+			if (cropMax)
+			{
+				// Store the crop rectangle for drawing later
+				_imgOutCropHelpDrawRect = true;
+				_imgOutCropHelpRectX = cropMax->x;
+				_imgOutCropHelpRectY = cropMax->y;
+				_imgOutCropHelpRectWidth = cropMax->width;
+				_imgOutCropHelpRectHeight = cropMax->height;
+				if (_verbose)
+				{
+					std::cout << "INFO: At " << _width << "x" << _height << " resolution, camera uses sensor area: "
+							  << cropMax->toString() << std::endl;
+				}
+			}
+
+			// Second: Reconfigure to capture at full sensor resolution
+			tempStreamConfig.size = libcamera::Size(16384, 16384);
+			tempConfig->validate();
+			_camera->configure(tempConfig.get());
+
+			// Get the full sensor resolution
+			auto fullCropMax = props.get(properties::ScalerCropMaximum);
+			if (fullCropMax)
+			{
+				_width = fullCropMax->width;
+				_height = fullCropMax->height;
+				if (_verbose)
+					std::cout << "INFO: Capturing full sensor at: " << _width << "x" << _height << std::endl;
+			}
+			else if (_verbose)
+			{
+				std::cout << "WARNING: ScalerCropMaximum not available" << std::endl;
+			}
+		}
+		else if (_verbose)
+		{
+			std::cout << "WARNING: Could not query camera formats, using default resolution" << std::endl;
+		}
+	}
 
 	// Stream
 	std::unique_ptr<CameraConfiguration> config =
@@ -2022,8 +2314,18 @@ int main(int argc, char *argv[])
 		streamConfig.colorSpace = libcamera::ColorSpace::Rec709;
 	}
 
+	// When crop is enabled, use crop dimensions as output size (1:1, no scaling)
+	// Use the requested width/height
+	// Note: if --crop is used, the ScalerCrop control crops at sensor level first,
+	// then the stream is scaled to the requested output size (allows downscaling after crop)
 	libcamera::Size mySize(_width, _height);
 	streamConfig.size = mySize;
+
+	if (_cropEn && _verbose)
+	{
+		std::cout << "INFO: Sensor crop will be " << _cropWidth << "x" << _cropHeight
+				  << ", output scaled to " << _width << "x" << _height << std::endl;
+	}
 
 	// Store original configuration string for comparison if adjusted
 	std::string requestedConfig = streamConfig.toString();
@@ -2092,6 +2394,9 @@ int main(int argc, char *argv[])
 	_imgHeight = streamConfig.size.height;
 	_imgWidth = streamConfig.size.width;
 
+	if (_verbose)
+		std::cout << "INFO: Stream configured to: " << _imgWidth << "x" << _imgHeight << std::endl;
+
 	if (!_transformEn)
 	{
 		_imgHeightToSend = _imgHeight;
@@ -2099,6 +2404,30 @@ int main(int argc, char *argv[])
 	}
 
 	_camera->configure(config.get());
+
+	// Show ScalerCropMaximum property after configuration (required by libcamera)
+	if (_verbose || _cropEn)
+	{
+		const ControlList &props = _camera->properties();
+		auto cropMax = props.get(properties::ScalerCropMaximum);
+		if (cropMax)
+		{
+			std::cout << "INFO: ScalerCropMaximum (sensor area): " << cropMax->toString() << std::endl;
+
+			// Validate crop against maximum if crop is enabled
+			if (_cropEn)
+			{
+				if (_cropX < cropMax->x || _cropY < cropMax->y ||
+					_cropX + _cropWidth > static_cast<int>(cropMax->x + cropMax->width) ||
+					_cropY + _cropHeight > static_cast<int>(cropMax->y + cropMax->height))
+				{
+					std::cout << "WARNING: Crop region " << _cropX << "," << _cropY << "," << _cropWidth << "," << _cropHeight
+							  << " exceeds sensor area " << cropMax->toString() << std::endl;
+					std::cout << "         The crop will be adjusted by the camera" << std::endl;
+				}
+			}
+		}
+	}
 
 	// Buffer Allocation
 	FrameBufferAllocator *allocator = new FrameBufferAllocator(_camera);
@@ -2181,6 +2510,15 @@ int main(int argc, char *argv[])
 	if (_gamma > 0.0f)
 		controls.set(controls::Gamma, _gamma);
 	controls.set(controls::Sharpness, 0.0);
+
+	// Apply ScalerCrop if specified
+	if (_cropEn)
+	{
+		libcamera::Rectangle cropRect(_cropX, _cropY, _cropWidth, _cropHeight);
+		controls.set(controls::ScalerCrop, cropRect);
+		if (_verbose)
+			std::cout << "INFO: ScalerCrop set to: " << cropRect.toString() << std::endl;
+	}
 
 	// Set frame duration limits based on target FPS
 	if (_targetFps > 0.0f)
