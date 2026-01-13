@@ -112,6 +112,9 @@ private:
 	bool _connected;
 
 	bool _skipReply;
+
+	// Log gating: print connection failure once until a successful connect clears it.
+	bool _connectFailedReported{false};
 };
 
 #endif

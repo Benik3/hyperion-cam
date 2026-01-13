@@ -2,32 +2,76 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
+#include <unistd.h>
+#include <cerrno>
 #include <cstddef>
 #include <cstring>
 
 namespace
 {
-bool parseIpAddressFamily(const char *host, int &outFamily)
-{
-	if (host == nullptr || *host == '\0')
+	bool parseIpAddressFamily(const char *host, int &outFamily)
+	{
+		if (host == nullptr || *host == '\0')
+			return false;
+
+		in_addr addr4;
+		if (inet_pton(AF_INET, host, &addr4) == 1)
+		{
+			outFamily = AF_INET;
+			return true;
+		}
+
+		in6_addr addr6;
+		if (inet_pton(AF_INET6, host, &addr6) == 1)
+		{
+			outFamily = AF_INET6;
+			return true;
+		}
+
 		return false;
-
-	in_addr addr4;
-	if (inet_pton(AF_INET, host, &addr4) == 1)
-	{
-		outFamily = AF_INET;
-		return true;
 	}
 
-	in6_addr addr6;
-	if (inet_pton(AF_INET6, host, &addr6) == 1)
+	ssize_t readFully(int fd, void *buf, size_t len)
 	{
-		outFamily = AF_INET6;
-		return true;
+		uint8_t *p = static_cast<uint8_t *>(buf);
+		size_t done = 0;
+		while (done < len)
+		{
+			ssize_t n = ::read(fd, p + done, len - done);
+			if (n > 0)
+			{
+				done += static_cast<size_t>(n);
+				continue;
+			}
+			if (n == 0)
+				return 0; // EOF
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		return static_cast<ssize_t>(done);
 	}
 
-	return false;
-}
+	ssize_t writeFully(int fd, const void *buf, size_t len)
+	{
+		const uint8_t *p = static_cast<const uint8_t *>(buf);
+		size_t done = 0;
+		while (done < len)
+		{
+			ssize_t n = ::write(fd, p + done, len - done);
+			if (n > 0)
+			{
+				done += static_cast<size_t>(n);
+				continue;
+			}
+			if (n == 0)
+				return -1;
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		return static_cast<ssize_t>(done);
+	}
 } // namespace
 
 #include "FlatBufferConnection.h"
@@ -35,13 +79,14 @@ bool parseIpAddressFamily(const char *host, int &outFamily)
 #include "hyperhdr_request_generated.h"
 
 FlatBufferConnection::FlatBufferConnection()
-	: _sockfd(0), _registered(false), _connected(false), _skipReply(false)
+	: _sockfd(0), _registered(false), _connected(false), _skipReply(false), _connectFailedReported(false)
 {
 }
 
 FlatBufferConnection::~FlatBufferConnection()
 {
-	close(_sockfd);
+	if (_sockfd > 0)
+		close(_sockfd);
 }
 
 void FlatBufferConnection::reserveBuilderBytes(size_t bytes)
@@ -131,7 +176,14 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 				}
 				if (connect(_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
 				{
-					std::cerr << "ERROR: Connection Failed " << std::endl;
+					if (!_connectFailedReported)
+					{
+						std::cerr << "ERROR: Connection Failed";
+						if (errno)
+							std::cerr << ": " << std::strerror(errno);
+						std::cerr << "\n";
+						_connectFailedReported = true;
+					}
 					connectionDestroy();
 					return 0;
 				}
@@ -148,7 +200,14 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 				}
 				if (connect(_sockfd, (struct sockaddr *)&serv_addr6, sizeof(serv_addr6)) < 0)
 				{
-					std::cerr << "ERROR: Connection Failed " << std::endl;
+					if (!_connectFailedReported)
+					{
+						std::cerr << "ERROR: Connection Failed";
+						if (errno)
+							std::cerr << ": " << std::strerror(errno);
+						std::cerr << "\n";
+						_connectFailedReported = true;
+					}
 					connectionDestroy();
 					return 0;
 				}
@@ -161,13 +220,21 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 
 			if (connect(_sockfd, (struct sockaddr *)&serv_unaddr, SUN_LEN(&serv_unaddr)) < 0)
 			{
-				std::cerr << "ERROR: Connection Failed " << std::endl;
+				if (!_connectFailedReported)
+				{
+					std::cerr << "ERROR: Connection Failed";
+					if (errno)
+						std::cerr << ": " << std::strerror(errno);
+					std::cerr << "\n";
+					_connectFailedReported = true;
+				}
 				connectionDestroy();
 				return 0;
 			}
 		}
 
 		_connected = true;
+		_connectFailedReported = false;
 
 		return 1;
 	}
@@ -188,7 +255,13 @@ int FlatBufferConnection::readData()
 		return -1;
 
 	uint8_t headbuff[4];
-	int n = read(_sockfd, headbuff, 4);
+	ssize_t n = readFully(_sockfd, headbuff, sizeof(headbuff));
+	if (n == 0)
+	{
+		connectionDestroy();
+		std::cerr << "ERROR: Socket closed by peer" << std::endl;
+		return -1;
+	}
 
 	uint32_t messageSize =
 		((headbuff[0] << 24) & 0xFF000000) |
@@ -207,7 +280,13 @@ int FlatBufferConnection::readData()
 		return -1;
 	}
 
-	n = read(_sockfd, recvBuff, messageSize);
+	n = readFully(_sockfd, recvBuff, messageSize);
+	if (n == 0)
+	{
+		connectionDestroy();
+		std::cerr << "ERROR: Socket closed by peer" << std::endl;
+		return -1;
+	}
 	if (n < 0)
 	{
 		connectionDestroy();
@@ -326,14 +405,13 @@ int FlatBufferConnection::sendMessage(const uint8_t *buffer, uint32_t size)
 		(uint8_t)(size & 0xFF)};
 
 	// write message
-	if (write(_sockfd, header, 4) < 0)
+	if (writeFully(_sockfd, header, sizeof(header)) < 0)
 	{
 		connectionDestroy();
 		return -1;
 	}
 
-	auto result = write(_sockfd, buffer, size);
-	if (result < 0)
+	if (writeFully(_sockfd, buffer, size) < 0)
 	{
 		connectionDestroy();
 		return -1;
@@ -353,7 +431,7 @@ bool FlatBufferConnection::parseReply(const hyperhdrnet::Reply *reply)
 		if (videoMode != -1)
 		{
 			// We got a video reply.
-			std::cout << "Set video mode " << videoMode << std::endl;
+			std::cout << "Set video mode " << videoMode << "\n";
 			return true;
 		}
 
@@ -361,7 +439,7 @@ bool FlatBufferConnection::parseReply(const hyperhdrnet::Reply *reply)
 		if (registered == _priority)
 		{
 			if (!_registered)
-				std::cout << "Client registered succesfully" << std::endl;
+				std::cout << "Client registered succesfully\n";
 			_registered = true;
 		}
 

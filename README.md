@@ -23,6 +23,8 @@ Settings can be adjusted by using command line options:
   -h [ --height ] arg (=480)           Height  
   -s [ --shutter ] arg (=16666)        Shutter speed in us  
   --fps arg (=0)                       Target FPS limit (0=disabled, adds delay to maintain frame rate)
+  --max-pending-process arg (=0)       Max in-flight transform jobs (0=unlimited). Set to 1 for lowest latency (drops frames when busy)
+  --max-pending-send arg (=0)          Max in-flight send jobs (0=unlimited). Set to 1-2 for lowest latency (drops frames when busy)
   -g [ --gain ] arg (=1)               Camera gain  
   -b [ --wbgain ] arg (=1.0,1.0)       White balance gains  
   -f [ --focus ] arg (=-1)             Manual focus lens position (-1 keeps default)
@@ -139,7 +141,7 @@ The app provides two levels of cropping for different use cases:
   ```
 
 **When to use each:**
-- Use `--crop` for selecting a specific sensor region before any processing
+- Use `--crop` for selecting a specific sensor region before any processing (very effective)
 - Use `--output-crop` for cropping final output when NOT using `--transform`
 - For perspective correction, use `--transform` alone (defines output region via 4 points)
 - `--crop` and `--output-crop` can be combined, but `--output-crop` and `--transform` cannot
@@ -153,6 +155,7 @@ The `--fps` option specify exact frame rate using libcamera's `FrameDurationLimi
 - At 60 FPS, the frame duration is ~16.7ms, so shutter speed cannot exceed 16666 µs
 
 But you can use faster shutter speed together with lower FPS, in such case next frame is delayed to maintain the desired FPS.
+This also produce lower latency (e.g. 30 FPS + shutter 16666 us (60fps)).
 
 #### Connection note:
 The app supports the use of a TCP connection or Unix Domain Socket (available when using [HyperHDR](https://github.com/awawa-dev/HyperHDR) at /tmp/hyperhdr-domain). If `--connection` is a valid IP address (IPv4/IPv6) it uses TCP (`--port` applies). Otherwise it treats the value as a Unix socket path. IPC has advantage of faster data exchange with lower overhead.  
@@ -205,6 +208,22 @@ The transformation is described by 4 points in the original picture. The result 
 ### GPU transform (optional)
 If built with EGL + OpenGL ES support, GPU transform is used by default whenever `--transform` is provided.
 Use `--cpuonly` to force CPU transforms.
+
+### Low latency tuning
+This app runs capture/transform/send asynchronously. If the CPU/GPU or HyperHDR connection can't keep up, the internal queues can grow which increases end-to-end latency.
+
+To keep latency bounded (at the cost of dropping frames under load), use:
+- `--max-pending-process 1`: don't queue transforms; drop frames while busy
+- `--max-pending-send 1` (or `2`): don't queue sends; drop frames while busy
+
+Examples:
+```
+# Lowest latency (bounded) when using a transform
+./hyperion-cam --transform "..." --max-pending-process 1 --max-pending-send 1
+
+# Lowest latency (bounded) without transform
+./hyperion-cam --max-pending-send 1
+```
 
 ### Performance / profiling knobs
 These are optional environment variables used mainly for profiling and tuning:

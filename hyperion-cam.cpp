@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <csignal>
 #include <thread>
 #include <cstring>
 #include <cstdlib>
@@ -399,7 +400,7 @@ static inline void cpuProfileTick(CpuProfileState &s, const char *tag, uint64_t 
 	{
 		double denom = s.frames ? static_cast<double>(s.frames) : 1.0;
 		double avgMs = (static_cast<double>(s.accXformNs) / denom) / 1e6;
-		std::cerr << tag << " avg ms: xform=" << avgMs << std::endl;
+		std::cerr << tag << " avg ms: xform=" << avgMs << "\n";
 		s.frames = 0;
 		s.accXformNs = 0;
 		s.lastPrintNs = now;
@@ -411,6 +412,18 @@ static CpuProfileState _cpuNv12Prof{envEnabled("HYPERCAM_CPU_PROFILE")};
 
 static std::atomic<int> _pendingProcess{0};
 static std::atomic<int> _pendingSend{0};
+
+// Connection error log gating: print once per disconnect, clear after successful reconnect.
+static std::atomic<bool> _flatbufConnErrorPrinted{false};
+
+// Optional backlog limits (0 = unlimited). When set, frames are dropped early to keep latency bounded.
+static int _maxPendingProcess = 0;
+static int _maxPendingSend = 0;
+static std::atomic<uint64_t> _droppedProcess{0};
+static std::atomic<uint64_t> _droppedSend{0};
+
+// Output crop ring buffer (used only when maxPendingSend > 0 to avoid per-frame allocations).
+static RgbRingBuffer _cropOut;
 
 static inline void imgOutExit(int code)
 {
@@ -1176,30 +1189,51 @@ static std::vector<uint8_t> cropRgb(const uint8_t *src, int srcWidth, int srcHei
 	return result;
 }
 
+static bool cropRgbInto(const uint8_t *src, int srcWidth, int srcHeight, int srcStride,
+						int cropX, int cropY, int cropWidth, int cropHeight,
+						uint8_t *dst, int dstStrideBytes)
+{
+	if (!dst)
+		return false;
+	if (dstStrideBytes <= 0)
+		dstStrideBytes = cropWidth * 3;
+	if (cropX < 0 || cropY < 0 || cropWidth <= 0 || cropHeight <= 0)
+		return false;
+	if (cropX + cropWidth > srcWidth || cropY + cropHeight > srcHeight)
+		return false;
+
+	for (int y = 0; y < cropHeight; y++)
+	{
+		const uint8_t *srcRow = src + ((cropY + y) * srcStride) + (cropX * 3);
+		uint8_t *dstRow = dst + (y * dstStrideBytes);
+		std::memcpy(dstRow, srcRow, static_cast<size_t>(cropWidth) * 3u);
+	}
+	return true;
+}
+
 static void flatBufSend(const uint8_t *img)
 {
 	const int64_t startNs = nowNs();
 	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
+		_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 		if (_flatbuf.setImage(img, _imgWidthToSend, _imgHeightToSend) < 0)
 		{
-			std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
+			std::cout << "ERROR: Flatbuffer write timeout\n";
 		}
 	}
 	else
-		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+	{
+		bool expected = false;
+		if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			std::cout << "ERROR: Flatbuffer connection timeout\n";
+	}
 
 	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame sending was too slow: " << elapsedMicros << " us\n";
 	}
 }
 
@@ -1208,25 +1242,24 @@ static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, in
 	const int64_t startNs = nowNs();
 	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
+		_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 		if (_flatbuf.setNV12Image(y, uv, width, height, strideY, strideUV) < 0)
 		{
-			std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
+			std::cout << "ERROR: Flatbuffer write timeout\n";
 		}
 	}
 	else
-		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+	{
+		bool expected = false;
+		if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			std::cout << "ERROR: Flatbuffer connection timeout\n";
+	}
 
 	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame sending was too slow: " << elapsedMicros << " us\n";
 	}
 }
 
@@ -1235,25 +1268,24 @@ static void flatBufSendRequest(flatbuffers::DetachedBuffer &&req)
 	const int64_t startNs = nowNs();
 	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 	{
+		_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 		if (_flatbuf.sendPrebuiltRequest(req.data(), static_cast<uint32_t>(req.size())) < 0)
 		{
-			std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
+			std::cout << "ERROR: Flatbuffer write timeout\n";
 		}
 	}
 	else
-		std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+	{
+		bool expected = false;
+		if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			std::cout << "ERROR: Flatbuffer connection timeout\n";
+	}
 
 	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame sending was too slow: " << elapsedMicros << " us\n";
 	}
 }
 
@@ -1319,13 +1351,7 @@ static void transformImg(uint8_t *img)
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
@@ -1453,13 +1479,7 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
@@ -1509,13 +1529,7 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
@@ -1556,13 +1570,7 @@ static void transformImgRgbGpu(uint8_t *img)
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
@@ -1604,13 +1612,7 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-		char strTime[100];
-		time_t t = time(NULL);
-		struct tm *p = localtime(&t);
-		strftime(strTime, 100, "%F %T", p);
-
-		std::cout << strTime << " - WARNING: Frame transformation was too slow: " << elapsedMicros << " us" << std::endl;
+		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
@@ -1719,6 +1721,16 @@ static void processRequest(Request *request)
 
 		if (_transformEn)
 		{
+			if (_maxPendingProcess > 0)
+			{
+				const int cur = _pendingProcess.load(std::memory_order_acquire);
+				if (cur >= _maxPendingProcess)
+				{
+					_droppedProcess.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+			}
+
 			_pendingProcess.fetch_add(1, std::memory_order_acq_rel);
 
 			if (_useNv12)
@@ -1773,6 +1785,16 @@ static void processRequest(Request *request)
 		}
 		else
 		{
+			if (_maxPendingSend > 0)
+			{
+				const int cur = _pendingSend.load(std::memory_order_acquire);
+				if (cur >= _maxPendingSend)
+				{
+					_droppedSend.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+			}
+
 			_pendingSend.fetch_add(1, std::memory_order_acq_rel);
 
 			if (_useNv12)
@@ -1789,35 +1811,75 @@ static void processRequest(Request *request)
 				uint8_t *img = it->second[0].data();
 				if (_outputCropEn)
 				{
-					// Crop the raw image before sending
-					std::vector<uint8_t> cropped = cropRgb(img, _imgWidthToSend, _imgHeightToSend, _strideBgr,
-														   _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
-					auto croppedPtr = std::make_shared<std::vector<uint8_t>>(std::move(cropped));
-					_loopFb.callLater([croppedPtr]()
-									  {
+					// Crop the raw image before sending.
+					// Default behavior allocates a new buffer per frame. When maxPendingSend is enabled,
+					// we can reuse a small ring buffer to reduce allocation jitter.
+					if (_maxPendingSend > 0)
+					{
+						auto view = _cropOut.next();
+						if (!cropRgbInto(img, _imgWidthToSend, _imgHeightToSend, _strideBgr,
+										 _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight,
+										 view.rgb, _outputCropWidth * 3))
+						{
+							_pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+							continue;
+						}
+						uint8_t *croppedPtr = view.rgb;
+						_loopFb.callLater([croppedPtr]()
+										  {
+							const int64_t startNs = nowNs();
+							if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+							{
+								_flatbufConnErrorPrinted.store(false, std::memory_order_release);
+								if (_flatbuf.setImage(croppedPtr, _outputCropWidth, _outputCropHeight) < 0)
+								{
+									std::cout << "ERROR: Flatbuffer write timeout\n";
+								}
+							}
+							else
+							{
+								bool expected = false;
+								if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+									std::cout << "ERROR: Flatbuffer connection timeout\n";
+							}
+
+							int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+							if (before > 1 && _verbose)
+							{
+								int64_t elapsedMicros = (nowNs() - startNs) / 1000;
+								std::cout << "WARNING: Frame sending was too slow: " << elapsedMicros << " us\n";
+							} });
+					}
+					else
+					{
+						std::vector<uint8_t> cropped = cropRgb(img, _imgWidthToSend, _imgHeightToSend, _strideBgr,
+															   _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
+						auto croppedPtr = std::make_shared<std::vector<uint8_t>>(std::move(cropped));
+						_loopFb.callLater([croppedPtr]()
+										  {
 						const int64_t startNs = nowNs();
 						if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
 						{
+							_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 							if (_flatbuf.setImage(croppedPtr->data(), _outputCropWidth, _outputCropHeight) < 0)
 							{
-								std::cout << "ERROR: Flatbuffer write timeout" << std::endl;
+								std::cout << "ERROR: Flatbuffer write timeout\n";
 							}
 						}
 						else
-							std::cout << "ERROR: Flatbuffer connection timeout" << std::endl;
+						{
+							bool expected = false;
+							if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+								std::cout << "ERROR: Flatbuffer connection timeout\n";
+						}
 
 						int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 						if (before > 1 && _verbose)
 						{
 							int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-
-							char strTime[100];
-							time_t t = time(NULL);
-							struct tm *p = localtime(&t);
-							strftime(strTime, 100, "%F %T", p);
-
-							std::cout << strTime << " - WARNING: Frame sending was too slow: " << elapsedMicros << " us" << std::endl;
+							std::cout << "WARNING: Frame sending was too slow: " << elapsedMicros << " us\n";
 						} });
+					}
 				}
 				else
 				{
@@ -1862,52 +1924,54 @@ static void processRequest(Request *request)
 int main(int argc, char *argv[])
 {
 	po::options_description options("Options");
-	options.add_options()																																							  //
-		("width,w", po::value<int>(&_width)->default_value(640), "Width")																											  //
-		("height,h", po::value<int>(&_height)->default_value(480), "Height")																										  //
-		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")																					  //
-		("fps", po::value<float>(&_targetFps)->default_value(0.0f), "Target FPS limit (0=disabled, adds delay to maintain frame rate)")												  //
-		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")																										  //
-		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")																			  //
-		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")																				  //
-		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or Unix socket path)")														  //
-		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")																										  //
-		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")																							  //
-		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")															  //
-		("output-crop", po::value<std::string>(&_outputCropStr), "Output crop in format x,y,width,height (applied after transform)")												  //
-		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")																	  //
-		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")																  //
-		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")																							  //
-		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")																	  //
-		("imgout-crophelp", po::value<std::string>(&_imgOutCropHelpPath), "Capture image showing sensor area used at requested resolution (helps determine --crop coordinates)")	  //
-		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit")													  //
-		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit")														  //
-		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit")										  //
-		("autosat", po::value<std::string>(&_autoSatTargetSpec)->implicit_value(""), "One-shot auto saturation calibration and exit (optional arg: R,G,B target; default 230,50,50)") //
-		("autosat-iters", po::value<int>(&_autoSatMaxIters)->default_value(24), "Auto saturation max iterations")																	  //
-		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations")																  //
-		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)")												  //
-		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)")							  //
-		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)")							  //
-		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)")															  //
-		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)")								  //
-		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus")							  //
-		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)")																  //
-		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation")																					  //
-		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast")																							  //
-		("gamma", po::value<float>(&_gamma)->default_value(0.0f), "Camera gamma (0.0=use camera default)")																			  //
-		("hflip", po::bool_switch(&_hflip)->default_value(false), "Horizontal flip (native camera transform)")																		  //
-		("vflip", po::bool_switch(&_vflip)->default_value(false), "Vertical flip (native camera transform)")																		  //
-		("rotate", po::value<int>(&_rotate)->default_value(0), "Rotation in degrees: 0, 90, 180, 270 (native camera transform)")													  //
-		("crop", po::value<std::string>(&_cropStr), "Crop region in format x,y,width,height (native camera ScalerCrop)")															  //
-		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																						  //
-		("help", po::bool_switch(&_help)->default_value(false), "Print help")																										  //
-		;
+	options.add_options()																																								   //
+		("width,w", po::value<int>(&_width)->default_value(640), "Width")																												   //
+		("height,h", po::value<int>(&_height)->default_value(480), "Height")																											   //
+		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")																						   //
+		("fps", po::value<float>(&_targetFps)->default_value(0.0f), "Target FPS limit (0=disabled, adds delay to maintain frame rate)")													   //
+		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")																											   //
+		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")																				   //
+		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")																					   //
+		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or Unix socket path)")															   //
+		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")																											   //
+		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")																								   //
+		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")																   //
+		("output-crop", po::value<std::string>(&_outputCropStr), "Output crop in format x,y,width,height (applied after transform)")													   //
+		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")																		   //
+		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")																	   //
+		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")																								   //
+		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")																		   //
+		("imgout-crophelp", po::value<std::string>(&_imgOutCropHelpPath), "Capture image showing sensor area used at requested resolution (helps determine --crop coordinates)")		   //
+		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit")														   //
+		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit")															   //
+		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit")											   //
+		("autosat", po::value<std::string>(&_autoSatTargetSpec)->implicit_value(""), "One-shot auto saturation calibration and exit (optional arg: R,G,B target; default 230,50,50)")	   //
+		("autosat-iters", po::value<int>(&_autoSatMaxIters)->default_value(24), "Auto saturation max iterations")																		   //
+		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations")																	   //
+		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)")													   //
+		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)")								   //
+		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)")								   //
+		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)")																   //
+		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)")									   //
+		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus")								   //
+		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)")																	   //
+		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation")																						   //
+		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast")																								   //
+		("gamma", po::value<float>(&_gamma)->default_value(0.0f), "Camera gamma (0.0=use camera default)")																				   //
+		("hflip", po::bool_switch(&_hflip)->default_value(false), "Horizontal flip (native camera transform)")																			   //
+		("vflip", po::bool_switch(&_vflip)->default_value(false), "Vertical flip (native camera transform)")																			   //
+		("rotate", po::value<int>(&_rotate)->default_value(0), "Rotation in degrees: 0, 90, 180, 270 (native camera transform)")														   //
+		("crop", po::value<std::string>(&_cropStr), "Crop region in format x,y,width,height (native camera ScalerCrop)")																   //
+		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																							   //
+		("help", po::bool_switch(&_help)->default_value(false), "Print help")																											   //
+		("max-pending-process", po::value<int>(&_maxPendingProcess)->default_value(0), "Max in-flight transform jobs (0=unlimited). Set to 1 for lowest latency (drops frames when busy)") //
+		("max-pending-send", po::value<int>(&_maxPendingSend)->default_value(0), "Max in-flight send jobs (0=unlimited). Set to 1-2 for lowest latency (drops frames when busy)");
+
+	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 
 	po::variables_map vm;
 	po::store(po::parse_command_line(argc, argv, options), vm);
 	po::notify(vm);
-
 	_autoSat = (vm.count("autosat") > 0);
 	if (_autoSat)
 	{
@@ -2008,6 +2072,12 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: Invalid output-crop format. Use x,y,width,height" << std::endl;
 			return EXIT_FAILURE;
 		}
+	}
+
+	if (_outputCropEn && _maxPendingSend > 0)
+	{
+		const std::size_t ringSize = static_cast<std::size_t>(std::max(3, _maxPendingSend + 1));
+		_cropOut.reset(_outputCropWidth, _outputCropHeight, ringSize);
 	}
 
 	// Handle --imgout-crophelp (replaces --imgout)
