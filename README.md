@@ -216,6 +216,10 @@ To keep latency bounded (at the cost of dropping frames under load), use:
 - `--max-pending-process 1`: don't queue transforms; drop frames while busy
 - `--max-pending-send 1` (or `2`): don't queue sends; drop frames while busy
 
+If HyperHDR is restarting or the socket is temporarily down, the sender can otherwise block on connect attempts. To keep the send loop responsive, tune:
+- `--connect-timeout-ms 250` (or lower): limits how long a single connect attempt can block
+- `--reconnect-interval-ms 250` (or higher): limits how often reconnect attempts are made while disconnected
+
 Examples:
 ```
 # Lowest latency (bounded) when using a transform
@@ -223,6 +227,9 @@ Examples:
 
 # Lowest latency (bounded) without transform
 ./hyperion-cam --max-pending-send 1
+
+# When HyperHDR restarts frequently (avoid connect-stalls/spam)
+./hyperion-cam --max-pending-send 1 --connect-timeout-ms 100 --reconnect-interval-ms 250
 ```
 
 ### Performance / profiling knobs

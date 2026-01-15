@@ -416,6 +416,30 @@ static std::atomic<int> _pendingSend{0};
 // Connection error log gating: print once per disconnect, clear after successful reconnect.
 static std::atomic<bool> _flatbufConnErrorPrinted{false};
 
+// Reconnect throttling (prevents the FB loop from blocking on connect attempts every frame).
+static int _flatbufConnectTimeoutMs = 250;
+static int _flatbufReconnectIntervalMs = 250;
+static std::atomic<int64_t> _flatbufNextConnectAttemptNs{0};
+
+static inline bool flatbufTryConnect()
+{
+	const int64_t now = nowNs();
+	const int64_t next = _flatbufNextConnectAttemptNs.load(std::memory_order_acquire);
+	if (next != 0 && now < next)
+		return false;
+
+	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+	{
+		_flatbufConnErrorPrinted.store(false, std::memory_order_release);
+		_flatbufNextConnectAttemptNs.store(0, std::memory_order_release);
+		return true;
+	}
+
+	const int64_t delayNs = static_cast<int64_t>(_flatbufReconnectIntervalMs) * 1000000ll;
+	_flatbufNextConnectAttemptNs.store(now + (delayNs > 0 ? delayNs : 0), std::memory_order_release);
+	return false;
+}
+
 // Optional backlog limits (0 = unlimited). When set, frames are dropped early to keep latency bounded.
 static int _maxPendingProcess = 0;
 static int _maxPendingSend = 0;
@@ -1214,9 +1238,8 @@ static bool cropRgbInto(const uint8_t *src, int srcWidth, int srcHeight, int src
 static void flatBufSend(const uint8_t *img)
 {
 	const int64_t startNs = nowNs();
-	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+	if (flatbufTryConnect())
 	{
-		_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 		if (_flatbuf.setImage(img, _imgWidthToSend, _imgHeightToSend) < 0)
 		{
 			std::cout << "ERROR: Flatbuffer write timeout\n";
@@ -1240,9 +1263,8 @@ static void flatBufSend(const uint8_t *img)
 static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, int strideUV, int width, int height)
 {
 	const int64_t startNs = nowNs();
-	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+	if (flatbufTryConnect())
 	{
-		_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 		if (_flatbuf.setNV12Image(y, uv, width, height, strideY, strideUV) < 0)
 		{
 			std::cout << "ERROR: Flatbuffer write timeout\n";
@@ -1266,9 +1288,8 @@ static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, in
 static void flatBufSendRequest(flatbuffers::DetachedBuffer &&req)
 {
 	const int64_t startNs = nowNs();
-	if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+	if (flatbufTryConnect())
 	{
-		_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 		if (_flatbuf.sendPrebuiltRequest(req.data(), static_cast<uint32_t>(req.size())) < 0)
 		{
 			std::cout << "ERROR: Flatbuffer write timeout\n";
@@ -1828,9 +1849,8 @@ static void processRequest(Request *request)
 						_loopFb.callLater([croppedPtr]()
 										  {
 							const int64_t startNs = nowNs();
-							if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+							if (flatbufTryConnect())
 							{
-								_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 								if (_flatbuf.setImage(croppedPtr, _outputCropWidth, _outputCropHeight) < 0)
 								{
 									std::cout << "ERROR: Flatbuffer write timeout\n";
@@ -1858,9 +1878,8 @@ static void processRequest(Request *request)
 						_loopFb.callLater([croppedPtr]()
 										  {
 						const int64_t startNs = nowNs();
-						if (_flatbuf.connectToServer(_origin.c_str(), _conn.c_str(), _port, _priority, !_verbose))
+						if (flatbufTryConnect())
 						{
-							_flatbufConnErrorPrinted.store(false, std::memory_order_release);
 							if (_flatbuf.setImage(croppedPtr->data(), _outputCropWidth, _outputCropHeight) < 0)
 							{
 								std::cout << "ERROR: Flatbuffer write timeout\n";
@@ -1965,13 +1984,17 @@ int main(int argc, char *argv[])
 		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																							   //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")																											   //
 		("max-pending-process", po::value<int>(&_maxPendingProcess)->default_value(0), "Max in-flight transform jobs (0=unlimited). Set to 1 for lowest latency (drops frames when busy)") //
-		("max-pending-send", po::value<int>(&_maxPendingSend)->default_value(0), "Max in-flight send jobs (0=unlimited). Set to 1-2 for lowest latency (drops frames when busy)");
+		("max-pending-send", po::value<int>(&_maxPendingSend)->default_value(0), "Max in-flight send jobs (0=unlimited). Set to 1-2 for lowest latency (drops frames when busy)")		   //
+		("connect-timeout-ms", po::value<int>(&_flatbufConnectTimeoutMs)->default_value(250), "Socket connect timeout in ms (lower = lower latency when server is down)")				   //
+		("reconnect-interval-ms", po::value<int>(&_flatbufReconnectIntervalMs)->default_value(250), "Min time between reconnect attempts in ms when disconnected");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 
 	po::variables_map vm;
 	po::store(po::parse_command_line(argc, argv, options), vm);
 	po::notify(vm);
+
+	_flatbuf.setConnectTimeoutMs(_flatbufConnectTimeoutMs);
 	_autoSat = (vm.count("autosat") > 0);
 	if (_autoSat)
 	{

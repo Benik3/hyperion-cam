@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
+#include <fcntl.h>
+#include <poll.h>
 
 namespace
 {
@@ -102,6 +104,71 @@ void FlatBufferConnection::reserveBuilderBytes(size_t bytes)
 	_reservedBuilderBytes = bytes;
 }
 
+void FlatBufferConnection::setConnectTimeoutMs(int timeoutMs)
+{
+	// Clamp to a sane range; 0 means "no wait".
+	if (timeoutMs < 0)
+		timeoutMs = 0;
+	if (timeoutMs > 60000)
+		timeoutMs = 60000;
+	_connectTimeoutMs = timeoutMs;
+}
+
+static bool connectWithTimeout(int fd, const struct sockaddr *addr, socklen_t addrlen, int timeoutMs)
+{
+	const int oldFlags = fcntl(fd, F_GETFL, 0);
+	if (oldFlags < 0)
+		return false;
+
+	if (fcntl(fd, F_SETFL, oldFlags | O_NONBLOCK) < 0)
+		return false;
+
+	int rc = ::connect(fd, addr, addrlen);
+	if (rc == 0)
+	{
+		(void)fcntl(fd, F_SETFL, oldFlags);
+		return true;
+	}
+
+	if (errno != EINPROGRESS)
+	{
+		(void)fcntl(fd, F_SETFL, oldFlags);
+		return false;
+	}
+
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLOUT;
+	pfd.revents = 0;
+
+	rc = ::poll(&pfd, 1, timeoutMs);
+	if (rc <= 0)
+	{
+		// timeout or error
+		(void)fcntl(fd, F_SETFL, oldFlags);
+		if (rc == 0)
+			errno = ETIMEDOUT;
+		return false;
+	}
+
+	int soErr = 0;
+	socklen_t soErrLen = sizeof(soErr);
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &soErrLen) < 0)
+	{
+		(void)fcntl(fd, F_SETFL, oldFlags);
+		return false;
+	}
+
+	(void)fcntl(fd, F_SETFL, oldFlags);
+	if (soErr != 0)
+	{
+		errno = soErr;
+		return false;
+	}
+
+	return true;
+}
+
 int FlatBufferConnection::connectToServer(const char *origin, const char *host, uint16_t port, int priority, bool skipReply)
 {
 	if (_sockfd > 0) // already connected
@@ -174,7 +241,7 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 					connectionDestroy();
 					return 0;
 				}
-				if (connect(_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+				if (!connectWithTimeout(_sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr), _connectTimeoutMs))
 				{
 					if (!_connectFailedReported)
 					{
@@ -198,7 +265,7 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 					connectionDestroy();
 					return 0;
 				}
-				if (connect(_sockfd, (struct sockaddr *)&serv_addr6, sizeof(serv_addr6)) < 0)
+				if (!connectWithTimeout(_sockfd, (struct sockaddr *)&serv_addr6, sizeof(serv_addr6), _connectTimeoutMs))
 				{
 					if (!_connectFailedReported)
 					{
@@ -218,7 +285,7 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 			serv_unaddr.sun_family = AF_UNIX;
 			strcpy(serv_unaddr.sun_path, host);
 
-			if (connect(_sockfd, (struct sockaddr *)&serv_unaddr, SUN_LEN(&serv_unaddr)) < 0)
+			if (!connectWithTimeout(_sockfd, (struct sockaddr *)&serv_unaddr, SUN_LEN(&serv_unaddr), _connectTimeoutMs))
 			{
 				if (!_connectFailedReported)
 				{

@@ -60,6 +60,10 @@ public:
 	/// Safe to call multiple times; it only grows the internal buffer.
 	void reserveBuilderBytes(size_t bytes);
 
+	/// @brief Set connect timeout used for establishing the socket connection.
+	/// Applies to TCP/Unix socket connect attempts.
+	void setConnectTimeoutMs(int timeoutMs);
+
 	/// @brief Send a prebuilt FlatBuffers Request message.
 	///
 	/// This avoids copying image payloads into FlatBufferConnection's internal
@@ -115,6 +119,8 @@ private:
 
 	// Log gating: print connection failure once until a successful connect clears it.
 	bool _connectFailedReported{false};
+
+	int _connectTimeoutMs{250};
 };
 
 #endif
