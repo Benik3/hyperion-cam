@@ -1376,9 +1376,8 @@ static void transformImg(uint8_t *img)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable
-					  { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([req = std::move(req)]() mutable
+					  { flatBufSendRequest(std::move(req)); });
 }
 
 static void transformImgNv12(uint8_t *y, uint8_t *uv)
@@ -1504,9 +1503,8 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable
-					  { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([req = std::move(req)]() mutable
+					  { flatBufSendRequest(std::move(req)); });
 }
 
 static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY, int fdUV, int offUV)
@@ -1554,9 +1552,8 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable
-					  { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([req = std::move(req)]() mutable
+					  { flatBufSendRequest(std::move(req)); });
 #endif
 }
 
@@ -1595,9 +1592,8 @@ static void transformImgRgbGpu(uint8_t *img)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable
-					  { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([req = std::move(req)]() mutable
+					  { flatBufSendRequest(std::move(req)); });
 #endif
 }
 
@@ -1637,9 +1633,8 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
 	}
 
 	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	auto reqPtr = std::make_shared<flatbuffers::DetachedBuffer>(std::move(req));
-	_loopFb.callLater([reqPtr]() mutable
-					  { flatBufSendRequest(std::move(*reqPtr)); });
+	_loopFb.callLater([req = std::move(req)]() mutable
+					  { flatBufSendRequest(std::move(req)); });
 #endif
 }
 
@@ -1874,13 +1869,12 @@ static void processRequest(Request *request)
 					{
 						std::vector<uint8_t> cropped = cropRgb(img, _imgWidthToSend, _imgHeightToSend, _strideBgr,
 															   _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
-						auto croppedPtr = std::make_shared<std::vector<uint8_t>>(std::move(cropped));
-						_loopFb.callLater([croppedPtr]()
+						_loopFb.callLater([cropped = std::move(cropped)]() mutable
 										  {
 						const int64_t startNs = nowNs();
 						if (flatbufTryConnect())
 						{
-							if (_flatbuf.setImage(croppedPtr->data(), _outputCropWidth, _outputCropHeight) < 0)
+								if (_flatbuf.setImage(cropped.data(), _outputCropWidth, _outputCropHeight) < 0)
 							{
 								std::cout << "ERROR: Flatbuffer write timeout\n";
 							}
