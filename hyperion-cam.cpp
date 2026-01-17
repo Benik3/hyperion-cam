@@ -9,6 +9,7 @@
 #include <thread>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
 #include <algorithm>
 #include <cmath>
 #include <mutex>
@@ -77,7 +78,6 @@ struct Nv12RingBuffer
 	}
 };
 
-static Nv12RingBuffer _nv12Out;
 
 struct RgbRingBuffer
 {
@@ -108,7 +108,6 @@ struct RgbRingBuffer
 	}
 };
 
-static RgbRingBuffer _rgbOut;
 
 std::map<libcamera::FrameBuffer *, std::vector<libcamera::Span<uint8_t>>> _mappedBuffers;
 static EventLoop _loop;
@@ -129,8 +128,6 @@ int _imgHeight = 0;
 int _imgWidthToSend;
 int _imgHeightToSend;
 
-// Output crop buffer (used when output-crop is enabled)
-static std::vector<uint8_t> _outputCropBuffer;
 
 int _width;
 int _height;
@@ -415,6 +412,7 @@ static std::atomic<int> _pendingSend{0};
 
 // Connection error log gating: print once per disconnect, clear after successful reconnect.
 static std::atomic<bool> _flatbufConnErrorPrinted{false};
+static std::atomic<bool> _outputCropNv12ErrorPrinted{false};
 
 // Reconnect throttling (prevents the FB loop from blocking on connect attempts every frame).
 static int _flatbufConnectTimeoutMs = 250;
@@ -448,6 +446,7 @@ static std::atomic<uint64_t> _droppedSend{0};
 
 // Output crop ring buffer (used only when maxPendingSend > 0 to avoid per-frame allocations).
 static RgbRingBuffer _cropOut;
+static Nv12RingBuffer _cropNv12Out;
 
 static inline void imgOutExit(int code)
 {
@@ -1235,6 +1234,44 @@ static bool cropRgbInto(const uint8_t *src, int srcWidth, int srcHeight, int src
 	return true;
 }
 
+static bool cropNv12Into(const uint8_t *srcY, const uint8_t *srcUV,
+						int srcWidth, int srcHeight, int srcStrideY, int srcStrideUV,
+						int cropX, int cropY, int cropWidth, int cropHeight,
+						uint8_t *dstY, uint8_t *dstUV, int dstStrideY, int dstStrideUV)
+{
+	if (!dstY || !dstUV)
+		return false;
+	if (dstStrideY <= 0)
+		dstStrideY = cropWidth;
+	if (dstStrideUV <= 0)
+		dstStrideUV = cropWidth;
+	if (cropX < 0 || cropY < 0 || cropWidth <= 0 || cropHeight <= 0)
+		return false;
+	if (cropX + cropWidth > srcWidth || cropY + cropHeight > srcHeight)
+		return false;
+	// NV12 requires even alignment for chroma.
+	if ((cropX & 1) || (cropY & 1) || (cropWidth & 1) || (cropHeight & 1))
+		return false;
+
+	for (int y = 0; y < cropHeight; y++)
+	{
+		const uint8_t *srcRow = srcY + ((cropY + y) * srcStrideY) + cropX;
+		uint8_t *dstRow = dstY + (y * dstStrideY);
+		std::memcpy(dstRow, srcRow, static_cast<size_t>(cropWidth));
+	}
+
+	const int uvH = cropHeight / 2;
+	const int uvY = cropY / 2;
+	for (int y = 0; y < uvH; y++)
+	{
+		const uint8_t *srcRow = srcUV + ((uvY + y) * srcStrideUV) + cropX;
+		uint8_t *dstRow = dstUV + (y * dstStrideUV);
+		std::memcpy(dstRow, srcRow, static_cast<size_t>(cropWidth));
+	}
+
+	return true;
+}
+
 static void flatBufSend(const uint8_t *img)
 {
 	const int64_t startNs = nowNs();
@@ -1343,10 +1380,6 @@ static flatbuffers::DetachedBuffer buildNV12ImageRequestUninitialized(uint16_t w
 void *transformLoop(void *arg)
 {
 	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend, _useNv12);
-	if (_useNv12)
-		_nv12Out.reset(_imgWidthToSend, _imgHeightToSend);
-	else
-		_rgbOut.reset(_imgWidthToSend, _imgHeightToSend);
 
 #ifdef HAVE_GPU_TRANSFORM
 	if (_useNv12 && _useGpu)
@@ -1819,8 +1852,55 @@ static void processRequest(Request *request)
 					continue;
 				uint8_t *y = it->second[0].data();
 				uint8_t *uv = it->second[1].data();
-				_loopFb.callLater([y, uv]()
+				if (_outputCropEn)
+				{
+					if (_maxPendingSend > 0)
+					{
+						auto view = _cropNv12Out.next();
+						if (!cropNv12Into(y, uv, _imgWidthToSend, _imgHeightToSend, _strideY, _strideUV,
+										 _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight,
+										 view.y, view.uv, _outputCropWidth, _outputCropWidth))
+						{
+							bool expected = false;
+							if (_outputCropNv12ErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+								std::cout << "ERROR: NV12 output-crop failed (check bounds and even alignment)" << std::endl;
+							_pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+							continue;
+						}
+						uint8_t *outY = view.y;
+						uint8_t *outUV = view.uv;
+						int outStrideY = _outputCropWidth;
+						int outStrideUV = _outputCropWidth;
+						int outW = _outputCropWidth;
+						int outH = _outputCropHeight;
+						_loopFb.callLater([outY, outUV, outStrideY, outStrideUV, outW, outH]()
+									  { flatBufSendNv12(outY, outUV, outStrideY, outStrideUV, outW, outH); });
+					}
+					else
+					{
+						std::vector<uint8_t> yCrop(static_cast<size_t>(_outputCropWidth) * static_cast<size_t>(_outputCropHeight));
+						std::vector<uint8_t> uvCrop(static_cast<size_t>(_outputCropWidth) * static_cast<size_t>(_outputCropHeight) / 2u);
+						if (!cropNv12Into(y, uv, _imgWidthToSend, _imgHeightToSend, _strideY, _strideUV,
+										 _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight,
+										 yCrop.data(), uvCrop.data(), _outputCropWidth, _outputCropWidth))
+						{
+							bool expected = false;
+							if (_outputCropNv12ErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+								std::cout << "ERROR: NV12 output-crop failed (check bounds and even alignment)" << std::endl;
+							_pendingSend.fetch_sub(1, std::memory_order_acq_rel);
+							continue;
+						}
+						int outW = _outputCropWidth;
+						int outH = _outputCropHeight;
+						_loopFb.callLater([yCrop = std::move(yCrop), uvCrop = std::move(uvCrop), outW, outH]() mutable
+									  { flatBufSendNv12(yCrop.data(), uvCrop.data(), outW, outW, outW, outH); });
+					}
+				}
+				else
+				{
+					_loopFb.callLater([y, uv]()
 								  { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend); });
+				}
 			}
 			else
 			{
@@ -2094,7 +2174,10 @@ int main(int argc, char *argv[])
 	if (_outputCropEn && _maxPendingSend > 0)
 	{
 		const std::size_t ringSize = static_cast<std::size_t>(std::max(3, _maxPendingSend + 1));
-		_cropOut.reset(_outputCropWidth, _outputCropHeight, ringSize);
+		if (_useNv12)
+			_cropNv12Out.reset(_outputCropWidth, _outputCropHeight, ringSize);
+		else
+			_cropOut.reset(_outputCropWidth, _outputCropHeight, ringSize);
 	}
 
 	// Handle --imgout-crophelp (replaces --imgout)
@@ -2160,6 +2243,15 @@ int main(int argc, char *argv[])
 		std::cout << "ERROR: --transform and --output-crop are mutually exclusive" << std::endl;
 		std::cout << "       If using transform, adjust the transform coordinates instead of cropping" << std::endl;
 		return EXIT_FAILURE;
+	}
+
+	if (_useNv12 && _outputCropEn)
+	{
+		if ((_outputCropX & 1) || (_outputCropY & 1) || (_outputCropWidth & 1) || (_outputCropHeight & 1))
+		{
+			std::cout << "ERROR: --output-crop requires even x,y,width,height when using NV12" << std::endl;
+			return EXIT_FAILURE;
+		}
 	}
 
 	// GPU transform is the default when compiled in and --transform is used.
@@ -2575,6 +2667,11 @@ int main(int argc, char *argv[])
 		{
 			size_t mapLen = plane.offset + plane.length;
 			void *memory = mmap(NULL, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED, plane.fd.get(), 0);
+			if (memory == MAP_FAILED)
+			{
+				std::cout << "ERROR: mmap failed: " << std::strerror(errno) << std::endl;
+				return EXIT_FAILURE;
+			}
 			uint8_t *planePtr = static_cast<uint8_t *>(memory) + plane.offset;
 			_mappedBuffers[buffer.get()].push_back(libcamera::Span<uint8_t>(planePtr, plane.length));
 		}
@@ -2649,6 +2746,23 @@ int main(int argc, char *argv[])
 	_camera->stop();
 	allocator->free(stream);
 	delete allocator;
+	if (_transformation)
+	{
+		delete _transformation;
+		_transformation = nullptr;
+	}
+#ifdef HAVE_GPU_TRANSFORM
+	if (_gpuNv12)
+	{
+		delete _gpuNv12;
+		_gpuNv12 = nullptr;
+	}
+	if (_gpuRgb)
+	{
+		delete _gpuRgb;
+		_gpuRgb = nullptr;
+	}
+#endif
 	_camera->release();
 	_camera.reset();
 	cm->stop();
