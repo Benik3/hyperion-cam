@@ -21,168 +21,168 @@
 
 namespace
 {
-static constexpr uint32_t fourcc_code(char a, char b, char c, char d)
-{
-	return (static_cast<uint32_t>(a)) |
-		(static_cast<uint32_t>(b) << 8) |
-		(static_cast<uint32_t>(c) << 16) |
-		(static_cast<uint32_t>(d) << 24);
-}
-
-// Plane import formats
-static constexpr uint32_t DRM_FORMAT_R8 = fourcc_code('R', '8', ' ', ' ');
-static constexpr uint32_t DRM_FORMAT_GR88 = fourcc_code('G', 'R', '8', '8');
-
-static inline uint64_t monoNs()
-{
-	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-										std::chrono::steady_clock::now().time_since_epoch())
-										.count());
-}
-
-static bool envEnabled(const char *name)
-{
-	const char *v = std::getenv(name);
-	if (!v)
-		return false;
-	return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
-}
-
-static std::string eglErrStr(EGLint err)
-{
-	switch (err)
+	static constexpr uint32_t fourcc_code(char a, char b, char c, char d)
 	{
-	case EGL_SUCCESS:
-		return "EGL_SUCCESS";
-	case EGL_NOT_INITIALIZED:
-		return "EGL_NOT_INITIALIZED";
-	case EGL_BAD_ACCESS:
-		return "EGL_BAD_ACCESS";
-	case EGL_BAD_ALLOC:
-		return "EGL_BAD_ALLOC";
-	case EGL_BAD_ATTRIBUTE:
-		return "EGL_BAD_ATTRIBUTE";
-	case EGL_BAD_CONTEXT:
-		return "EGL_BAD_CONTEXT";
-	case EGL_BAD_CONFIG:
-		return "EGL_BAD_CONFIG";
-	case EGL_BAD_CURRENT_SURFACE:
-		return "EGL_BAD_CURRENT_SURFACE";
-	case EGL_BAD_DISPLAY:
-		return "EGL_BAD_DISPLAY";
-	case EGL_BAD_SURFACE:
-		return "EGL_BAD_SURFACE";
-	case EGL_BAD_MATCH:
-		return "EGL_BAD_MATCH";
-	case EGL_BAD_PARAMETER:
-		return "EGL_BAD_PARAMETER";
-	case EGL_BAD_NATIVE_PIXMAP:
-		return "EGL_BAD_NATIVE_PIXMAP";
-	case EGL_BAD_NATIVE_WINDOW:
-		return "EGL_BAD_NATIVE_WINDOW";
-	case EGL_CONTEXT_LOST:
-		return "EGL_CONTEXT_LOST";
-	default:
-		return "EGL_ERROR_" + std::to_string(err);
+		return (static_cast<uint32_t>(a)) |
+			   (static_cast<uint32_t>(b) << 8) |
+			   (static_cast<uint32_t>(c) << 16) |
+			   (static_cast<uint32_t>(d) << 24);
 	}
-}
 
-static EGLDisplay getEglDisplayHeadless()
-{
-	// First try the default display.
-	EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-	if (dpy == EGL_NO_DISPLAY)
-		return EGL_NO_DISPLAY;
+	// Plane import formats
+	static constexpr uint32_t DRM_FORMAT_R8 = fourcc_code('R', '8', ' ', ' ');
+	static constexpr uint32_t DRM_FORMAT_GR88 = fourcc_code('G', 'R', '8', '8');
 
-	EGLint maj = 0, min = 0;
-	if (eglInitialize(dpy, &maj, &min))
-		return dpy;
+	static inline uint64_t monoNs()
+	{
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+										 std::chrono::steady_clock::now().time_since_epoch())
+										 .count());
+	}
 
-	// Default display failed to initialize (common on headless without X/Wayland).
-	// Try Mesa surfaceless platform if available.
-	PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplay =
-		reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
-	if (!getPlatformDisplay)
-		return EGL_NO_DISPLAY;
+	static bool envEnabled(const char *name)
+	{
+		const char *v = std::getenv(name);
+		if (!v)
+			return false;
+		return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+	}
+
+	static std::string eglErrStr(EGLint err)
+	{
+		switch (err)
+		{
+		case EGL_SUCCESS:
+			return "EGL_SUCCESS";
+		case EGL_NOT_INITIALIZED:
+			return "EGL_NOT_INITIALIZED";
+		case EGL_BAD_ACCESS:
+			return "EGL_BAD_ACCESS";
+		case EGL_BAD_ALLOC:
+			return "EGL_BAD_ALLOC";
+		case EGL_BAD_ATTRIBUTE:
+			return "EGL_BAD_ATTRIBUTE";
+		case EGL_BAD_CONTEXT:
+			return "EGL_BAD_CONTEXT";
+		case EGL_BAD_CONFIG:
+			return "EGL_BAD_CONFIG";
+		case EGL_BAD_CURRENT_SURFACE:
+			return "EGL_BAD_CURRENT_SURFACE";
+		case EGL_BAD_DISPLAY:
+			return "EGL_BAD_DISPLAY";
+		case EGL_BAD_SURFACE:
+			return "EGL_BAD_SURFACE";
+		case EGL_BAD_MATCH:
+			return "EGL_BAD_MATCH";
+		case EGL_BAD_PARAMETER:
+			return "EGL_BAD_PARAMETER";
+		case EGL_BAD_NATIVE_PIXMAP:
+			return "EGL_BAD_NATIVE_PIXMAP";
+		case EGL_BAD_NATIVE_WINDOW:
+			return "EGL_BAD_NATIVE_WINDOW";
+		case EGL_CONTEXT_LOST:
+			return "EGL_CONTEXT_LOST";
+		default:
+			return "EGL_ERROR_" + std::to_string(err);
+		}
+	}
+
+	static EGLDisplay getEglDisplayHeadless()
+	{
+		// First try the default display.
+		EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+		if (dpy == EGL_NO_DISPLAY)
+			return EGL_NO_DISPLAY;
+
+		EGLint maj = 0, min = 0;
+		if (eglInitialize(dpy, &maj, &min))
+			return dpy;
+
+		// Default display failed to initialize (common on headless without X/Wayland).
+		// Try Mesa surfaceless platform if available.
+		PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplay =
+			reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
+		if (!getPlatformDisplay)
+			return EGL_NO_DISPLAY;
 
 #ifdef EGL_PLATFORM_SURFACELESS_MESA
-	EGLDisplay surf = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
-	if (surf != EGL_NO_DISPLAY)
-	{
-		if (eglInitialize(surf, &maj, &min))
-			return surf;
-	}
+		EGLDisplay surf = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
+		if (surf != EGL_NO_DISPLAY)
+		{
+			if (eglInitialize(surf, &maj, &min))
+				return surf;
+		}
 #endif
 
-	return EGL_NO_DISPLAY;
-}
-
-static GLuint compileShader(GLenum type, const char *src)
-{
-	GLuint sh = glCreateShader(type);
-	glShaderSource(sh, 1, &src, nullptr);
-	glCompileShader(sh);
-	GLint ok = 0;
-	glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-	if (!ok)
-	{
-		char log[2048];
-		GLsizei len = 0;
-		glGetShaderInfoLog(sh, sizeof(log), &len, log);
-		std::string msg = "Shader compile failed: ";
-		msg.append(log, log + len);
-		glDeleteShader(sh);
-		throw std::runtime_error(msg);
+		return EGL_NO_DISPLAY;
 	}
-	return sh;
-}
 
-static GLuint linkProgram(GLuint vs, GLuint fs)
-{
-	GLuint prog = glCreateProgram();
-	glAttachShader(prog, vs);
-	glAttachShader(prog, fs);
-	glLinkProgram(prog);
-	GLint ok = 0;
-	glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-	if (!ok)
+	static GLuint compileShader(GLenum type, const char *src)
 	{
-		char log[2048];
-		GLsizei len = 0;
-		glGetProgramInfoLog(prog, sizeof(log), &len, log);
-		std::string msg = "Program link failed: ";
-		msg.append(log, log + len);
-		glDeleteProgram(prog);
-		throw std::runtime_error(msg);
+		GLuint sh = glCreateShader(type);
+		glShaderSource(sh, 1, &src, nullptr);
+		glCompileShader(sh);
+		GLint ok = 0;
+		glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+		if (!ok)
+		{
+			char log[2048];
+			GLsizei len = 0;
+			glGetShaderInfoLog(sh, sizeof(log), &len, log);
+			std::string msg = "Shader compile failed: ";
+			msg.append(log, log + len);
+			glDeleteShader(sh);
+			throw std::runtime_error(msg);
+		}
+		return sh;
 	}
-	return prog;
-}
 
-static void checkGl(const char *what)
-{
-	GLenum e = glGetError();
-	if (e != GL_NO_ERROR)
+	static GLuint linkProgram(GLuint vs, GLuint fs)
 	{
-		throw std::runtime_error(std::string("GL error after ") + what + ": " + std::to_string(static_cast<int>(e)));
+		GLuint prog = glCreateProgram();
+		glAttachShader(prog, vs);
+		glAttachShader(prog, fs);
+		glLinkProgram(prog);
+		GLint ok = 0;
+		glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+		if (!ok)
+		{
+			char log[2048];
+			GLsizei len = 0;
+			glGetProgramInfoLog(prog, sizeof(log), &len, log);
+			std::string msg = "Program link failed: ";
+			msg.append(log, log + len);
+			glDeleteProgram(prog);
+			throw std::runtime_error(msg);
+		}
+		return prog;
 	}
-}
 
-static std::array<float, 9> mat3FromCv64(const cv::Mat &m)
-{
-	std::array<float, 9> out{};
-	// GLSL expects column-major layout when transpose is GL_FALSE.
-	// OpenCV stores matrices conceptually in row-major accessors.
-	out[0] = static_cast<float>(m.at<double>(0, 0));
-	out[1] = static_cast<float>(m.at<double>(1, 0));
-	out[2] = static_cast<float>(m.at<double>(2, 0));
-	out[3] = static_cast<float>(m.at<double>(0, 1));
-	out[4] = static_cast<float>(m.at<double>(1, 1));
-	out[5] = static_cast<float>(m.at<double>(2, 1));
-	out[6] = static_cast<float>(m.at<double>(0, 2));
-	out[7] = static_cast<float>(m.at<double>(1, 2));
-	out[8] = static_cast<float>(m.at<double>(2, 2));
-	return out;
-}
+	static void checkGl(const char *what)
+	{
+		GLenum e = glGetError();
+		if (e != GL_NO_ERROR)
+		{
+			throw std::runtime_error(std::string("GL error after ") + what + ": " + std::to_string(static_cast<int>(e)));
+		}
+	}
+
+	static std::array<float, 9> mat3FromCv64(const cv::Mat &m)
+	{
+		std::array<float, 9> out{};
+		// GLSL expects column-major layout when transpose is GL_FALSE.
+		// OpenCV stores matrices conceptually in row-major accessors.
+		out[0] = static_cast<float>(m.at<double>(0, 0));
+		out[1] = static_cast<float>(m.at<double>(1, 0));
+		out[2] = static_cast<float>(m.at<double>(2, 0));
+		out[3] = static_cast<float>(m.at<double>(0, 1));
+		out[4] = static_cast<float>(m.at<double>(1, 1));
+		out[5] = static_cast<float>(m.at<double>(2, 1));
+		out[6] = static_cast<float>(m.at<double>(0, 2));
+		out[7] = static_cast<float>(m.at<double>(1, 2));
+		out[8] = static_cast<float>(m.at<double>(2, 2));
+		return out;
+	}
 
 } // namespace
 
@@ -236,7 +236,8 @@ struct GpuNv12Transform::Impl
 		std::size_t operator()(const DmabufKey &k) const
 		{
 			std::size_t h = 1469598103934665603ull;
-			auto mix = [&](std::size_t v) {
+			auto mix = [&](std::size_t v)
+			{
 				h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
 			};
 			mix(static_cast<std::size_t>(k.fd));
@@ -304,7 +305,7 @@ struct GpuNv12Transform::Impl
 		{
 			EGLint err = eglGetError();
 			throw std::runtime_error("EGL display init failed (" + eglErrStr(err) + "). "
-							"On headless systems you may need KMS/DRM enabled or set EGL_PLATFORM=surfaceless.");
+																					"On headless systems you may need KMS/DRM enabled or set EGL_PLATFORM=surfaceless.");
 		}
 
 		static const EGLint cfgAttribs[] = {
@@ -934,32 +935,33 @@ void main(){
 		if (now - lastPrintNs > 1000000000ull)
 		{
 			double denom = profFrames ? static_cast<double>(profFrames) : 1.0;
-			auto toMs = [&](uint64_t ns) { return (static_cast<double>(ns) / denom) / 1e6; };
-				std::cerr << "[gpuNv12] avg ms: total(render)=" << toMs(accTotalNs)
-						  << " xform(upload+render)=" << toMs(accXformTotalNs)
-						  << " upload=" << toMs(accUploadNs)
-						  << " uploadY=" << toMs(accUploadYNs)
-						  << " uploadUV=" << toMs(accUploadUVNs)
-						  << " yDraw=" << toMs(accDrawYNs);
-				if (usePbo)
-					std::cerr << " yReadKick=" << toMs(accReadKickYNs);
-				else
-					std::cerr << " yRead=" << toMs(accReadYNs);
-				std::cerr << " uvDraw=" << toMs(accDrawUVNs);
-				if (usePbo)
-					std::cerr << " uvReadKick=" << toMs(accReadKickUVNs);
-				else
-					std::cerr << " uvRead=" << toMs(accReadUVNs);
-				if (usePbo)
-					std::cerr << " consume(map+cpy)=" << toMs(accConsumeNs) << " reuseCopy=" << toMs(accReuseCopyNs);
-				std::cerr << (profileSync ? " (sync)" : "")
-						  << std::endl;
+			auto toMs = [&](uint64_t ns)
+			{ return (static_cast<double>(ns) / denom) / 1e6; };
+			std::cerr << "[gpuNv12] avg ms: total(render)=" << toMs(accTotalNs)
+					  << " xform(upload+render)=" << toMs(accXformTotalNs)
+					  << " upload=" << toMs(accUploadNs)
+					  << " uploadY=" << toMs(accUploadYNs)
+					  << " uploadUV=" << toMs(accUploadUVNs)
+					  << " yDraw=" << toMs(accDrawYNs);
+			if (usePbo)
+				std::cerr << " yReadKick=" << toMs(accReadKickYNs);
+			else
+				std::cerr << " yRead=" << toMs(accReadYNs);
+			std::cerr << " uvDraw=" << toMs(accDrawUVNs);
+			if (usePbo)
+				std::cerr << " uvReadKick=" << toMs(accReadKickUVNs);
+			else
+				std::cerr << " uvRead=" << toMs(accReadUVNs);
+			if (usePbo)
+				std::cerr << " consume(map+cpy)=" << toMs(accConsumeNs) << " reuseCopy=" << toMs(accReuseCopyNs);
+			std::cerr << (profileSync ? " (sync)" : "")
+					  << std::endl;
 			profFrames = 0;
-				accUploadNs = accUploadYNs = accUploadUVNs = 0;
-				accDrawYNs = accReadYNs = accReadKickYNs = 0;
-				accDrawUVNs = accReadUVNs = accReadKickUVNs = 0;
-				accConsumeNs = 0;
-				accReuseCopyNs = 0;
+			accUploadNs = accUploadYNs = accUploadUVNs = 0;
+			accDrawYNs = accReadYNs = accReadKickYNs = 0;
+			accDrawUVNs = accReadUVNs = accReadKickUVNs = 0;
+			accConsumeNs = 0;
+			accReuseCopyNs = 0;
 			accTotalNs = accXformTotalNs = 0;
 			lastPrintNs = now;
 		}

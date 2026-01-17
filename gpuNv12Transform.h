@@ -8,10 +8,10 @@ class GpuNv12Transform
 {
 public:
 	GpuNv12Transform(int srcWidth,
-				int srcHeight,
-				const cv::Point2f *srcQuad,
-				int dstWidth,
-				int dstHeight);
+					 int srcHeight,
+					 const cv::Point2f *srcQuad,
+					 int dstWidth,
+					 int dstHeight);
 	~GpuNv12Transform();
 
 	GpuNv12Transform(const GpuNv12Transform &) = delete;
@@ -23,22 +23,22 @@ public:
 	// outY: must be dstWidth*dstHeight
 	// outUV: must be dstWidth*dstHeight/2
 	void transform(const uint8_t *yPlane,
-			   const uint8_t *uvPlane,
-			   int strideY,
-			   int strideUV,
-			   uint8_t *outY,
-			   uint8_t *outUV);
+				   const uint8_t *uvPlane,
+				   int strideY,
+				   int strideUV,
+				   uint8_t *outY,
+				   uint8_t *outUV);
 
 	// DMA-BUF import path: avoids CPU upload by importing the input planes via EGLImage.
 	// Returns false if DMA-BUF import isn't available/enabled (caller may fall back to transform()).
 	bool transformDmabuf(int fdY,
-				 int offsetYBytes,
-				 int strideY,
-				 int fdUV,
-				 int offsetUVBytes,
-				 int strideUV,
-				 uint8_t *outY,
-				 uint8_t *outUV);
+						 int offsetYBytes,
+						 int strideY,
+						 int fdUV,
+						 int offsetUVBytes,
+						 int strideUV,
+						 uint8_t *outY,
+						 uint8_t *outUV);
 
 private:
 	struct Impl;

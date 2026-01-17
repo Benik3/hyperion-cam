@@ -88,6 +88,7 @@ Use `--autofocus-once` to run autofocus once, print the resulting focus position
 The `--hflip` and `--vflip` options use libcamera's native Transform control to flip the image horizontally or vertically at the hardware level (sensor or ISP). These are zero-overhead operations and work with all pixel formats (RGB, NV12). They can be combined with `--transform` for perspective correction.
 
 #### Rotation note:
+Note: The rotation depends on a camera capabilities. Not all cameras support e.g. 90° and 270°
 The `--rotate` option provides hardware-accelerated rotation (0°, 90°, 180°, 270°) using libcamera's native Transform. This can be combined with `--hflip` and `--vflip` for complex orientations:
 
 Examples:
@@ -200,6 +201,9 @@ Examples:
 ./hyperion-cam --transform "0,0:640,0:0,480:640,480" --autosat
 ./hyperion-cam --transform "0,0:640,0:0,480:640,480" --autosat 50,230,50
 ```
+
+#### Gamma note:
+Not all cameras support gamma correction.
 
 #### Picture transformation note:
 The app allows to make Perspective (projective) transformation of the picture in real time using OpenCV. Of course, it adds a little lag, but it's numbers of milliseconds.  

@@ -25,154 +25,154 @@
 
 namespace
 {
-static constexpr uint32_t fourcc_code(char a, char b, char c, char d)
-{
-	return (static_cast<uint32_t>(a)) |
-		(static_cast<uint32_t>(b) << 8) |
-		(static_cast<uint32_t>(c) << 16) |
-		(static_cast<uint32_t>(d) << 24);
-}
-
-static constexpr uint32_t DRM_FORMAT_XRGB8888 = fourcc_code('X', 'R', '2', '4');
-static constexpr uint32_t DRM_FORMAT_XBGR8888 = fourcc_code('X', 'B', '2', '4');
-
-static inline uint64_t monoNs()
-{
-	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-								 std::chrono::steady_clock::now().time_since_epoch())
-								 .count());
-}
-
-static bool envEnabled(const char *name)
-{
-	const char *v = std::getenv(name);
-	if (!v)
-		return false;
-	return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
-}
-
-static std::string eglErrStr(EGLint err)
-{
-	switch (err)
+	static constexpr uint32_t fourcc_code(char a, char b, char c, char d)
 	{
-	case EGL_SUCCESS:
-		return "EGL_SUCCESS";
-	case EGL_NOT_INITIALIZED:
-		return "EGL_NOT_INITIALIZED";
-	case EGL_BAD_ACCESS:
-		return "EGL_BAD_ACCESS";
-	case EGL_BAD_ALLOC:
-		return "EGL_BAD_ALLOC";
-	case EGL_BAD_ATTRIBUTE:
-		return "EGL_BAD_ATTRIBUTE";
-	case EGL_BAD_CONTEXT:
-		return "EGL_BAD_CONTEXT";
-	case EGL_BAD_CONFIG:
-		return "EGL_BAD_CONFIG";
-	case EGL_BAD_CURRENT_SURFACE:
-		return "EGL_BAD_CURRENT_SURFACE";
-	case EGL_BAD_DISPLAY:
-		return "EGL_BAD_DISPLAY";
-	case EGL_BAD_SURFACE:
-		return "EGL_BAD_SURFACE";
-	case EGL_BAD_MATCH:
-		return "EGL_BAD_MATCH";
-	case EGL_BAD_PARAMETER:
-		return "EGL_BAD_PARAMETER";
-	case EGL_BAD_NATIVE_PIXMAP:
-		return "EGL_BAD_NATIVE_PIXMAP";
-	case EGL_BAD_NATIVE_WINDOW:
-		return "EGL_BAD_NATIVE_WINDOW";
-	case EGL_CONTEXT_LOST:
-		return "EGL_CONTEXT_LOST";
-	default:
-		return "EGL_ERROR_" + std::to_string(err);
+		return (static_cast<uint32_t>(a)) |
+			   (static_cast<uint32_t>(b) << 8) |
+			   (static_cast<uint32_t>(c) << 16) |
+			   (static_cast<uint32_t>(d) << 24);
 	}
-}
 
-static EGLDisplay getEglDisplayHeadless()
-{
-	EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-	if (dpy == EGL_NO_DISPLAY)
-		return EGL_NO_DISPLAY;
+	static constexpr uint32_t DRM_FORMAT_XRGB8888 = fourcc_code('X', 'R', '2', '4');
+	static constexpr uint32_t DRM_FORMAT_XBGR8888 = fourcc_code('X', 'B', '2', '4');
 
-	EGLint maj = 0, min = 0;
-	if (eglInitialize(dpy, &maj, &min))
-		return dpy;
+	static inline uint64_t monoNs()
+	{
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+										 std::chrono::steady_clock::now().time_since_epoch())
+										 .count());
+	}
 
-	PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplay =
-		reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
-	if (!getPlatformDisplay)
-		return EGL_NO_DISPLAY;
+	static bool envEnabled(const char *name)
+	{
+		const char *v = std::getenv(name);
+		if (!v)
+			return false;
+		return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+	}
+
+	static std::string eglErrStr(EGLint err)
+	{
+		switch (err)
+		{
+		case EGL_SUCCESS:
+			return "EGL_SUCCESS";
+		case EGL_NOT_INITIALIZED:
+			return "EGL_NOT_INITIALIZED";
+		case EGL_BAD_ACCESS:
+			return "EGL_BAD_ACCESS";
+		case EGL_BAD_ALLOC:
+			return "EGL_BAD_ALLOC";
+		case EGL_BAD_ATTRIBUTE:
+			return "EGL_BAD_ATTRIBUTE";
+		case EGL_BAD_CONTEXT:
+			return "EGL_BAD_CONTEXT";
+		case EGL_BAD_CONFIG:
+			return "EGL_BAD_CONFIG";
+		case EGL_BAD_CURRENT_SURFACE:
+			return "EGL_BAD_CURRENT_SURFACE";
+		case EGL_BAD_DISPLAY:
+			return "EGL_BAD_DISPLAY";
+		case EGL_BAD_SURFACE:
+			return "EGL_BAD_SURFACE";
+		case EGL_BAD_MATCH:
+			return "EGL_BAD_MATCH";
+		case EGL_BAD_PARAMETER:
+			return "EGL_BAD_PARAMETER";
+		case EGL_BAD_NATIVE_PIXMAP:
+			return "EGL_BAD_NATIVE_PIXMAP";
+		case EGL_BAD_NATIVE_WINDOW:
+			return "EGL_BAD_NATIVE_WINDOW";
+		case EGL_CONTEXT_LOST:
+			return "EGL_CONTEXT_LOST";
+		default:
+			return "EGL_ERROR_" + std::to_string(err);
+		}
+	}
+
+	static EGLDisplay getEglDisplayHeadless()
+	{
+		EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+		if (dpy == EGL_NO_DISPLAY)
+			return EGL_NO_DISPLAY;
+
+		EGLint maj = 0, min = 0;
+		if (eglInitialize(dpy, &maj, &min))
+			return dpy;
+
+		PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplay =
+			reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
+		if (!getPlatformDisplay)
+			return EGL_NO_DISPLAY;
 
 #ifdef EGL_PLATFORM_SURFACELESS_MESA
-	EGLDisplay surf = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
-	if (surf != EGL_NO_DISPLAY)
-	{
-		if (eglInitialize(surf, &maj, &min))
-			return surf;
-	}
+		EGLDisplay surf = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
+		if (surf != EGL_NO_DISPLAY)
+		{
+			if (eglInitialize(surf, &maj, &min))
+				return surf;
+		}
 #endif
 
-	return EGL_NO_DISPLAY;
-}
-
-static GLuint compileShader(GLenum type, const char *src)
-{
-	GLuint sh = glCreateShader(type);
-	glShaderSource(sh, 1, &src, nullptr);
-	glCompileShader(sh);
-	GLint ok = 0;
-	glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-	if (!ok)
-	{
-		char log[2048];
-		GLsizei len = 0;
-		glGetShaderInfoLog(sh, sizeof(log), &len, log);
-		std::string msg = "Shader compile failed: ";
-		msg.append(log, log + len);
-		glDeleteShader(sh);
-		throw std::runtime_error(msg);
+		return EGL_NO_DISPLAY;
 	}
-	return sh;
-}
 
-static GLuint linkProgram(GLuint vs, GLuint fs)
-{
-	GLuint prog = glCreateProgram();
-	glAttachShader(prog, vs);
-	glAttachShader(prog, fs);
-	glLinkProgram(prog);
-	GLint ok = 0;
-	glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-	if (!ok)
+	static GLuint compileShader(GLenum type, const char *src)
 	{
-		char log[2048];
-		GLsizei len = 0;
-		glGetProgramInfoLog(prog, sizeof(log), &len, log);
-		std::string msg = "Program link failed: ";
-		msg.append(log, log + len);
-		glDeleteProgram(prog);
-		throw std::runtime_error(msg);
+		GLuint sh = glCreateShader(type);
+		glShaderSource(sh, 1, &src, nullptr);
+		glCompileShader(sh);
+		GLint ok = 0;
+		glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+		if (!ok)
+		{
+			char log[2048];
+			GLsizei len = 0;
+			glGetShaderInfoLog(sh, sizeof(log), &len, log);
+			std::string msg = "Shader compile failed: ";
+			msg.append(log, log + len);
+			glDeleteShader(sh);
+			throw std::runtime_error(msg);
+		}
+		return sh;
 	}
-	return prog;
-}
 
-static std::array<float, 9> mat3FromCv64(const cv::Mat &m)
-{
-	std::array<float, 9> out{};
-	// GLSL expects column-major layout when transpose is GL_FALSE.
-	out[0] = static_cast<float>(m.at<double>(0, 0));
-	out[1] = static_cast<float>(m.at<double>(1, 0));
-	out[2] = static_cast<float>(m.at<double>(2, 0));
-	out[3] = static_cast<float>(m.at<double>(0, 1));
-	out[4] = static_cast<float>(m.at<double>(1, 1));
-	out[5] = static_cast<float>(m.at<double>(2, 1));
-	out[6] = static_cast<float>(m.at<double>(0, 2));
-	out[7] = static_cast<float>(m.at<double>(1, 2));
-	out[8] = static_cast<float>(m.at<double>(2, 2));
-	return out;
-}
+	static GLuint linkProgram(GLuint vs, GLuint fs)
+	{
+		GLuint prog = glCreateProgram();
+		glAttachShader(prog, vs);
+		glAttachShader(prog, fs);
+		glLinkProgram(prog);
+		GLint ok = 0;
+		glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+		if (!ok)
+		{
+			char log[2048];
+			GLsizei len = 0;
+			glGetProgramInfoLog(prog, sizeof(log), &len, log);
+			std::string msg = "Program link failed: ";
+			msg.append(log, log + len);
+			glDeleteProgram(prog);
+			throw std::runtime_error(msg);
+		}
+		return prog;
+	}
+
+	static std::array<float, 9> mat3FromCv64(const cv::Mat &m)
+	{
+		std::array<float, 9> out{};
+		// GLSL expects column-major layout when transpose is GL_FALSE.
+		out[0] = static_cast<float>(m.at<double>(0, 0));
+		out[1] = static_cast<float>(m.at<double>(1, 0));
+		out[2] = static_cast<float>(m.at<double>(2, 0));
+		out[3] = static_cast<float>(m.at<double>(0, 1));
+		out[4] = static_cast<float>(m.at<double>(1, 1));
+		out[5] = static_cast<float>(m.at<double>(2, 1));
+		out[6] = static_cast<float>(m.at<double>(0, 2));
+		out[7] = static_cast<float>(m.at<double>(1, 2));
+		out[8] = static_cast<float>(m.at<double>(2, 2));
+		return out;
+	}
 
 } // namespace
 
@@ -668,22 +668,22 @@ void main(){
 
 				int x = 0;
 #if defined(__aarch64__)
-					const bool neonAnyStride = envEnabled("HYPERCAM_GL_PACK_NEON_ANY_STRIDE");
-					if (neonAnyStride || strideBytes == srcW * 3)
+				const bool neonAnyStride = envEnabled("HYPERCAM_GL_PACK_NEON_ANY_STRIDE");
+				if (neonAnyStride || strideBytes == srcW * 3)
+				{
+					// 16 pixels at a time: load 3 interleaved streams, store 4 interleaved (A=255).
+					const uint8x16_t a = vdupq_n_u8(255);
+					for (; x + 15 < srcW; x += 16)
 					{
-						// 16 pixels at a time: load 3 interleaved streams, store 4 interleaved (A=255).
-						const uint8x16_t a = vdupq_n_u8(255);
-						for (; x + 15 < srcW; x += 16)
-						{
-							uint8x16x3_t rgb = vld3q_u8(srcRow + x * 3);
-							uint8x16x4_t rgba;
-							rgba.val[0] = rgb.val[0];
-							rgba.val[1] = rgb.val[1];
-							rgba.val[2] = rgb.val[2];
-							rgba.val[3] = a;
-							vst4q_u8(dstRow + x * 4, rgba);
-						}
+						uint8x16x3_t rgb = vld3q_u8(srcRow + x * 3);
+						uint8x16x4_t rgba;
+						rgba.val[0] = rgb.val[0];
+						rgba.val[1] = rgb.val[1];
+						rgba.val[2] = rgb.val[2];
+						rgba.val[3] = a;
+						vst4q_u8(dstRow + x * 4, rgba);
 					}
+				}
 #endif
 
 				for (; x < srcW; x++)
@@ -747,7 +747,7 @@ void main(){
 				// RGB565 -> RGB888
 				const uint16_t *src16 = static_cast<const uint16_t *>(ptr);
 				std::size_t i = 0;
-			#if defined(__aarch64__)
+#if defined(__aarch64__)
 				const uint16x8_t mask5 = vdupq_n_u16(0x1Fu);
 				const uint16x8_t mask6 = vdupq_n_u16(0x3Fu);
 				for (; i + 15 < n; i += 16)
@@ -775,7 +775,7 @@ void main(){
 					rgb.val[2] = vcombine_u8(vmovn_u16(b8_0), vmovn_u16(b8_1));
 					vst3q_u8(dst + i * 3, rgb);
 				}
-			#endif
+#endif
 				for (; i < n; i++)
 				{
 					const uint16_t p = src16[i];
@@ -792,7 +792,7 @@ void main(){
 				// RGBA -> RGB directly from mapped PBO memory
 				const uint8_t *src = static_cast<const uint8_t *>(ptr);
 				std::size_t i = 0;
-			#if defined(__aarch64__)
+#if defined(__aarch64__)
 				for (; i + 15 < n; i += 16)
 				{
 					uint8x16x4_t rgba = vld4q_u8(src + i * 4);
@@ -802,7 +802,7 @@ void main(){
 					rgb.val[2] = rgba.val[2];
 					vst3q_u8(dst + i * 3, rgb);
 				}
-			#endif
+#endif
 				for (; i < n; i++)
 				{
 					const std::size_t si = i * 4;
@@ -904,7 +904,8 @@ void main(){
 			if (now - lastPrintNs > 1000000000ull)
 			{
 				double denom = profFrames ? static_cast<double>(profFrames) : 1.0;
-				auto toMs = [&](uint64_t ns) { return (static_cast<double>(ns) / denom) / 1e6; };
+				auto toMs = [&](uint64_t ns)
+				{ return (static_cast<double>(ns) / denom) / 1e6; };
 				std::cerr << "[gpuRgb] avg ms: total(render)=" << toMs(accTotalNs)
 						  << " xform(upload+render)=" << toMs(accXformTotalNs)
 						  << " upload=" << toMs(accUploadNs)

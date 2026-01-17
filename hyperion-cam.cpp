@@ -78,7 +78,6 @@ struct Nv12RingBuffer
 	}
 };
 
-
 struct RgbRingBuffer
 {
 	std::vector<std::vector<uint8_t>> rgb;
@@ -108,7 +107,6 @@ struct RgbRingBuffer
 	}
 };
 
-
 std::map<libcamera::FrameBuffer *, std::vector<libcamera::Span<uint8_t>>> _mappedBuffers;
 static EventLoop _loop;
 static EventLoop _loopFb;
@@ -127,7 +125,6 @@ int _imgWidth = 0;
 int _imgHeight = 0;
 int _imgWidthToSend;
 int _imgHeightToSend;
-
 
 int _width;
 int _height;
@@ -1235,9 +1232,9 @@ static bool cropRgbInto(const uint8_t *src, int srcWidth, int srcHeight, int src
 }
 
 static bool cropNv12Into(const uint8_t *srcY, const uint8_t *srcUV,
-						int srcWidth, int srcHeight, int srcStrideY, int srcStrideUV,
-						int cropX, int cropY, int cropWidth, int cropHeight,
-						uint8_t *dstY, uint8_t *dstUV, int dstStrideY, int dstStrideUV)
+						 int srcWidth, int srcHeight, int srcStrideY, int srcStrideUV,
+						 int cropX, int cropY, int cropWidth, int cropHeight,
+						 uint8_t *dstY, uint8_t *dstUV, int dstStrideY, int dstStrideUV)
 {
 	if (!dstY || !dstUV)
 		return false;
@@ -1858,8 +1855,8 @@ static void processRequest(Request *request)
 					{
 						auto view = _cropNv12Out.next();
 						if (!cropNv12Into(y, uv, _imgWidthToSend, _imgHeightToSend, _strideY, _strideUV,
-										 _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight,
-										 view.y, view.uv, _outputCropWidth, _outputCropWidth))
+										  _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight,
+										  view.y, view.uv, _outputCropWidth, _outputCropWidth))
 						{
 							bool expected = false;
 							if (_outputCropNv12ErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
@@ -1874,15 +1871,15 @@ static void processRequest(Request *request)
 						int outW = _outputCropWidth;
 						int outH = _outputCropHeight;
 						_loopFb.callLater([outY, outUV, outStrideY, outStrideUV, outW, outH]()
-									  { flatBufSendNv12(outY, outUV, outStrideY, outStrideUV, outW, outH); });
+										  { flatBufSendNv12(outY, outUV, outStrideY, outStrideUV, outW, outH); });
 					}
 					else
 					{
 						std::vector<uint8_t> yCrop(static_cast<size_t>(_outputCropWidth) * static_cast<size_t>(_outputCropHeight));
 						std::vector<uint8_t> uvCrop(static_cast<size_t>(_outputCropWidth) * static_cast<size_t>(_outputCropHeight) / 2u);
 						if (!cropNv12Into(y, uv, _imgWidthToSend, _imgHeightToSend, _strideY, _strideUV,
-										 _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight,
-										 yCrop.data(), uvCrop.data(), _outputCropWidth, _outputCropWidth))
+										  _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight,
+										  yCrop.data(), uvCrop.data(), _outputCropWidth, _outputCropWidth))
 						{
 							bool expected = false;
 							if (_outputCropNv12ErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
@@ -1893,13 +1890,13 @@ static void processRequest(Request *request)
 						int outW = _outputCropWidth;
 						int outH = _outputCropHeight;
 						_loopFb.callLater([yCrop = std::move(yCrop), uvCrop = std::move(uvCrop), outW, outH]() mutable
-									  { flatBufSendNv12(yCrop.data(), uvCrop.data(), outW, outW, outW, outH); });
+										  { flatBufSendNv12(yCrop.data(), uvCrop.data(), outW, outW, outW, outH); });
 					}
 				}
 				else
 				{
 					_loopFb.callLater([y, uv]()
-								  { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend); });
+									  { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend); });
 				}
 			}
 			else

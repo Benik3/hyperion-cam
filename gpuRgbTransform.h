@@ -18,10 +18,10 @@ public:
 	};
 
 	GpuRgbTransform(int srcWidth,
-			 int srcHeight,
-			 const cv::Point2f *srcQuad,
-			 int dstWidth,
-			 int dstHeight);
+					int srcHeight,
+					const cv::Point2f *srcQuad,
+					int dstWidth,
+					int dstHeight);
 	~GpuRgbTransform();
 
 	GpuRgbTransform(const GpuRgbTransform &) = delete;
@@ -34,8 +34,8 @@ public:
 
 	// Like transform(), but allows 4 bytes per pixel input (e.g. XBGR8888/BGRX8888).
 	void transform(const uint8_t *inPixels, int strideBytes, InputFormat fmt, uint8_t *outRgb);
-		// DMA-BUF import path: avoids CPU packing + glTexSubImage2D by importing the camera buffer
-		// directly into a GL texture via EGLImage.
+	// DMA-BUF import path: avoids CPU packing + glTexSubImage2D by importing the camera buffer
+	// directly into a GL texture via EGLImage.
 	void transformDmabuf(int fd, int offsetBytes, int strideBytes, InputFormat fmt, uint8_t *outRgb);
 
 private:
