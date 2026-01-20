@@ -9,7 +9,7 @@ class OpencvTransform
 {
 public:
 	/// @brief Constructor
-	OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut, bool alignEvenOutput = false);
+	OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut, bool alignEvenOutput = false, int interp = cv::INTER_NEAREST, int forcedOutW = 0, int forcedOutH = 0);
 
 	/// @brief Destructor
 	~OpencvTransform();
@@ -28,4 +28,5 @@ private:
 	std::size_t _dstIndex = 0;
 	int _srcWidth = 0;
 	int _srcHeight = 0;
+	int _interp = cv::INTER_NEAREST;
 };

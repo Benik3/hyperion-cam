@@ -11,7 +11,8 @@ public:
 					 int srcHeight,
 					 const cv::Point2f *srcQuad,
 					 int dstWidth,
-					 int dstHeight);
+					 int dstHeight,
+					 bool highQuality = false);
 	~GpuNv12Transform();
 
 	GpuNv12Transform(const GpuNv12Transform &) = delete;

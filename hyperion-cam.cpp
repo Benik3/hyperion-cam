@@ -37,6 +37,7 @@ static std::shared_ptr<Camera> _camera;
 bool _useNv12 = false;
 bool _useGpu = false;
 bool _cpuOnly = false;
+bool _hyperhdrCalib = false;
 
 static int _strideY = 0;
 static int _strideUV = 0;
@@ -164,6 +165,18 @@ bool _verbose = false;
 bool _help = false;
 bool _version = false;
 
+// --hyperhdr-calib output geometry (NV12 only)
+static bool _calibAdjustEn = false;
+static int _calibCropX = 0;
+static int _calibCropY = 0;
+static int _calibCropW = 0;
+static int _calibCropH = 0;
+static int _calibOutW = 0;
+static int _calibOutH = 0;
+static bool _calibNeedCrop = false;
+static bool _calibNeedScale = false;
+static int _xformInterp = cv::INTER_NEAREST;
+
 // For --imgout-crophelp: store the auto-crop rectangle to draw on full sensor image
 static bool _imgOutCropHelpDrawRect = false;
 static int _imgOutCropHelpRectX = 0;
@@ -177,6 +190,10 @@ static std::atomic<bool> _autoFocusTriggerSent{false};
 static std::atomic<float> _autoFocusLockedPos{-1.0f};
 
 static std::atomic<bool> _imgOutDone{false};
+
+static bool _transformUserEn = false;
+static int _transformForcedW = 0;
+static int _transformForcedH = 0;
 
 // FPS control
 static float _targetFps = 0.0f; // 0 = disabled (no FPS limit)
@@ -226,6 +243,80 @@ static inline bool autoCalibEnabled()
 static inline float clampf(float v, float lo, float hi)
 {
 	return std::max(lo, std::min(hi, v));
+}
+
+static inline int makeEven(int v)
+{
+	v &= ~1;
+	return (v < 2) ? 2 : v;
+}
+
+static void calcTransformOutputSize(int &outW, int &outH, bool alignEven)
+{
+	int w = static_cast<int>(std::lround(std::max(_imgQuad[1].x - _imgQuad[0].x, _imgQuad[3].x - _imgQuad[2].x)));
+	int h = static_cast<int>(std::lround(std::max(_imgQuad[2].y - _imgQuad[0].y, _imgQuad[3].y - _imgQuad[1].y)));
+	if (alignEven)
+	{
+		w = makeEven(w);
+		h = makeEven(h);
+	}
+	outW = w;
+	outH = h;
+}
+
+static void computeCalibGeometry(int srcW, int srcH)
+{
+	_calibNeedCrop = false;
+	_calibNeedScale = false;
+	_calibCropX = 0;
+	_calibCropY = 0;
+	_calibCropW = srcW;
+	_calibCropH = srcH;
+
+	if (srcW <= 0 || srcH <= 0)
+		return;
+
+	const double targetRatio = 16.0 / 9.0;
+	const double ratio = static_cast<double>(srcW) / static_cast<double>(srcH);
+	int outW = srcW;
+	int outH = srcH;
+
+	// Fix aspect without downscaling: increase the shorter dimension.
+	if (std::fabs(ratio - targetRatio) > 1e-6)
+	{
+		if (ratio > targetRatio)
+		{
+			// Too wide -> increase height
+			outH = static_cast<int>(std::lround(static_cast<double>(outW) * 9.0 / 16.0));
+			if (outH < srcH)
+				outH = srcH;
+			outW = static_cast<int>(std::lround(static_cast<double>(outH) * 16.0 / 9.0));
+		}
+		else
+		{
+			// Too tall -> increase width
+			outW = static_cast<int>(std::lround(static_cast<double>(outH) * 16.0 / 9.0));
+			if (outW < srcW)
+				outW = srcW;
+			outH = static_cast<int>(std::lround(static_cast<double>(outW) * 9.0 / 16.0));
+		}
+	}
+
+	// Ensure minimum 1920x1080 (scale up only)
+	const double scaleW = 1920.0 / static_cast<double>(outW);
+	const double scaleH = 1080.0 / static_cast<double>(outH);
+	const double scale = std::max(1.0, std::max(scaleW, scaleH));
+	outW = makeEven(static_cast<int>(std::lround(static_cast<double>(outW) * scale)));
+	outH = makeEven(static_cast<int>(std::lround(static_cast<double>(outW) * 9.0 / 16.0)));
+	if (outH < 1080)
+	{
+		outH = makeEven(1080);
+		outW = makeEven(static_cast<int>(std::lround(static_cast<double>(outH) * 16.0 / 9.0)));
+	}
+
+	_calibOutW = outW;
+	_calibOutH = outH;
+	_calibNeedScale = (_calibOutW != srcW) || (_calibOutH != srcH);
 }
 
 static inline bool parseRgbTriplet(std::string spec, int &outR, int &outG, int &outB)
@@ -1132,7 +1223,9 @@ static void imgOutSaveTransformedGpu(uint8_t *img, int fd, int off)
 		return;
 	}
 
-	std::vector<uint8_t> rgb(static_cast<std::size_t>(_imgWidthToSend) * static_cast<std::size_t>(_imgHeightToSend) * 3u);
+	const int outW = (_transformForcedW > 0) ? _transformForcedW : _imgWidthToSend;
+	const int outH = (_transformForcedH > 0) ? _transformForcedH : _imgHeightToSend;
+	std::vector<uint8_t> rgb(static_cast<std::size_t>(outW) * static_cast<std::size_t>(outH) * 3u);
 	GpuRgbTransform::InputFormat fmt = GpuRgbTransform::InputFormat::Packed3;
 	if (_bppBgr == 4)
 		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
@@ -1142,7 +1235,7 @@ static void imgOutSaveTransformedGpu(uint8_t *img, int fd, int off)
 	else
 		_gpuRgb->transform(img, _strideBgr, fmt, rgb.data());
 
-	cv::Mat rgbMat(_imgHeightToSend, _imgWidthToSend, CV_8UC3, rgb.data());
+	cv::Mat rgbMat(outH, outW, CV_8UC3, rgb.data());
 	cv::Mat bgr;
 	cv::cvtColor(rgbMat, bgr, cv::COLOR_RGB2BGR);
 
@@ -1376,13 +1469,20 @@ static flatbuffers::DetachedBuffer buildNV12ImageRequestUninitialized(uint16_t w
 }
 void *transformLoop(void *arg)
 {
-	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend, _useNv12);
+	const int forcedW = (_transformForcedW > 0) ? _transformForcedW : 0;
+	const int forcedH = (_transformForcedH > 0) ? _transformForcedH : 0;
+	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend, _useNv12, _xformInterp, forcedW, forcedH);
+	if (forcedW > 0 && forcedH > 0)
+	{
+		_imgWidthToSend = forcedW;
+		_imgHeightToSend = forcedH;
+	}
 
 #ifdef HAVE_GPU_TRANSFORM
 	if (_useNv12 && _useGpu)
-		_gpuNv12 = new GpuNv12Transform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend);
+		_gpuNv12 = new GpuNv12Transform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend, _hyperhdrCalib);
 	if (!_useNv12 && _useGpu)
-		_gpuRgb = new GpuRgbTransform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend);
+		_gpuRgb = new GpuRgbTransform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend, _hyperhdrCalib);
 #endif
 	_loopTr.exec();
 	return 0;
@@ -1521,8 +1621,8 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	cv::Mat yOut(_imgHeightToSend, _imgWidthToSend, CV_8UC1, outY, outStrideY);
 	cv::Mat uvOut(_imgHeightToSend / 2, _imgWidthToSend / 2, CV_8UC2, outUV, outStrideUV);
 
-	cv::remap(yIn, yOut, mapYx, mapYy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
-	cv::remap(uvIn, uvOut, mapUVx, mapUVy, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
+	cv::remap(yIn, yOut, mapYx, mapYy, _xformInterp, cv::BORDER_CONSTANT);
+	cv::remap(uvIn, uvOut, mapUVx, mapUVy, _xformInterp, cv::BORDER_CONSTANT);
 	cpuProfileTick(_cpuNv12Prof, "[cpuNv12]", static_cast<uint64_t>(nowNs() - startNs));
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -2014,49 +2114,49 @@ static void processRequest(Request *request)
 int main(int argc, char *argv[])
 {
 	po::options_description options("Options");
-	options.add_options()																																								   //
-		("width,w", po::value<int>(&_width)->default_value(640), "Width")																												   //
-		("height,h", po::value<int>(&_height)->default_value(480), "Height")																											   //
-		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")																						   //
-		("fps", po::value<float>(&_targetFps)->default_value(0.0f), "Target FPS limit (0=disabled, adds delay to maintain frame rate)")													   //
-		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")																											   //
-		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")																				   //
-		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")																					   //
-		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or Unix socket path)")															   //
-		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")																											   //
-		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")																								   //
-		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")																   //
-		("output-crop", po::value<std::string>(&_outputCropStr), "Output crop in format x,y,width,height (applied after transform)")													   //
-		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")																		   //
-		("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available")																	   //
-		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")																								   //
-		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")																		   //
-		("imgout-crophelp", po::value<std::string>(&_imgOutCropHelpPath), "Capture image showing sensor area used at requested resolution (helps determine --crop coordinates)")		   //
-		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit")														   //
-		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit")															   //
-		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit")											   //
-		("autosat", po::value<std::string>(&_autoSatTargetSpec)->implicit_value(""), "One-shot auto saturation calibration and exit (optional arg: R,G,B target; default 230,50,50)")	   //
-		("autosat-iters", po::value<int>(&_autoSatMaxIters)->default_value(24), "Auto saturation max iterations")																		   //
-		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations")																	   //
-		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)")													   //
-		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)")								   //
-		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)")								   //
-		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)")																   //
-		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)")									   //
-		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus")								   //
-		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)")																	   //
-		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation")																						   //
-		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast")																								   //
-		("gamma", po::value<float>(&_gamma)->default_value(0.0f), "Camera gamma (0.0=use camera default)")																				   //
-		("hflip", po::bool_switch(&_hflip)->default_value(false), "Horizontal flip (native camera transform)")																			   //
-		("vflip", po::bool_switch(&_vflip)->default_value(false), "Vertical flip (native camera transform)")																			   //
-		("rotate", po::value<int>(&_rotate)->default_value(0), "Rotation in degrees: 0, 90, 180, 270 (native camera transform)")														   //
-		("crop", po::value<std::string>(&_cropStr), "Crop region in format x,y,width,height (native camera ScalerCrop)")																   //
-		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																							   //
-		("help", po::bool_switch(&_help)->default_value(false), "Print help")																											   //
-		("max-pending-process", po::value<int>(&_maxPendingProcess)->default_value(0), "Max in-flight transform jobs (0=unlimited). Set to 1 for lowest latency (drops frames when busy)") //
-		("max-pending-send", po::value<int>(&_maxPendingSend)->default_value(0), "Max in-flight send jobs (0=unlimited). Set to 1-2 for lowest latency (drops frames when busy)")		   //
-		("connect-timeout-ms", po::value<int>(&_flatbufConnectTimeoutMs)->default_value(250), "Socket connect timeout in ms (lower = lower latency when server is down)")				   //
+	options.add_options()																																																											  //
+		("width,w", po::value<int>(&_width)->default_value(640), "Width")																																															  //
+		("height,h", po::value<int>(&_height)->default_value(480), "Height")																																														  //
+		("shutter,s", po::value<int32_t>(&_shutter)->default_value(16666), "Shutter speed in us")																																									  //
+		("fps", po::value<float>(&_targetFps)->default_value(0.0f), "Target FPS limit (0=disabled, adds delay to maintain frame rate)")																																  //
+		("gain,g", po::value<float>(&_gain)->default_value(1.0), "Camera gain")																																														  //
+		("wbgain,b", po::value<std::string>(&_wbgainsStr)->default_value("1.0,1.0"), "White balance gains")																																							  //
+		("origin,o", po::value<std::string>(&_origin)->default_value("camera"), "Name of the origin")																																								  //
+		("connection,c", po::value<std::string>(&_conn)->default_value("127.0.0.1"), "Socket address (IP or Unix socket path)")																																		  //
+		("port,p", po::value<int>(&_port)->default_value(19400), "TCP port")																																														  //
+		("priority,r", po::value<int>(&_priority)->default_value(120), "Hyperion priority")																																											  //
+		("transform,t", po::value<std::string>(&_transformStr), "Picture transformation in format x1,y1:x2,y2:x3,y3:x4,y4")																																			  //
+		("output-crop", po::value<std::string>(&_outputCropStr), "Output crop in format x,y,width,height (applied after transform)")																																  //
+		("nv12", po::bool_switch(&_useNv12)->default_value(false), "Enable NV12 format output (default is BGR888)")																																					  //
+		("hyperhdr-calib", po::bool_switch(&_hyperhdrCalib)->default_value(false), "HyperHDR calibration mode: force NV12, ensure 16:9 and >=1920x1080")("cpuonly", po::bool_switch(&_cpuOnly)->default_value(false), "Force CPU transform even if GPU is available") //
+		("verbose,v", po::bool_switch(&_verbose)->default_value(false), "Verbose output")																																											  //
+		("imgout", po::value<std::string>(&_imgOutPath), "Capture one image (RGB) to file (png/bmp/...) and exit")																																					  //
+		("imgout-crophelp", po::value<std::string>(&_imgOutCropHelpPath), "Capture image showing sensor area used at requested resolution (helps determine --crop coordinates)")																					  //
+		("autowb", po::bool_switch(&_autoWb)->default_value(false), "One-shot auto white balance calibration (gray 127) and exit")																																	  //
+		("autogain", po::bool_switch(&_autoGain)->default_value(false), "One-shot auto gain calibration (gray 127) and exit")																																		  //
+		("autocalib", po::bool_switch(&_autoCalib)->default_value(false), "One-shot auto white balance + gain calibration (gray 127) and exit")																														  //
+		("autosat", po::value<std::string>(&_autoSatTargetSpec)->implicit_value(""), "One-shot auto saturation calibration and exit (optional arg: R,G,B target; default 230,50,50)")																				  //
+		("autosat-iters", po::value<int>(&_autoSatMaxIters)->default_value(24), "Auto saturation max iterations")																																					  //
+		("autocalib-iters", po::value<int>(&_autoCalibMaxIters)->default_value(8), "Auto calibration max iterations")																																				  //
+		("autocalib-delay-ms", po::value<int>(&_autoCalibDelayMs)->default_value(500), "Delay between auto calibration updates (ms)")																																  //
+		("autocalib-tol-wb", po::value<float>(&_autoCalibTolWb)->default_value(2.0), "Auto WB convergence tolerance (abs channel delta: |R-G| and |B-G|)")																											  //
+		("autocalib-tol-grey", po::value<float>(&_autoCalibTolGrey)->default_value(3.0), "Auto gain convergence tolerance (abs avg RGB error from 127)")																											  //
+		("autocalib-gain-samples", po::value<int>(&_autoGainSamples)->default_value(8), "Auto gain samples (curve-fit)")																																			  //
+		("autocalib-gain-range", po::value<float>(&_autoGainRange)->default_value(4.0), "Auto gain range multiplier (min=gain/range, max=gain*range)")																												  //
+		("autofocus-once", po::bool_switch(&_autoFocusOnce)->default_value(false), "Run autofocus once at startup, print focus, then lock manual focus")																											  //
+		("focus,f", po::value<float>(&_focus)->default_value(-1.0f), "Manual focus lens position (-1 keeps default)")																																				  //
+		("saturation", po::value<float>(&_saturation)->default_value(1.0f), "Camera saturation")																																									  //
+		("contrast", po::value<float>(&_contrast)->default_value(1.0f), "Camera contrast")																																											  //
+		("gamma", po::value<float>(&_gamma)->default_value(0.0f), "Camera gamma (0.0=use camera default)")																																							  //
+		("hflip", po::bool_switch(&_hflip)->default_value(false), "Horizontal flip (native camera transform)")																																						  //
+		("vflip", po::bool_switch(&_vflip)->default_value(false), "Vertical flip (native camera transform)")																																						  //
+		("rotate", po::value<int>(&_rotate)->default_value(0), "Rotation in degrees: 0, 90, 180, 270 (native camera transform)")																																	  //
+		("crop", po::value<std::string>(&_cropStr), "Crop region in format x,y,width,height (native camera ScalerCrop)")																																			  //
+		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																																										  //
+		("help", po::bool_switch(&_help)->default_value(false), "Print help")																																														  //
+		("max-pending-process", po::value<int>(&_maxPendingProcess)->default_value(0), "Max in-flight transform jobs (0=unlimited). Set to 1 for lowest latency (drops frames when busy)")																			  //
+		("max-pending-send", po::value<int>(&_maxPendingSend)->default_value(0), "Max in-flight send jobs (0=unlimited). Set to 1-2 for lowest latency (drops frames when busy)")																					  //
+		("connect-timeout-ms", po::value<int>(&_flatbufConnectTimeoutMs)->default_value(250), "Socket connect timeout in ms (lower = lower latency when server is down)")																							  //
 		("reconnect-interval-ms", po::value<int>(&_flatbufReconnectIntervalMs)->default_value(250), "Min time between reconnect attempts in ms when disconnected");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
@@ -2066,6 +2166,30 @@ int main(int argc, char *argv[])
 	po::notify(vm);
 
 	_flatbuf.setConnectTimeoutMs(_flatbufConnectTimeoutMs);
+
+	if (_hyperhdrCalib)
+	{
+		_useNv12 = true;
+		_xformInterp = cv::INTER_LINEAR;
+		if (_width < 1920)
+			_width = 1920;
+		if (_height < 1080)
+			_height = 1080;
+		if ((_width & 1) != 0)
+			_width += 1;
+		if ((_height & 1) != 0)
+			_height += 1;
+		if (_autoWb || _autoGain || _autoCalib || vm.count("autosat"))
+		{
+			std::cout << "ERROR: --hyperhdr-calib cannot be combined with auto calibration options" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (vm.count("output-crop"))
+		{
+			std::cout << "ERROR: --hyperhdr-calib cannot be combined with --output-crop" << std::endl;
+			return EXIT_FAILURE;
+		}
+	}
 	_autoSat = (vm.count("autosat") > 0);
 	if (_autoSat)
 	{
@@ -2111,6 +2235,7 @@ int main(int argc, char *argv[])
 				   &_imgQuad[0].x, &_imgQuad[0].y, &_imgQuad[1].x, &_imgQuad[1].y, &_imgQuad[2].x, &_imgQuad[2].y, &_imgQuad[3].x, &_imgQuad[3].y) == 8)
 		{
 			_transformEn = true;
+			_transformUserEn = true;
 		}
 		else
 		{
@@ -2577,6 +2702,91 @@ int main(int argc, char *argv[])
 	{
 		_imgHeightToSend = _imgHeight;
 		_imgWidthToSend = _imgWidth;
+	}
+
+	if (_hyperhdrCalib)
+	{
+		int baseW = _imgWidthToSend;
+		int baseH = _imgHeightToSend;
+		bool autoEnableTransform = false;
+		if (_transformEn && _transformUserEn)
+		{
+			calcTransformOutputSize(baseW, baseH, _useNv12);
+		}
+		else
+		{
+			const double targetRatio = 16.0 / 9.0;
+			const int reqW = _width;
+			const int reqH = _height;
+			const double ratio = (reqH > 0) ? (static_cast<double>(reqW) / static_cast<double>(reqH)) : 0.0;
+			const bool ratioOk = std::fabs(ratio - targetRatio) <= 1e-6;
+			const bool sizeOk = (reqW >= 1920) && (reqH >= 1080);
+			if (!ratioOk || !sizeOk)
+				autoEnableTransform = true;
+
+			if (autoEnableTransform)
+			{
+				// Auto-enable transform (full-frame) for calibration output sizing.
+				_transformEn = true;
+				_imgQuad[0] = cv::Point2f(0.f, 0.f);
+				_imgQuad[1] = cv::Point2f(static_cast<float>(_imgWidth), 0.f);
+				_imgQuad[2] = cv::Point2f(0.f, static_cast<float>(_imgHeight));
+				_imgQuad[3] = cv::Point2f(static_cast<float>(_imgWidth), static_cast<float>(_imgHeight));
+				baseW = _imgWidth;
+				baseH = _imgHeight;
+			}
+		}
+
+		computeCalibGeometry(baseW, baseH);
+		if (_transformEn)
+		{
+			_imgWidthToSend = _calibOutW;
+			_imgHeightToSend = _calibOutH;
+		}
+		else
+		{
+			_calibOutW = baseW;
+			_calibOutH = baseH;
+			_calibNeedScale = false;
+		}
+		_calibAdjustEn = false;
+		if (_transformEn)
+		{
+			_transformForcedW = _calibOutW;
+			_transformForcedH = _calibOutH;
+		}
+		else
+		{
+			_transformForcedW = 0;
+			_transformForcedH = 0;
+		}
+
+		// Re-evaluate GPU usage if transform was auto-enabled.
+#ifdef HAVE_GPU_TRANSFORM
+		_useGpu = (_transformEn && !_cpuOnly);
+#else
+		_useGpu = false;
+#endif
+		if (!_transformEn)
+		{
+			const double actualRatio = (_imgHeightToSend > 0) ? (static_cast<double>(_imgWidthToSend) / static_cast<double>(_imgHeightToSend)) : 0.0;
+			const bool actualRatioOk = std::fabs(actualRatio - (16.0 / 9.0)) <= 1e-6;
+			const bool actualSizeOk = (_imgWidthToSend >= 1920) && (_imgHeightToSend >= 1080);
+			if ((!actualRatioOk || !actualSizeOk) && _verbose)
+			{
+				std::cout << "WARNING: hyperhdr-calib without transform but stream is "
+						  << _imgWidthToSend << "x" << _imgHeightToSend
+						  << " (may not meet 16:9 >=1920x1080)" << std::endl;
+			}
+		}
+
+		if (_verbose)
+		{
+			std::cout << "INFO: hyperhdr-calib base=" << baseW << "x" << baseH
+					  << " out=" << _calibOutW << "x" << _calibOutH
+					  << " interp=" << _xformInterp
+					  << " xform=" << (_transformEn ? "on" : "off") << std::endl;
+		}
 	}
 
 	_camera->configure(config.get());

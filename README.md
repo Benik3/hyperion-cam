@@ -45,6 +45,7 @@ Settings can be adjusted by using command line options:
   --imgout arg                         Capture one image (RGB) to file (png/bmp/...) and exit
   --imgout-crophelp arg                Capture image showing sensor area used at requested resolution (helps determine --crop coordinates)
   --nv12                               Enable NV12 format output (default is BGR888)
+  --hyperhdr-calib                     HyperHDR calibration mode: force NV12, ensure 16:9 and >=1920x1080 (uses higher -w/-h if set)
   --cpuonly                            Force CPU transform even if GPU is available
   -v [ --verbose ]                     Verbose output  
   --version                            Print version and exit
@@ -140,6 +141,26 @@ The app provides two levels of cropping for different use cases:
   # Crop 640x480 raw output to center 540x380 region
   ./hyperion-cam -w 640 -h 480 --output-crop 50,50,540,380
   ```
+
+#### HyperHDR calibration mode (`--hyperhdr-calib`):
+This function is for the HyperHDR 3DLut calibration. The calibration porcess requires pretty high quality of the picture and at least 1920x1080 resolution.
+It's possible that the calibration porcess in the HyperHDR will fail due to too low quality of the picture (too much noise etc.).
+When enabled, the app forces NV12 output and ensures the transformed output is at least 1920x1080 and 16:9. --output-crop is disabled.
+If you use transformation, it's good idea to use higher input resolution (to avoid upscaling). But too high resolution can lead to error due to low resources.
+It's also recommended to use --fps option to lower it.
+
+Behavior:
+- If the requested `-w`/`-h` is lower than 1920x1080, it is raised to 1920x1080.
+- If you request a higher resolution, it will be kept.
+- If no transform is specified, a full-frame transform is auto-enabled.
+- The transform output is forced to the calibration target size (affects `--imgout` too).
+
+Examples:
+```
+./hyperion-cam --hyperhdr-calib --imgout /tmp/hcalib.png
+./hyperion-cam --hyperhdr-calib -w 2560 -h 1440 --imgout /tmp/hcalib.png
+./hyperion-cam --hyperhdr-calib --transform "0,0:640,0:0,480:640,480" --imgout /tmp/hcalib.png
+```
 
 **When to use each:**
 - Use `--crop` for selecting a specific sensor region before any processing (very effective)

@@ -232,9 +232,12 @@ struct GpuRgbTransform::Impl
 	int dstW{0}, dstH{0};
 	std::array<float, 9> inv{};
 
-	Impl(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight)
+	GLint texFilter{GL_NEAREST};
+
+	Impl(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality)
 		: srcW(srcWidth), srcH(srcHeight), dstW(dstWidth), dstH(dstHeight)
 	{
+		texFilter = highQuality ? GL_LINEAR : GL_NEAREST;
 		profile = envEnabled("HYPERCAM_GL_PROFILE");
 		profileSync = envEnabled("HYPERCAM_GL_PROFILE_SYNC");
 		useRgb565 = envEnabled("HYPERCAM_GL_RGB565");
@@ -364,8 +367,8 @@ void main(){
 		for (int i = 0; i < 2; i++)
 		{
 			glBindTexture(GL_TEXTURE_2D, texIn[i]);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, texFilter);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, texFilter);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, srcW, srcH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -926,9 +929,9 @@ void main(){
 	}
 };
 
-GpuRgbTransform::GpuRgbTransform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight)
+GpuRgbTransform::GpuRgbTransform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality)
 {
-	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight);
+	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight, highQuality);
 }
 
 GpuRgbTransform::~GpuRgbTransform()
@@ -972,7 +975,7 @@ void GpuRgbTransform::transformDmabuf(int fd, int offsetBytes, int strideBytes, 
 
 #else
 
-GpuRgbTransform::GpuRgbTransform(int, int, const cv::Point2f *, int, int)
+GpuRgbTransform::GpuRgbTransform(int, int, const cv::Point2f *, int, int, bool)
 {
 	throw std::runtime_error("GPU transform support not compiled in (missing EGL/GLES dev libs)");
 }

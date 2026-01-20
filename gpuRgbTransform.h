@@ -21,7 +21,8 @@ public:
 					int srcHeight,
 					const cv::Point2f *srcQuad,
 					int dstWidth,
-					int dstHeight);
+					int dstHeight,
+					bool highQuality = false);
 	~GpuRgbTransform();
 
 	GpuRgbTransform(const GpuRgbTransform &) = delete;

@@ -1,10 +1,15 @@
 #include "opencvTransform.h"
 
-OpencvTransform::OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut, bool alignEvenOutput)
-    : _srcQuad(points), _srcWidth(width), _srcHeight(height)
+OpencvTransform::OpencvTransform(int width, int height, cv::Point2f *points, int *widthOut, int *heightOut, bool alignEvenOutput, int interp, int forcedOutW, int forcedOutH)
+    : _srcQuad(points), _srcWidth(width), _srcHeight(height), _interp(interp)
 {
     int x = std::max(_srcQuad[1].x - _srcQuad[0].x, _srcQuad[3].x - _srcQuad[2].x);
     int y = std::max(_srcQuad[2].y - _srcQuad[0].y, _srcQuad[3].y - _srcQuad[1].y);
+    if (forcedOutW > 0 && forcedOutH > 0)
+    {
+        x = forcedOutW;
+        y = forcedOutH;
+    }
 
     if (alignEvenOutput)
     {
@@ -80,7 +85,7 @@ uint8_t *OpencvTransform::transform(uint8_t *img, int srcStrideBytes)
     if (srcStrideBytes <= 0)
         srcStrideBytes = _srcWidth * 3;
     cv::Mat src(_srcHeight, _srcWidth, CV_8UC3, img, static_cast<size_t>(srcStrideBytes));
-    cv::remap(src, _dstBuffers[idx], _mapX, _mapY, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
+    cv::remap(src, _dstBuffers[idx], _mapX, _mapY, _interp, cv::BORDER_CONSTANT);
     return _dstBuffers[idx].data;
 }
 
@@ -93,7 +98,7 @@ void OpencvTransform::transformInto(const uint8_t *img, int srcStrideBytes, uint
 
     cv::Mat src(_srcHeight, _srcWidth, CV_8UC3, const_cast<uint8_t *>(img), static_cast<size_t>(srcStrideBytes));
     cv::Mat dstMat(_dstBuffers[0].rows, _dstBuffers[0].cols, CV_8UC3, dst, static_cast<size_t>(dstStrideBytes));
-    cv::remap(src, dstMat, _mapX, _mapY, cv::INTER_NEAREST, cv::BORDER_CONSTANT);
+    cv::remap(src, dstMat, _mapX, _mapY, _interp, cv::BORDER_CONSTANT);
 }
 
 OpencvTransform::~OpencvTransform()

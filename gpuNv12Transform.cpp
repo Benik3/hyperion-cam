@@ -289,9 +289,12 @@ struct GpuNv12Transform::Impl
 	uint64_t accXformTotalNs{0};
 	uint64_t lastPrintNs{0};
 
-	Impl(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight)
+	GLint texFilter{GL_NEAREST};
+
+	Impl(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality)
 		: srcW(srcWidth), srcH(srcHeight), dstW(dstWidth), dstH(dstHeight)
 	{
+		texFilter = highQuality ? GL_LINEAR : GL_NEAREST;
 		profile = envEnabled("HYPERCAM_GL_PROFILE");
 		profileSync = envEnabled("HYPERCAM_GL_PROFILE_SYNC");
 		usePbo = envEnabled("HYPERCAM_NV12_PBO");
@@ -462,16 +465,16 @@ void main(){
 		// Input textures
 		glGenTextures(1, &texY);
 		glBindTexture(GL_TEXTURE_2D, texY);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, texFilter);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, texFilter);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, srcW, srcH, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
 
 		glGenTextures(1, &texUV);
 		glBindTexture(GL_TEXTURE_2D, texUV);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, texFilter);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, texFilter);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, srcW / 2, srcH / 2, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
@@ -999,9 +1002,9 @@ void main(){
 	}
 };
 
-GpuNv12Transform::GpuNv12Transform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight)
+GpuNv12Transform::GpuNv12Transform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality)
 {
-	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight);
+	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight, highQuality);
 }
 
 GpuNv12Transform::~GpuNv12Transform()
@@ -1022,7 +1025,7 @@ bool GpuNv12Transform::transformDmabuf(int fdY, int offsetYBytes, int strideY, i
 
 #else
 
-GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int)
+GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int, bool)
 {
 	throw std::runtime_error("GPU transform support not compiled in (missing EGL/GLES3 dev libs)");
 }
