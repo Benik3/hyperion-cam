@@ -285,46 +285,9 @@ static void computeCalibGeometry(int srcW, int srcH)
 	if (srcW <= 0 || srcH <= 0)
 		return;
 
-	const double targetRatio = 16.0 / 9.0;
-	const double ratio = static_cast<double>(srcW) / static_cast<double>(srcH);
-	int outW = srcW;
-	int outH = srcH;
-
-	// Fix aspect without downscaling: increase the shorter dimension.
-	if (std::fabs(ratio - targetRatio) > 1e-6)
-	{
-		if (ratio > targetRatio)
-		{
-			// Too wide -> increase height
-			outH = static_cast<int>(std::lround(static_cast<double>(outW) * 9.0 / 16.0));
-			if (outH < srcH)
-				outH = srcH;
-			outW = static_cast<int>(std::lround(static_cast<double>(outH) * 16.0 / 9.0));
-		}
-		else
-		{
-			// Too tall -> increase width
-			outW = static_cast<int>(std::lround(static_cast<double>(outH) * 16.0 / 9.0));
-			if (outW < srcW)
-				outW = srcW;
-			outH = static_cast<int>(std::lround(static_cast<double>(outW) * 9.0 / 16.0));
-		}
-	}
-
-	// Ensure minimum 1920x1080 (scale up only)
-	const double scaleW = 1920.0 / static_cast<double>(outW);
-	const double scaleH = 1080.0 / static_cast<double>(outH);
-	const double scale = std::max(1.0, std::max(scaleW, scaleH));
-	outW = makeEven(static_cast<int>(std::lround(static_cast<double>(outW) * scale)));
-	outH = makeEven(static_cast<int>(std::lround(static_cast<double>(outW) * 9.0 / 16.0)));
-	if (outH < 1080)
-	{
-		outH = makeEven(1080);
-		outW = makeEven(static_cast<int>(std::lround(static_cast<double>(outH) * 16.0 / 9.0)));
-	}
-
-	_calibOutW = outW;
-	_calibOutH = outH;
+	// hyperhdr-calib: always output 1920x1080 (16:9) regardless of input size.
+	_calibOutW = makeEven(1920);
+	_calibOutH = makeEven(1080);
 	_calibNeedScale = (_calibOutW != srcW) || (_calibOutH != srcH);
 }
 
