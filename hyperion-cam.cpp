@@ -234,6 +234,15 @@ static int _autoGainCurvePhase = 0; // 0=off, 1=sampling, 2=confirm
 static std::vector<float> _autoGainCurveGains;
 static std::vector<float> _autoGainCurveYs;
 static size_t _autoGainCurveNextIdx = 0;
+// Auto-shutter (used when gain is at minimum but image is too bright)
+static bool _autoGainUseShutter = false;
+static int _autoShutterCurvePhase = 0; // 0=off, 1=sampling, 2=confirm
+static std::vector<float> _autoShutterCurveShutters;
+static std::vector<float> _autoShutterCurveYs;
+static size_t _autoShutterCurveNextIdx = 0;
+static const int32_t _autoShutterMinUs = 100;
+static float _autoShutterClampMin = 0.0f;
+static float _autoShutterClampMax = 0.0f;
 
 static inline bool autoCalibEnabled()
 {
@@ -443,6 +452,50 @@ static bool fitGainLogLinear(const std::vector<float> &gains, const std::vector<
 	if (!std::isfinite(gT) || gT <= 0.0)
 		return false;
 	outGain = static_cast<float>(gT);
+	return true;
+}
+
+static bool fitShutterLogLinear(const std::vector<float> &shutters, const std::vector<float> &ys, float targetY, float &outShutter)
+{
+	// Fit log(y) = a*log(shutter) + b and solve for y=targetY.
+	if (shutters.size() != ys.size() || shutters.empty())
+		return false;
+	if (targetY <= 0.0f)
+		return false;
+
+	double sumX = 0.0, sumY = 0.0, sumXX = 0.0, sumXY = 0.0;
+	int n = 0;
+	for (size_t i = 0; i < shutters.size(); i++)
+	{
+		const float s = shutters[i];
+		const float y = ys[i];
+		if (!(s > 0.0f) || !(y > 1.0f) || y >= 254.5f)
+			continue;
+		const double x = std::log(static_cast<double>(s));
+		const double ly = std::log(static_cast<double>(y));
+		sumX += x;
+		sumY += ly;
+		sumXX += x * x;
+		sumXY += x * ly;
+		n++;
+	}
+	if (n < 2)
+		return false;
+
+	const double denom = (static_cast<double>(n) * sumXX) - (sumX * sumX);
+	if (std::fabs(denom) < 1e-9)
+		return false;
+	const double a = ((static_cast<double>(n) * sumXY) - (sumX * sumY)) / denom;
+	const double b = (sumY - a * sumX) / static_cast<double>(n);
+	if (!(a > 0.0))
+		return false;
+
+	const double tgt = std::log(static_cast<double>(targetY));
+	const double xT = (tgt - b) / a;
+	const double sT = std::exp(xT);
+	if (!std::isfinite(sT) || sT <= 0.0)
+		return false;
+	outShutter = static_cast<float>(sT);
 	return true;
 }
 
@@ -833,9 +886,27 @@ static void autoCalibProcessBgr(const cv::Mat &bgr)
 		_autoCalibStage.store(2, std::memory_order_release);
 	}
 
+	// If gain is already at minimum but the image is too bright, switch to shutter calibration.
+	if (needGain && (!needWb || stage == 2))
+	{
+		if (!_autoGainUseShutter && _gain <= 1.0f && (gainOkRef > targetGrey + tolGrey))
+		{
+			_autoGainUseShutter = true;
+			_autoGainCurvePhase = 0;
+			_autoGainCurveGains.clear();
+			_autoGainCurveYs.clear();
+			_autoGainCurveNextIdx = 0;
+			_autoShutterCurvePhase = 0;
+			_autoShutterCurveShutters.clear();
+			_autoShutterCurveYs.clear();
+			_autoShutterCurveNextIdx = 0;
+			std::cout << "AutoGain: gain=1.0 but image is too bright; switching to shutter calibration" << std::endl;
+		}
+	}
+
 	if (needWb && needGain)
 	{
-		if (stage == 2 && wbOk && gainOk2)
+		if (!_autoGainUseShutter && stage == 2 && wbOk && gainOk2)
 		{
 			std::cout << "AutoCalib done: gain=" << _gain << " wbgain=" << _rGain << "," << _bGain
 					  << " avg RGB=" << r << "," << g << "," << b << std::endl;
@@ -851,7 +922,7 @@ static void autoCalibProcessBgr(const cv::Mat &bgr)
 		_autoCalibBusy.store(false, std::memory_order_release);
 		return;
 	}
-	else if (needGain && gainOk2)
+	else if (!_autoGainUseShutter && needGain && gainOk2)
 	{
 		std::cout << "AutoGain done: gain=" << _gain << " avg RGB=" << r << "," << g << "," << b << std::endl;
 		imgOutExit(EXIT_SUCCESS);
@@ -914,13 +985,115 @@ static void autoCalibProcessBgr(const cv::Mat &bgr)
 		// Gain stage max-iteration check.
 		// Curve-fitting uses multiple frames for sampling; don't count those as "iterations".
 		// Only enforce the cap once we've moved into the confirm phase.
-		const bool enforceMaxIters = (_autoGainCurvePhase == 2);
+		const bool enforceMaxIters = _autoGainUseShutter ? (_autoShutterCurvePhase == 2) : (_autoGainCurvePhase == 2);
 		if (enforceMaxIters && iters >= _autoCalibMaxIters)
 		{
-			const char *stageName = (needWb && needGain) ? "GAIN stage" : "gain";
+			const char *stageName = _autoGainUseShutter ? "SHUTTER stage" : ((needWb && needGain) ? "GAIN stage" : "gain");
 			std::cout << "AutoCalib reached max iterations (" << stageName << "): gain=" << _gain << " wbgain=" << _rGain << "," << _bGain
 					  << " avg RGB=" << r << "," << g << "," << b << std::endl;
 			imgOutExit(EXIT_SUCCESS);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+	}
+
+	// Shutter calibration (used when gain is at minimum and image is too bright).
+	if (needGain && _autoGainUseShutter)
+	{
+		if (_autoShutterCurvePhase == 0)
+		{
+			_autoShutterCurvePhase = 1;
+			_autoShutterCurveShutters.clear();
+			_autoShutterCurveYs.clear();
+			_autoShutterCurveNextIdx = 0;
+
+			const float minUs = static_cast<float>(_autoShutterMinUs);
+			const float curUs = std::max(minUs, static_cast<float>(_shutter));
+			const float range = std::max(1.01f, _autoGainRange);
+			const float minS = clampf(curUs / range, minUs, curUs);
+			const float maxS = curUs;
+			_autoShutterClampMin = minS;
+			_autoShutterClampMax = maxS;
+			const int samples = std::max(3, _autoGainSamples);
+			_autoShutterCurveShutters.resize(static_cast<size_t>(samples));
+			for (int i = 0; i < samples; i++)
+			{
+				const double t = (samples == 1) ? 0.0 : (static_cast<double>(i) / static_cast<double>(samples - 1));
+				const double sLog = std::log(static_cast<double>(minS)) + t * (std::log(static_cast<double>(maxS)) - std::log(static_cast<double>(minS)));
+				_autoShutterCurveShutters[static_cast<size_t>(i)] = static_cast<float>(std::exp(sLog));
+			}
+			// Force the first sample to be the current shutter for a quick datapoint.
+			_autoShutterCurveShutters[0] = curUs;
+			for (float &ss : _autoShutterCurveShutters)
+				ss = clampf(ss, minUs, curUs);
+			if (_verbose)
+				std::cout << "AutoShutter: sampling " << samples << " points in [" << minS << "," << maxS << "]" << std::endl;
+		}
+
+		if (_autoShutterCurvePhase == 2)
+		{
+			if (gainOk2)
+			{
+				std::cout << "AutoShutter done: shutter=" << _shutter
+						  << " avg RGB=" << r << "," << g << "," << b << std::endl;
+				std::cout << "WARNING: Image was too bright at gain=1.0; consider lowering shutter speed." << std::endl;
+				imgOutExit(EXIT_SUCCESS);
+				_autoCalibBusy.store(false, std::memory_order_release);
+				return;
+			}
+
+			const float ref = gainOkRef;
+			if (ref > 1e-3f)
+			{
+				const float ratio = clampf(targetGrey / ref, 0.5f, 2.0f);
+				const float curUs = std::max(static_cast<float>(_autoShutterMinUs), static_cast<float>(_shutter));
+				const float nextUs = clampf(curUs * ratio, _autoShutterClampMin, _autoShutterClampMax);
+				_shutter = static_cast<int32_t>(std::lround(nextUs));
+			}
+			_autoCalibIterCount.fetch_add(1, std::memory_order_acq_rel);
+			if (_verbose)
+				std::cout << "AutoShutter confirm adjust: set shutter=" << _shutter
+						  << " (measured avg=" << gainOkRef << ", target " << targetGrey << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		// Record the current measurement for the current shutter.
+		_autoShutterCurveYs.push_back(gainRef);
+		if (_verbose)
+			std::cout << "AutoShutter sample: shutter=" << _shutter << " ref=" << gainRef << " (avg RGB=" << r << "," << g << "," << b << ")" << std::endl;
+
+		_autoShutterCurveNextIdx++;
+		if (_autoShutterCurveNextIdx < _autoShutterCurveShutters.size())
+		{
+			_shutter = static_cast<int32_t>(std::lround(_autoShutterCurveShutters[_autoShutterCurveNextIdx]));
+			if (_verbose)
+				std::cout << "AutoShutter set next shutter=" << _shutter << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+
+		float predicted = 0.0f;
+		if (!fitShutterLogLinear(_autoShutterCurveShutters, _autoShutterCurveYs, targetGrey, predicted))
+		{
+			std::cout << "AutoShutter: fit failed" << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			_autoCalibBusy.store(false, std::memory_order_release);
+			return;
+		}
+		else
+		{
+			predicted = clampf(predicted, _autoShutterClampMin, _autoShutterClampMax);
+			_shutter = static_cast<int32_t>(std::lround(predicted));
+			_autoShutterCurvePhase = 2;
+			if (_verbose)
+				std::cout << "AutoShutter predicted shutter=" << _shutter << " (target " << targetGrey << ")" << std::endl;
+			if (_autoCalibDelayMs > 0)
+				_autoCalibNextAllowedNs.store(nowNs() + static_cast<int64_t>(_autoCalibDelayMs) * 1000000LL, std::memory_order_release);
 			_autoCalibBusy.store(false, std::memory_order_release);
 			return;
 		}
@@ -2207,6 +2380,12 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (_gain < 1.0f)
+	{
+		std::cout << "ERROR: gain must be >= 1.0" << std::endl;
+		return EXIT_FAILURE;
+	}
+
 	if (_version)
 	{
 		std::cout << "hyperion-cam " << HYPERCAM_VERSION << std::endl;
@@ -2353,6 +2532,13 @@ int main(int argc, char *argv[])
 		_autoGainCurveGains.clear();
 		_autoGainCurveYs.clear();
 		_autoGainCurveNextIdx = 0;
+		_autoGainUseShutter = false;
+		_autoShutterCurvePhase = 0;
+		_autoShutterCurveShutters.clear();
+		_autoShutterCurveYs.clear();
+		_autoShutterCurveNextIdx = 0;
+		_autoShutterClampMin = 0.0f;
+		_autoShutterClampMax = 0.0f;
 		_autoCalibStage.store(0, std::memory_order_release);
 		_autoCalibIterCount.store(0, std::memory_order_release);
 		_autoCalibFrameCount.store(0, std::memory_order_release);
