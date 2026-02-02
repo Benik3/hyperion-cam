@@ -6,6 +6,11 @@ project(Hyperion-cam
 
 set(CMAKE_CXX_STANDARD 17)
 
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+endif()
+
 set(CMAKE_CXX_FLAGS "-Wall -Winvalid-pch -Wnon-virtual-dtor -Wextra -Werror -Wno-unused-parameter")
 set(CMAKE_CXX_FLAGS_RELEASE "-Ofast -fno-fast-math")
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -50,10 +55,10 @@ if (EGL_FOUND AND GLESv2_FOUND)
     set(HAVE_GPU_TRANSFORM 1)
     message(STATUS "GPU transform: ENABLED")
     add_library(gpuNv12Transform
-        gpuNv12Transform.cpp
-        gpuNv12Transform.h
-        gpuRgbTransform.cpp
-        gpuRgbTransform.h
+        src/gpuNv12Transform.cpp
+        src/gpuNv12Transform.h
+        src/gpuRgbTransform.cpp
+        src/gpuRgbTransform.h
     )
     target_link_libraries(gpuNv12Transform PkgConfig::EGL PkgConfig::GLESv2)
     target_compile_definitions(gpuNv12Transform PRIVATE HAVE_GPU_TRANSFORM=1)
@@ -62,18 +67,18 @@ else()
 endif()
 
 add_library(FlatBuffer
-    FlatBufferConnection.cpp
-    FlatBufferConnection.h
+    src/FlatBufferConnection.cpp
+    src/FlatBufferConnection.h
 )
 
 add_library(opencvTransform
-    opencvTransform.cpp
-    opencvTransform.h
+    src/opencvTransform.cpp
+    src/opencvTransform.h
 )
 
-include_directories(${CMAKE_SOURCE_DIR} ${LIBCAMERA_INCLUDE_DIRS} ${LIBEVENT_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
+include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src ${LIBCAMERA_INCLUDE_DIRS} ${LIBEVENT_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 
-add_executable(hyperion-cam hyperion-cam.cpp event_loop.cpp)
+add_executable(hyperion-cam src/hyperion-cam.cpp src/event_loop.cpp)
 
 target_link_libraries(hyperion-cam PkgConfig::LIBEVENT)
 target_link_libraries(hyperion-cam PkgConfig::LIBCAMERA)

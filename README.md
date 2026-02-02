@@ -1,15 +1,41 @@
 # hyperion-cam
-Simple camera grabber for Hyperion using Libcamera, OpenCV and flatbuffer.
+Simple camera grabber for Hyperion using Libcamera, EGL/OpenCV and flatbuffer.
 
 ## How it works
 The app makes one stream from camera in full manual mode. There is no preview or any other output than to flatbuffer.  
-Received frames can be transformed using OpenCv to correct picture deformation.  
+Received frames can be transformed to correct perspective picture deformation.  
 Resulted frames are sent through flatbuffer connection to Hyperion/HyperHDR.
 
 The grabber supports:
 - RGB/BGR output (default)
 - NV12 output via `--nv12`
 - Optional GPU-accelerated transform (if compiled with EGL/GLES)
+
+## How to build
+This project uses CMake and pkg-config.
+
+Dependencies (Debian/Ubuntu/Raspberry Pi OS):
+```
+sudo apt update
+sudo apt install -y \
+  build-essential cmake pkg-config \
+  libcamera-dev libevent-dev libboost-program-options-dev libopencv-dev
+```
+
+Optional but recommended (GPU transform support):
+```
+sudo apt install -y libegl1-mesa-dev libgles2-mesa-dev
+```
+
+Build:
+```
+mkdir -p Release
+cd Release
+cmake ..
+make
+```
+
+The binary will be at `Release/hyperion-cam`.
 
 ## How to use
 By simply running without any options starts the app with these settings:  
@@ -68,15 +94,11 @@ Settings can be adjusted by using command line options:
 Use `--imgout /path/file.png` to capture exactly one frame, save it, and exit.
 - If `--transform` is provided, the saved image is the transformed output.
 - `--imgout` always saves RGB/BGR images (there is no common still-image container for NV12). If `--nv12` is set, it is ignored.
-- Use `--imgout-crophelp /path/file.png` together with `-w` and `-h` to see what sensor area the camera uses at that resolution. This helps determine the correct coordinates for `--crop`. The camera automatically crops to the center when using lower resolutions, and this option shows you exactly what area is being captured, making it easier to adjust the crop position with `--crop x,y,width,height`.
 
 Examples:
 ```
 ./hyperion-cam --imgout /tmp/frame.png
 ./hyperion-cam --transform "0,0:640,0:0,480:640,480" --imgout /tmp/frame.png
-./hyperion-cam --cpuonly --transform "..." --imgout /tmp/frame.png
-./hyperion-cam --imgout-crophelp /tmp/crop-area.png -w 640 -h 480       # See what 640x480 sensor area is used
-./hyperion-cam --imgout-crophelp /tmp/crop-area.png -w 1920 -h 1080 -v  # Verbose shows ScalerCropMaximum coordinates
 ```
 
 #### Focus note:
@@ -84,12 +106,13 @@ For autofocus-capable cameras (e.g. Camera Module 3), the app forces autofocus i
 Use `--focus` to set the manual lens position.
 
 Use `--autofocus-once` to run autofocus once, print the resulting focus position, and then lock to manual focus. You can reuse then this auto value with the `--focus` option
+It's good to use some pattern wih sharp things for focusing. You can use e.g. the test pattern in imgs directory.
 
 #### Flip note:
 The `--hflip` and `--vflip` options use libcamera's native Transform control to flip the image horizontally or vertically at the hardware level (sensor or ISP). These are zero-overhead operations and work with all pixel formats (RGB, NV12). They can be combined with `--transform` for perspective correction.
 
 #### Rotation note:
-Note: The rotation depends on a camera capabilities. Not all cameras support e.g. 90° and 270°
+The rotation depends on a camera capabilities. Not all cameras support e.g. 90° and 270°
 The `--rotate` option provides hardware-accelerated rotation (0°, 90°, 180°, 270°) using libcamera's native Transform. This can be combined with `--hflip` and `--vflip` for complex orientations:
 
 Examples:
@@ -113,14 +136,17 @@ The app provides two levels of cropping for different use cases:
 
 **Sensor-level crop (`--crop`):**
 - Uses libcamera's ScalerCrop control to crop at the sensor/ISP level
-- Coordinates are in **absolute sensor coordinates** (not relative to (0,0))
+- Coordinates are in **absolute sensor coordinates** (not relative to (0,0) of the output image)
 - Applied before any transforms, rotation, or flip operations on chip level
 - Hardware-accelerated, very efficient
 - Can be combined with `-w` and `-h` for downscaling: sensor crop happens first (reducing bandwidth), then the output is scaled to requested resolution
 - Format: `x,y,width,height` (e.g., `--crop 768,432,1920,1080`)
-- Use `-v` to see `ScalerCropMaximum` which shows the valid sensor coordinate range (e.g., `(768, 432)/3072x1728`)
+- Use `--imgout-crophelp /path/file.png` together with `-w` and `-h` to see what sensor area the camera uses at that resolution. This helps determine the correct coordinates for `--crop`. The camera automatically crops to the center when using lower resolutions, and this option shows you exactly what area is being captured, making it easier to adjust the crop position with `--crop x,y,width,height`.
 - Examples:
   ```bash
+  ./hyperion-cam --imgout-crophelp /tmp/crop-area.png -w 640 -h 480       # See what 640x480 sensor area is used
+  ./hyperion-cam --imgout-crophelp /tmp/crop-area.png -w 1920 -h 1080 -v  # Verbose shows ScalerCropMaximum coordinates
+
   ./hyperion-cam --crop 768,432,1920,1080                    # Crop 1920x1080 region, output 640x480 (default, downscaled)
   ./hyperion-cam --crop 768,432,1920,1080 -w 1920 -h 1080    # Crop 1920x1080 region, output 1920x1080 (1:1, no scaling)
   ./hyperion-cam --crop 768,432,2000,2000 -w 500 -h 500      # Crop 2000x2000, downscale to 500x500
@@ -134,7 +160,7 @@ The app provides two levels of cropping for different use cases:
   - The transform already defines your output region via perspective mapping
 - Coordinates are relative to the camera output (after rotation/flip if used)
 - Software-based crop, adds minimal overhead (simple memcpy)
-- Useful for cropping raw camera output to specific region of interest
+- Useful for cropping camera output to specific region of interest when `--crop` can't be used
 - Format: `x,y,width,height` (e.g., `--output-crop 10,10,620,460`)
 - Example:
   ```bash
@@ -143,17 +169,15 @@ The app provides two levels of cropping for different use cases:
   ```
 
 #### HyperHDR calibration mode (`--hyperhdr-calib`):
-This function is for the HyperHDR 3DLut calibration. The calibration porcess requires pretty high quality of the picture and at least 1920x1080 resolution.
-It's possible that the calibration porcess in the HyperHDR will fail due to too low quality of the picture (too much noise etc.).
+Note: This calibration probably always fails in the HyperHDR due to too low quality of the picture (too much noise, too low resolution etc.). I leaved it here because I had it already implemented...
+This function is for the HyperHDR 3DLut calibration. The calibration porcess requires pretty high quality of the picture and resolution.
 When enabled, the app forces NV12 output and ensures the transformed output is at least 1920x1080 and 16:9. --output-crop is disabled.
 If you use transformation, it's good idea to use higher input resolution (to avoid upscaling). But too high resolution can lead to error due to low resources.
 It's also recommended to use --fps option to lower it.
 
 Behavior:
 - If the requested `-w`/`-h` is lower than 1920x1080, it is raised to 1920x1080.
-- If you request a higher resolution, it will be kept.
-- If no transform is specified, a full-frame transform is auto-enabled.
-- The transform output is forced to the calibration target size (affects `--imgout` too).
+- If you request a higher resolution, it will be kept from camera but lowered to FHD into FlatBuffer.
 
 Examples:
 ```
@@ -161,12 +185,6 @@ Examples:
 ./hyperion-cam --hyperhdr-calib -w 2560 -h 1440 --imgout /tmp/hcalib.png
 ./hyperion-cam --hyperhdr-calib --transform "0,0:640,0:0,480:640,480" --imgout /tmp/hcalib.png
 ```
-
-**When to use each:**
-- Use `--crop` for selecting a specific sensor region before any processing (very effective)
-- Use `--output-crop` for cropping final output when NOT using `--transform`
-- For perspective correction, use `--transform` alone (defines output region via 4 points)
-- `--crop` and `--output-crop` can be combined, but `--output-crop` and `--transform` cannot
 
 #### Shutter speed and FPS note:
 The `--shutter` speed modifies the exposition time of the camera. When used alone, it defines also the FPS, frame is released immediatelly after capture (recommended mode).
@@ -177,24 +195,24 @@ The `--fps` option specify exact frame rate using libcamera's `FrameDurationLimi
 - At 60 FPS, the frame duration is ~16.7ms, so shutter speed cannot exceed 16666 µs
 
 But you can use faster shutter speed together with lower FPS, in such case next frame is delayed to maintain the desired FPS.
-This also produce lower latency (e.g. 30 FPS + shutter 16666 us (60fps)).
+This also produce lower latency then just increasing shutter (e.g. 30 FPS + shutter 16666 us (60fps)).
 
 #### Connection note:
 The app supports the use of a TCP connection or Unix Domain Socket (available when using [HyperHDR](https://github.com/awawa-dev/HyperHDR) at /tmp/hyperhdr-domain). If `--connection` is a valid IP address (IPv4/IPv6) it uses TCP (`--port` applies). Otherwise it treats the value as a Unix socket path. IPC has advantage of faster data exchange with lower overhead.  
-I don't recommend to use the TCP connection over a network as you will probably have lags (due to high packet size and packet framing). Maybe on an ethernet network it would be usable, but over wifi it's unusable. Rather always install Hyperion locally and then send only the LED data to another Hyperion server (if you can't drive the LEDs directly).
+I don't recommend to use the TCP connection over a network as you will probably have lags (due to high packet size and packet framing). Maybe on an ethernet network it would be usable, but over wifi it's unusable. Rather always install HyperHDR locally and then send only the LED data to another Hyperion server (if you can't drive the LEDs directly).
 
 #### Auto calibration note:
 For one-time setup, the app can estimate white balance gains and/or analogue gain using a neutral gray target.
 
-- Display or place a uniform gray image with RGB value `127,127,127` in front of the camera.
+- Display an uniform gray image with RGB value `127,127,127` in front of the camera.
 - The app captures frames in RGB mode (NV12 is ignored).
 - It measures the average color of an outline box ROI made from the image edges (optionally transformed): top/bottom/left/right strips, each with thickness = 1/8 of image size.
   - Example: for 640x480 it uses 80px strips (top/bottom) and 60px strips (left/right).
 - It iteratively adjusts `--wbgain` (R,B) to make R≈G≈B and `--gain` to reach ≈127 brightness, prints the final values and the final measured RGB, then exits.
-  - Use `--autocalib-tol-wb` and `--autocalib-tol-grey` to require tighter convergence.
+  - Use `--autocalib-tol-wb` and `--autocalib-tol-grey` to require tighter/looser convergence.
 
-Auto gain method:
-- Auto gain uses curve fitting: it samples multiple analogue gain values, fits a curve to the measured ROI brightness, solves for the gain that yields ~127, then confirms on a final frame.
+Auto gain method note:
+- If the image is too bright even with gain 1.0, it automatically starts to find correct "gain" by adjusting a shutter speed (lowering it) and reports it at the end.
 
 Examples:
 ```
@@ -209,11 +227,11 @@ For one-time setup, the app can estimate camera saturation using a target color.
 
 - Display or place a uniform target image with RGB value `230,50,50` in front of the camera.
   - You can override the target color by passing `R,G,B` to `--autosat`, e.g. `--autosat 50,230,50` for green.
+  - The color should be "washed" for the calibration to work properly.
+  - For some reason a blue target doesn't work as well, but with red and green targets I get the same result.
 - The app captures frames in RGB mode (NV12 is ignored).
 - It measures the average color of an outline box ROI made from the image edges (optionally transformed): top/bottom/left/right strips, each with thickness = 1/8 of image size.
 - It searches saturation so the measured ROI color matches the target color (within a small tolerance), then prints the final saturation and final measured RGB, then exits.
-- Don't use values near the end because of clipping (like 255, 0, 0)
-- For some reason a blue target doesn't work as well, but with red and green targets I get the same result.
 
 Examples:
 ```
@@ -227,12 +245,12 @@ Examples:
 Not all cameras support gamma correction.
 
 #### Picture transformation note:
-The app allows to make Perspective (projective) transformation of the picture in real time using OpenCV. Of course, it adds a little lag, but it's numbers of milliseconds.  
+The app allows to make Perspective (projective) transformation of the picture in real time using EGL/OpenCV. The EGL method (GPU accelerated) is of course much faster.
 The transformation is described by 4 points in the original picture. The result is cropped and transformed so the 4 points make new corners of image.
 
 ### GPU transform (optional)
 If built with EGL + OpenGL ES support, GPU transform is used by default whenever `--transform` is provided.
-Use `--cpuonly` to force CPU transforms.
+Use `--cpuonly` to force CPU transforms (much lower performance).
 
 ### Low latency tuning
 This app runs capture/transform/send asynchronously. If the CPU/GPU or HyperHDR connection can't keep up, the internal queues can grow which increases end-to-end latency.
@@ -266,33 +284,7 @@ These are optional environment variables used mainly for profiling and tuning:
 
 GPU paths attempt DMA-BUF import automatically (zero-copy upload when supported) and fall back to CPU upload if not available.
 
-## How to build
-This project uses CMake and pkg-config.
-
-Dependencies (Debian/Ubuntu/Raspberry Pi OS):
-```
-sudo apt update
-sudo apt install -y \
-  build-essential cmake pkg-config \
-  libcamera-dev libevent-dev libboost-program-options-dev libopencv-dev
-```
-
-Optional but recommended (GPU transform support):
-```
-sudo apt install -y libegl1-mesa-dev libgles2-mesa-dev
-```
-
-Build:
-```
-mkdir -p Release
-cd Release
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j
-```
-
-The binary will be at `Release/hyperion-cam`.
-
 ## Credits
 The camera part is based on [simple-cam](https://git.libcamera.org/libcamera/simple-cam.git) example from libcamera  
 The OpenCV part is based on [OpenCV example](https://docs.opencv.org/3.4/da/d6e/tutorial_py_geometric_transformations.html)  
-The Flatbuffer part is based on [Hyperion for LG WebOS](https://github.com/webosbrew/hyperion-webos) and [Hyperion-ng](https://github.com/hyperion-project/hyperion.ng).
+The Flatbuffer part is based on [Hyperion for LG WebOS](https://github.com/webosbrew/hyperion-webos) and [HyperHDR](https://github.com/awawa-dev/HyperHDR)
