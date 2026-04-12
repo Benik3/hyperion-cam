@@ -235,11 +235,19 @@ struct GpuNv12Transform::Impl
 	{
 		std::size_t operator()(const DmabufKey &k) const
 		{
-			std::size_t h = 1469598103934665603ull;
+#if SIZE_MAX == 0xFFFFFFFFU
+			std::size_t h = 2166136261U;
 			auto mix = [&](std::size_t v)
 			{
-				h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+				h ^= v + 0x9e3779b9U + (h << 6) + (h >> 2);
 			};
+#else
+			std::size_t h = 1469598103934665603ULL;
+			auto mix = [&](std::size_t v)
+			{
+				h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+			};
+#endif
 			mix(static_cast<std::size_t>(k.fd));
 			mix(static_cast<std::size_t>(k.offset));
 			mix(static_cast<std::size_t>(k.stride));

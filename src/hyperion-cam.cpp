@@ -30,6 +30,8 @@
 #include "gpuRgbTransform.h"
 #endif
 
+static constexpr const char *HYPERCAM_VERSION = "1.0.1";
+
 using namespace libcamera;
 namespace po = boost::program_options;
 
@@ -114,8 +116,6 @@ static EventLoop _loopFb;
 static EventLoop _loopTr;
 FlatBufferConnection _flatbuf;
 OpencvTransform *_transformation;
-
-static constexpr const char *HYPERCAM_VERSION = "1.0.0";
 
 #ifdef HAVE_GPU_TRANSFORM
 GpuNv12Transform *_gpuNv12 = nullptr;

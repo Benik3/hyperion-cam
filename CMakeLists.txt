@@ -92,3 +92,15 @@ if (HAVE_GPU_TRANSFORM)
     target_compile_definitions(hyperion-cam PRIVATE HAVE_GPU_TRANSFORM=1)
     target_link_libraries(hyperion-cam gpuNv12Transform)
 endif()
+
+# 32-bit ARM requires explicit libatomic for 64-bit std::atomic operations.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("
+#include <atomic>
+#include <cstdint>
+std::atomic<int64_t> x{0};
+int main() { return (int)x.load(); }
+" HAVE_BUILTIN_ATOMIC64)
+if (NOT HAVE_BUILTIN_ATOMIC64)
+    target_link_libraries(hyperion-cam atomic)
+endif()
