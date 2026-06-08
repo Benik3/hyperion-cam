@@ -64,6 +64,10 @@ public:
 	/// Applies to TCP/Unix socket connect attempts.
 	void setConnectTimeoutMs(int timeoutMs);
 
+	/// @brief Set send timeout (SO_SNDTIMEO) for the data socket.
+	/// Bounds how long a blocking write can stall if the server stops reading.
+	void setSendTimeoutMs(int timeoutMs);
+
 	/// @brief Send a prebuilt FlatBuffers Request message.
 	///
 	/// This avoids copying image payloads into FlatBufferConnection's internal
@@ -121,6 +125,8 @@ private:
 	bool _connectFailedReported{false};
 
 	int _connectTimeoutMs{250};
+
+	int _sendTimeoutMs{5000};
 };
 
 #endif

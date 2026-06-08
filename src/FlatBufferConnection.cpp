@@ -114,6 +114,17 @@ void FlatBufferConnection::setConnectTimeoutMs(int timeoutMs)
 	_connectTimeoutMs = timeoutMs;
 }
 
+void FlatBufferConnection::setSendTimeoutMs(int timeoutMs)
+{
+	// Clamp to a sane range; keep a small floor so a transient hiccup doesn't
+	// abandon every frame, but bound it well below the old 5s default.
+	if (timeoutMs < 10)
+		timeoutMs = 10;
+	if (timeoutMs > 60000)
+		timeoutMs = 60000;
+	_sendTimeoutMs = timeoutMs;
+}
+
 static bool connectWithTimeout(int fd, const struct sockaddr *addr, socklen_t addrlen, int timeoutMs)
 {
 	const int oldFlags = fcntl(fd, F_GETFL, 0);
@@ -197,12 +208,19 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 			_sockfd = 0;
 			return 0;
 		}
+		// Send timeout bounds how long a blocking write may stall on a slow/hung
+		// server (latency-first: abandon the frame fast). Receive timeout stays
+		// generous because reads only happen during one-time registration.
+		struct timeval sndTimeout;
+		sndTimeout.tv_sec = _sendTimeoutMs / 1000;
+		sndTimeout.tv_usec = (_sendTimeoutMs % 1000) * 1000;
+
 		struct timeval timeout;
 		timeout.tv_sec = 5;
 		timeout.tv_usec = 0;
 
-		if (setsockopt(_sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
-					   sizeof(timeout)) < 0)
+		if (setsockopt(_sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&sndTimeout,
+					   sizeof(sndTimeout)) < 0)
 		{
 			std::cerr << "ERROR: setsockopt SO_SNDTIMEO failed" << std::endl;
 			connectionDestroy();

@@ -1,5 +1,10 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <iostream>
 #include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <atomic>
 #include <chrono>
@@ -164,6 +169,11 @@ int _outputCropHeight = 0;
 bool _verbose = false;
 bool _help = false;
 bool _version = false;
+
+// Real-time scheduling / CPU affinity (latency-first defaults).
+static bool _noRealtime = false; // --no-realtime disables SCHED_FIFO
+static int _rtPriority = 10;		 // --rt-priority (SCHED_FIFO, well below kernel threads ~50)
+static int _sendTimeoutMs = 100; // --send-timeout-ms (SO_SNDTIMEO)
 
 // --hyperhdr-calib output geometry (NV12 only)
 static bool _calibAdjustEn = false;
@@ -475,6 +485,47 @@ static inline int64_t nowNs()
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(
 			   std::chrono::high_resolution_clock::now().time_since_epoch())
 		.count();
+}
+
+// Apply latency-first thread tuning: pin to a dedicated core (only when there
+// are enough cores to spare core 0 for the kernel/IRQs + libcamera's internal
+// pipeline thread) and raise to SCHED_FIFO. Degrades gracefully: a failure to
+// set RT priority (missing CAP_SYS_NICE) warns once and keeps running normally.
+static std::atomic<bool> _rtWarned{false};
+static void applyThreadRealtime(const char *name, int core)
+{
+	const long n = sysconf(_SC_NPROCESSORS_ONLN);
+	const int numCores = (n > 0) ? static_cast<int>(n) : 1;
+	const bool pin = (numCores >= 4 && core >= 0 && core < numCores);
+
+	if (pin)
+	{
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		CPU_SET(core, &set);
+		if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0 && _verbose)
+			std::cout << "WARNING: failed to pin " << name << " thread to core " << core << std::endl;
+	}
+
+	if (_noRealtime)
+		return;
+
+	struct sched_param sp;
+	std::memset(&sp, 0, sizeof(sp));
+	sp.sched_priority = _rtPriority;
+	if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+	{
+		bool expected = false;
+		if (_rtWarned.compare_exchange_strong(expected, true))
+			std::cout << "WARNING: could not set SCHED_FIFO (need CAP_SYS_NICE / root); running at normal priority" << std::endl;
+	}
+	else if (_verbose)
+	{
+		std::cout << "INFO: " << name << " thread SCHED_FIFO prio " << _rtPriority;
+		if (pin)
+			std::cout << " pinned to core " << core;
+		std::cout << std::endl;
+	}
 }
 
 struct CpuProfileState
@@ -1403,6 +1454,7 @@ static void imgOutSaveTransformedGpu(uint8_t *img, int fd, int off)
 
 void *flatLoop(void *arg)
 {
+	applyThreadRealtime("send", 2);
 	_loopFb.exec();
 	return 0;
 }
@@ -1548,28 +1600,21 @@ static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, in
 	}
 }
 
-static void flatBufSendRequest(flatbuffers::DetachedBuffer &&req)
+// Connect + send a prebuilt request, without touching the in-flight counters.
+// Used by the fused transform paths, which send inline on the transform thread
+// and account the combined transform+send job via _pendingProcess.
+static void sendRequestRaw(const uint8_t *data, uint32_t size)
 {
-	const int64_t startNs = nowNs();
 	if (flatbufTryConnect())
 	{
-		if (_flatbuf.sendPrebuiltRequest(req.data(), static_cast<uint32_t>(req.size())) < 0)
-		{
+		if (_flatbuf.sendPrebuiltRequest(data, size) < 0)
 			std::cout << "ERROR: Flatbuffer write timeout\n";
-		}
 	}
 	else
 	{
 		bool expected = false;
 		if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 			std::cout << "ERROR: Flatbuffer connection timeout\n";
-	}
-
-	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
-	if (before > 1 && _verbose)
-	{
-		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-		std::cout << "WARNING: Frame sending was too slow: " << elapsedMicros << " us\n";
 	}
 }
 
@@ -1605,6 +1650,8 @@ static flatbuffers::DetachedBuffer buildNV12ImageRequestUninitialized(uint16_t w
 }
 void *transformLoop(void *arg)
 {
+	// Pin + RT before creating the EGL context so all GL work runs on this thread.
+	applyThreadRealtime("transform", 2);
 	const int forcedW = (_transformForcedW > 0) ? _transformForcedW : 0;
 	const int forcedH = (_transformForcedH > 0) ? _transformForcedH : 0;
 	_transformation = new OpencvTransform(_imgWidth, _imgHeight, _imgQuad, &_imgWidthToSend, &_imgHeightToSend, _useNv12, _xformInterp, forcedW, forcedH);
@@ -1634,16 +1681,17 @@ static void transformImg(uint8_t *img)
 	_transformation->transformInto(img, _strideBgr, outRgb, static_cast<int>(outW) * 3);
 	cpuProfileTick(_cpuRgbProf, "[cpuRgb]", static_cast<uint64_t>(nowNs() - startNs));
 
+	// Fused send: deliver inline on this transform worker thread, then release
+	// the in-flight slot only after the send completes so newer frames are
+	// dropped while we're busy (latest-frame-wins, bounded latency).
+	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
+		std::cout << "WARNING: Frame transform+send was too slow: " << elapsedMicros << " us\n";
 	}
-
-	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([req = std::move(req)]() mutable
-					  { flatBufSendRequest(std::move(req)); });
 }
 
 static void transformImgNv12(uint8_t *y, uint8_t *uv)
@@ -1761,16 +1809,17 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	cv::remap(uvIn, uvOut, mapUVx, mapUVy, _xformInterp, cv::BORDER_CONSTANT);
 	cpuProfileTick(_cpuNv12Prof, "[cpuNv12]", static_cast<uint64_t>(nowNs() - startNs));
 
+	// Fused send: deliver inline on this transform worker thread, then release
+	// the in-flight slot only after the send completes so newer frames are
+	// dropped while we're busy (latest-frame-wins, bounded latency).
+	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
+		std::cout << "WARNING: Frame transform+send was too slow: " << elapsedMicros << " us\n";
 	}
-
-	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([req = std::move(req)]() mutable
-					  { flatBufSendRequest(std::move(req)); });
 }
 
 static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY, int fdUV, int offUV)
@@ -1810,16 +1859,17 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 		_gpuNv12->transform(y, uv, _strideY, _strideUV, outY, outUV);
 	}
 
+	// Fused send: deliver inline on this transform worker thread, then release
+	// the in-flight slot only after the send completes so newer frames are
+	// dropped while we're busy (latest-frame-wins, bounded latency).
+	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
+		std::cout << "WARNING: Frame transform+send was too slow: " << elapsedMicros << " us\n";
 	}
-
-	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([req = std::move(req)]() mutable
-					  { flatBufSendRequest(std::move(req)); });
 #endif
 }
 
@@ -1850,16 +1900,17 @@ static void transformImgRgbGpu(uint8_t *img)
 		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
 	_gpuRgb->transform(img, _strideBgr, fmt, outRgb);
 
+	// Fused send: deliver inline on this transform worker thread, then release
+	// the in-flight slot only after the send completes so newer frames are
+	// dropped while we're busy (latest-frame-wins, bounded latency).
+	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
+		std::cout << "WARNING: Frame transform+send was too slow: " << elapsedMicros << " us\n";
 	}
-
-	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([req = std::move(req)]() mutable
-					  { flatBufSendRequest(std::move(req)); });
 #endif
 }
 
@@ -1891,16 +1942,17 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
 		fmt = _swapRb4 ? GpuRgbTransform::InputFormat::Xrgb8888 : GpuRgbTransform::InputFormat::Xbgr8888;
 	_gpuRgb->transformDmabuf(fd, offsetBytes, _strideBgr, fmt, outRgb);
 
+	// Fused send: deliver inline on this transform worker thread, then release
+	// the in-flight slot only after the send completes so newer frames are
+	// dropped while we're busy (latest-frame-wins, bounded latency).
+	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
 	{
 		int64_t elapsedMicros = (nowNs() - startNs) / 1000;
-		std::cout << "WARNING: Frame transformation was too slow: " << elapsedMicros << " us\n";
+		std::cout << "WARNING: Frame transform+send was too slow: " << elapsedMicros << " us\n";
 	}
-
-	_pendingSend.fetch_add(1, std::memory_order_acq_rel);
-	_loopFb.callLater([req = std::move(req)]() mutable
-					  { flatBufSendRequest(std::move(req)); });
 #endif
 }
 
@@ -2290,10 +2342,13 @@ int main(int argc, char *argv[])
 		("crop", po::value<std::string>(&_cropStr), "Crop region in format x,y,width,height (native camera ScalerCrop)")																																			  //
 		("version", po::bool_switch(&_version)->default_value(false), "Print version and exit")																																										  //
 		("help", po::bool_switch(&_help)->default_value(false), "Print help")																																														  //
-		("max-pending-process", po::value<int>(&_maxPendingProcess)->default_value(0), "Max in-flight transform jobs (0=unlimited). Set to 1 for lowest latency (drops frames when busy)")																			  //
-		("max-pending-send", po::value<int>(&_maxPendingSend)->default_value(0), "Max in-flight send jobs (0=unlimited). Set to 1-2 for lowest latency (drops frames when busy)")																					  //
+		("max-pending-process", po::value<int>(&_maxPendingProcess)->default_value(1), "Max in-flight transform jobs (0=unlimited, default 1=lowest latency, drops frames when busy)")																			  //
+		("max-pending-send", po::value<int>(&_maxPendingSend)->default_value(1), "Max in-flight send jobs (0=unlimited, default 1=lowest latency, drops frames when busy)")																					  //
 		("connect-timeout-ms", po::value<int>(&_flatbufConnectTimeoutMs)->default_value(250), "Socket connect timeout in ms (lower = lower latency when server is down)")																							  //
-		("reconnect-interval-ms", po::value<int>(&_flatbufReconnectIntervalMs)->default_value(250), "Min time between reconnect attempts in ms when disconnected");
+		("reconnect-interval-ms", po::value<int>(&_flatbufReconnectIntervalMs)->default_value(250), "Min time between reconnect attempts in ms when disconnected")																								  //
+		("send-timeout-ms", po::value<int>(&_sendTimeoutMs)->default_value(100), "Socket send timeout in ms (SO_SNDTIMEO); abandons a frame if HyperHDR stalls")																									  //
+		("no-realtime", po::bool_switch(&_noRealtime)->default_value(false), "Disable SCHED_FIFO real-time scheduling (still pins threads to cores)")																											  //
+		("rt-priority", po::value<int>(&_rtPriority)->default_value(10), "SCHED_FIFO priority for capture/worker threads (1-99, default 10)");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 
@@ -2302,6 +2357,12 @@ int main(int argc, char *argv[])
 	po::notify(vm);
 
 	_flatbuf.setConnectTimeoutMs(_flatbufConnectTimeoutMs);
+	_flatbuf.setSendTimeoutMs(_sendTimeoutMs);
+
+	if (_rtPriority < 1)
+		_rtPriority = 1;
+	if (_rtPriority > 99)
+		_rtPriority = 99;
 
 	if (_hyperhdrCalib)
 	{
@@ -3081,8 +3142,10 @@ int main(int argc, char *argv[])
 	for (std::unique_ptr<Request> &request : requests)
 		_camera->queueRequest(request.get());
 
-	// Run thread for flatbuffer
-	if (_imgOutPath.empty())
+	// Run thread for flatbuffer. In transform mode the send is fused onto the
+	// transform thread (sent inline), so the dedicated send thread is only needed
+	// for the no-transform streaming path.
+	if (_imgOutPath.empty() && !_transformEn)
 	{
 		pthread_t ptidFb;
 		pthread_create(&ptidFb, NULL, &flatLoop, NULL);
@@ -3094,6 +3157,9 @@ int main(int argc, char *argv[])
 		pthread_t ptidCv;
 		pthread_create(&ptidCv, NULL, &transformLoop, NULL);
 	}
+
+	// This (main) thread runs the camera capture/dispatch loop: pin + RT it.
+	applyThreadRealtime("capture", 1);
 
 	// Run an EventLoop for camera
 	_loop.exec();
