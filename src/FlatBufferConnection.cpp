@@ -1,4 +1,6 @@
 #include <iostream>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
@@ -54,23 +56,43 @@ namespace
 		return static_cast<ssize_t>(done);
 	}
 
-	ssize_t writeFully(int fd, const void *buf, size_t len)
+	// Gather-write: header + payload in one syscall (iov is consumed/adjusted).
+	ssize_t writevFully(int fd, struct iovec *iov, int iovcnt)
 	{
-		const uint8_t *p = static_cast<const uint8_t *>(buf);
+		size_t total = 0;
+		for (int i = 0; i < iovcnt; i++)
+			total += iov[i].iov_len;
+
 		size_t done = 0;
-		while (done < len)
+		while (done < total)
 		{
-			ssize_t n = ::write(fd, p + done, len - done);
-			if (n > 0)
+			ssize_t n = ::writev(fd, iov, iovcnt);
+			if (n < 0)
 			{
-				done += static_cast<size_t>(n);
-				continue;
+				if (errno == EINTR)
+					continue;
+				return -1;
 			}
 			if (n == 0)
 				return -1;
-			if (errno == EINTR)
-				continue;
-			return -1;
+			done += static_cast<size_t>(n);
+
+			size_t adv = static_cast<size_t>(n);
+			while (adv > 0 && iovcnt > 0)
+			{
+				if (adv >= iov[0].iov_len)
+				{
+					adv -= iov[0].iov_len;
+					iov++;
+					iovcnt--;
+				}
+				else
+				{
+					iov[0].iov_base = static_cast<uint8_t *>(iov[0].iov_base) + adv;
+					iov[0].iov_len -= adv;
+					adv = 0;
+				}
+			}
 		}
 		return static_cast<ssize_t>(done);
 	}
@@ -93,13 +115,16 @@ FlatBufferConnection::~FlatBufferConnection()
 
 void FlatBufferConnection::reserveBuilderBytes(size_t bytes)
 {
-	// Grow-only. We use PreAlign()+Clear() as a supported way to force the
-	// internal buffer to allocate enough capacity while leaving the builder empty.
+	// Grow-only. Allocate a throwaway uninitialized vector to force the internal
+	// buffer to the needed capacity, then Clear() (which keeps the allocation).
+	// Note: PreAlign(bytes, 1) does NOT grow the buffer - it only writes the
+	// alignment padding, which is 0 bytes for alignment 1.
 	if (bytes <= _reservedBuilderBytes)
 		return;
 
 	_builder.Clear();
-	_builder.PreAlign(bytes, 1);
+	uint8_t *scratch = nullptr;
+	_builder.CreateUninitializedVector(bytes, &scratch);
 	_builder.Clear();
 	_reservedBuilderBytes = bytes;
 }
@@ -382,6 +407,29 @@ int FlatBufferConnection::readData()
 	return 0;
 }
 
+void FlatBufferConnection::drainReplies()
+{
+	if (!_sockfd)
+		return;
+
+	uint8_t scratch[1024];
+	for (;;)
+	{
+		ssize_t n = ::recv(_sockfd, scratch, sizeof(scratch), MSG_DONTWAIT);
+		if (n > 0)
+			continue;
+		if (n == 0)
+		{
+			connectionDestroy();
+			std::cerr << "ERROR: Socket closed by peer" << std::endl;
+			return;
+		}
+		if (errno == EINTR)
+			continue;
+		return; // EAGAIN/EWOULDBLOCK: nothing pending
+	}
+}
+
 int FlatBufferConnection::setRegister(const char *origin, int priority)
 {
 	if (!_sockfd)
@@ -426,8 +474,13 @@ int FlatBufferConnection::setImage(const uint8_t *buffer, uint16_t width, uint16
 	int ret = sendMessage(_builder.GetBufferPointer(), _builder.GetSize());
 	_builder.Clear();
 
-	if (ret != -1 && !_skipReply)
-		readData();
+	if (ret != -1)
+	{
+		if (_skipReply)
+			drainReplies();
+		else
+			readData();
+	}
 
 	return ret;
 }
@@ -455,8 +508,13 @@ int FlatBufferConnection::setNV12Image(const uint8_t *yPlane, const uint8_t *uvP
 	int ret = sendMessage(_builder.GetBufferPointer(), _builder.GetSize());
 	_builder.Clear();
 
-	if (ret != -1 && !_skipReply)
-		readData();
+	if (ret != -1)
+	{
+		if (_skipReply)
+			drainReplies();
+		else
+			readData();
+	}
 
 	return ret;
 }
@@ -470,8 +528,13 @@ int FlatBufferConnection::sendPrebuiltRequest(const uint8_t *buffer, uint32_t si
 	}
 
 	int ret = sendMessage(buffer, size);
-	if (ret != -1 && !_skipReply)
-		readData();
+	if (ret != -1)
+	{
+		if (_skipReply)
+			drainReplies();
+		else
+			readData();
+	}
 
 	return ret;
 }
@@ -489,14 +552,13 @@ int FlatBufferConnection::sendMessage(const uint8_t *buffer, uint32_t size)
 		(uint8_t)((size >> 8) & 0xFF),
 		(uint8_t)(size & 0xFF)};
 
-	// write message
-	if (writeFully(_sockfd, header, sizeof(header)) < 0)
-	{
-		connectionDestroy();
-		return -1;
-	}
+	struct iovec iov[2];
+	iov[0].iov_base = const_cast<uint8_t *>(header);
+	iov[0].iov_len = sizeof(header);
+	iov[1].iov_base = const_cast<uint8_t *>(buffer);
+	iov[1].iov_len = size;
 
-	if (writeFully(_sockfd, buffer, size) < 0)
+	if (writevFully(_sockfd, iov, 2) < 0)
 	{
 		connectionDestroy();
 		return -1;

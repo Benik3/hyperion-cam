@@ -175,6 +175,14 @@ static bool _noRealtime = false; // --no-realtime disables SCHED_FIFO
 static int _rtPriority = 10;		 // --rt-priority (SCHED_FIFO, well below kernel threads ~50)
 static int _sendTimeoutMs = 100; // --send-timeout-ms (SO_SNDTIMEO)
 
+// Direct dispatch: run processRequest() on the libcamera camera-manager thread
+// instead of bouncing through the capture event loop (saves one eventfd wakeup
+// + context switch per frame). Only used in pure streaming mode; --imgout and
+// auto-calibration keep the event-loop hop so their heavy work stays off the
+// camera thread. --no-direct-dispatch restores the old behavior.
+static bool _noDirectDispatch = false;
+static bool _directDispatch = false;
+
 // --hyperhdr-calib output geometry (NV12 only)
 static bool _calibAdjustEn = false;
 static int _calibCropX = 0;
@@ -1691,10 +1699,40 @@ static void sendRequestRaw(const uint8_t *data, uint32_t size)
 	}
 }
 
-static flatbuffers::DetachedBuffer buildRawImageRequestUninitialized(uint16_t width, uint16_t height, uint8_t **outRgb)
+// Reusable per-thread builder for the fused transform+send paths: the request
+// is consumed (sent) before the next frame is built, so the builder's buffer
+// can be recycled. Avoids a frame-sized malloc/free per frame (allocation jitter).
+// Capacity is reserved up front: the buffer must NOT grow between the
+// CreateUninitializedVector calls and writing through the returned pointers.
+static flatbuffers::FlatBufferBuilder &fusedBuilder(size_t needBytes)
+{
+	static thread_local flatbuffers::FlatBufferBuilder builder(1024);
+	static thread_local size_t reserved = 0;
+	if (needBytes > reserved)
+	{
+		// Force the internal buffer to the needed capacity in one allocation;
+		// Clear() keeps the allocation. (PreAlign with alignment 1 does NOT
+		// grow the buffer - it only writes padding, which is 0 bytes here.)
+		builder.Clear();
+		uint8_t *scratch = nullptr;
+		builder.CreateUninitializedVector(needBytes, &scratch);
+		builder.Clear();
+		reserved = needBytes;
+	}
+	return builder;
+}
+
+struct BuiltRequest
+{
+	const uint8_t *data;
+	uint32_t size;
+};
+
+static BuiltRequest buildRawImageRequestUninitialized(uint16_t width, uint16_t height, uint8_t **outRgb)
 {
 	const size_t imgBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
-	flatbuffers::FlatBufferBuilder builder(imgBytes + 1024u);
+	flatbuffers::FlatBufferBuilder &builder = fusedBuilder(imgBytes + 1024u);
+	builder.Clear();
 
 	auto imgVec = builder.CreateUninitializedVector(imgBytes, outRgb);
 	auto rawImg = hyperhdrnet::CreateRawImage(builder, imgVec, width, height);
@@ -1702,15 +1740,16 @@ static flatbuffers::DetachedBuffer buildRawImageRequestUninitialized(uint16_t wi
 	auto req = hyperhdrnet::CreateRequest(builder, hyperhdrnet::Command_Image, imageReq.Union());
 	builder.Finish(req);
 
-	return builder.Release();
+	return BuiltRequest{builder.GetBufferPointer(), builder.GetSize()};
 }
 
-static flatbuffers::DetachedBuffer buildNV12ImageRequestUninitialized(uint16_t width, uint16_t height, uint16_t strideY, uint16_t strideUV,
-																	  uint8_t **outY, uint8_t **outUV)
+static BuiltRequest buildNV12ImageRequestUninitialized(uint16_t width, uint16_t height, uint16_t strideY, uint16_t strideUV,
+													   uint8_t **outY, uint8_t **outUV)
 {
 	const size_t yBytes = static_cast<size_t>(strideY) * static_cast<size_t>(height);
 	const size_t uvBytes = static_cast<size_t>(strideUV) * (static_cast<size_t>(height) / 2u);
-	flatbuffers::FlatBufferBuilder builder(yBytes + uvBytes + 1024u);
+	flatbuffers::FlatBufferBuilder &builder = fusedBuilder(yBytes + uvBytes + 1024u);
+	builder.Clear();
 
 	auto yVec = builder.CreateUninitializedVector(yBytes, outY);
 	auto uvVec = builder.CreateUninitializedVector(uvBytes, outUV);
@@ -1719,7 +1758,7 @@ static flatbuffers::DetachedBuffer buildNV12ImageRequestUninitialized(uint16_t w
 	auto req = hyperhdrnet::CreateRequest(builder, hyperhdrnet::Command_Image, imageReq.Union());
 	builder.Finish(req);
 
-	return builder.Release();
+	return BuiltRequest{builder.GetBufferPointer(), builder.GetSize()};
 }
 void *transformLoop(void *arg)
 {
@@ -1757,7 +1796,7 @@ static void transformImg(uint8_t *img, int64_t sensorTsNs)
 	// Fused send: deliver inline on this transform worker thread, then release
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
-	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	sendRequestRaw(req.data, req.size);
 	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -1886,7 +1925,7 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv, int64_t sensorTsNs)
 	// Fused send: deliver inline on this transform worker thread, then release
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
-	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	sendRequestRaw(req.data, req.size);
 	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -1938,7 +1977,7 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 	// Fused send: deliver inline on this transform worker thread, then release
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
-	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	sendRequestRaw(req.data, req.size);
 	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -1981,7 +2020,7 @@ static void transformImgRgbGpu(uint8_t *img, int64_t sensorTsNs)
 	// Fused send: deliver inline on this transform worker thread, then release
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
-	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	sendRequestRaw(req.data, req.size);
 	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -2025,7 +2064,7 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes, int64_t sensorTsNs
 	// Fused send: deliver inline on this transform worker thread, then release
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
-	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	sendRequestRaw(req.data, req.size);
 	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
@@ -2045,6 +2084,18 @@ static void requestComplete(Request *request)
 		return;
 
 	handleAutoFocusMetadata(request);
+
+	if (_directDispatch)
+	{
+		// One-time: pin + RT the libcamera camera-manager thread, which is now
+		// the frame dispatch thread.
+		static std::atomic<bool> tuned{false};
+		if (!tuned.exchange(true, std::memory_order_acq_rel))
+			applyThreadRealtime("camera-dispatch", 1);
+
+		processRequest(request);
+		return;
+	}
 
 	_loop.callLater(std::bind(&processRequest, request));
 }
@@ -2440,7 +2491,8 @@ int main(int argc, char *argv[])
 		("send-timeout-ms", po::value<int>(&_sendTimeoutMs)->default_value(100), "Socket send timeout in ms (SO_SNDTIMEO); abandons a frame if HyperHDR stalls")																									  //
 		("no-realtime", po::bool_switch(&_noRealtime)->default_value(false), "Disable SCHED_FIFO real-time scheduling (still pins threads to cores)")																											  //
 		("rt-priority", po::value<int>(&_rtPriority)->default_value(10), "SCHED_FIFO priority for capture/worker threads (1-99, default 10)")																													  //
-		("latency-stats", po::bool_switch(&_latencyStats)->default_value(false), "Print per-second sensor->send latency percentiles (p50/p95/p99) to stderr");
+		("latency-stats", po::bool_switch(&_latencyStats)->default_value(false), "Print per-second sensor->send latency percentiles (p50/p95/p99) to stderr")																									  //
+		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 
@@ -2455,6 +2507,15 @@ int main(int argc, char *argv[])
 		_rtPriority = 1;
 	if (_rtPriority > 99)
 		_rtPriority = 99;
+
+	// Lock all current and future memory: page faults on the RT capture/transform
+	// threads show up directly as frame latency spikes. Non-fatal without
+	// CAP_IPC_LOCK (running as non-root) - we just keep going unlocked.
+	if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+	{
+		if (_verbose)
+			std::cout << "WARNING: mlockall failed (" << std::strerror(errno) << "); page faults may add jitter" << std::endl;
+	}
 
 	if (_hyperhdrCalib)
 	{
@@ -2677,6 +2738,9 @@ int main(int argc, char *argv[])
 			return EXIT_FAILURE;
 		}
 	}
+
+	// Direct dispatch only in pure streaming mode (see declaration comment).
+	_directDispatch = !_noDirectDispatch && _imgOutPath.empty() && !autoCalibEnabled();
 
 	// GPU transform is the default when compiled in and --transform is used.
 	// Use --cpuonly to force the CPU path.

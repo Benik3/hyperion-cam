@@ -88,6 +88,13 @@ private:
 	/// @return 0 = OK, -1 = failed
 	int readData();
 
+	/// @brief Discard any pending server replies without blocking.
+	///
+	/// In skip-reply mode the server still replies to every image; if those
+	/// bytes are never read the kernel receive buffer fills and the server
+	/// stalls or buffers unboundedly. Also detects a peer close (EOF) early.
+	void drainReplies();
+
 	///
 	/// @brief Parse a reply message
 	/// @param reply The received reply
