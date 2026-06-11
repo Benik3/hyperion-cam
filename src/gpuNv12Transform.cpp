@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -262,6 +263,16 @@ struct GpuNv12Transform::Impl
 
 	// Optional pipelined readback via PBOs (reduces blocking on glReadPixels).
 	bool usePbo{false};
+	// Synchronous single-PBO readback (default): glReadPixels into a PBO lets
+	// the GPU do the tiled->linear conversion, then fence + map + memcpy.
+	// Same-frame freshness, cheaper than direct glReadPixels to CPU memory.
+	bool syncPbo{false};
+	GLuint pboSyncY{0};
+	GLuint pboSyncUV{0};
+	// RGBA-packed readback (see ctor comment).
+	bool packed{false};
+	int packedYW{0};
+	int packedUVW{0};
 	GLuint pboY[2]{0, 0};
 	GLuint pboUV[2]{0, 0};
 	GLsync fenceY[2]{0, 0};
@@ -306,6 +317,15 @@ struct GpuNv12Transform::Impl
 		profile = envEnabled("HYPERCAM_GL_PROFILE");
 		profileSync = envEnabled("HYPERCAM_GL_PROFILE_SYNC");
 		usePbo = envEnabled("HYPERCAM_NV12_PBO");
+		// Measured slower than direct glReadPixels on RPi4/Mesa v3d (the driver
+		// de-tiles on the CPU either way and the PBO adds an extra copy); opt-in.
+		syncPbo = !usePbo && envEnabled("HYPERCAM_GL_SYNCPBO");
+		// Pack 4 Y pixels (or 2 UV pairs) per RGBA8 texel: glReadPixels cost on
+		// v3d is dominated by per-pixel CPU de-tiling, so 1/4 the pixels at 4x
+		// the depth reads back much faster. Needs dstW % 4 == 0.
+		packed = !usePbo && (dstW % 4 == 0) && !envEnabled("HYPERCAM_GL_NO_PACK");
+		packedYW = packed ? dstW / 4 : dstW;
+		packedUVW = packed ? dstW / 4 : dstW / 2;
 		dmabufEnabled = true;
 		lastPrintNs = monoNs();
 
@@ -409,30 +429,39 @@ struct GpuNv12Transform::Impl
 		glEnableVertexAttribArray(0);
 		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
 
+		// The projective mapping is evaluated in the vertex shader and linearly
+		// interpolated as homogeneous coords (exact: each component is a linear
+		// function of the destination pixel position). The fragment shader only
+		// does the perspective divide + one texture fetch - much cheaper per
+		// pixel than a mat3 multiply + textureSize() query.
+		// uXScale: full-res output pixels per framebuffer pixel along x
+		// (1 unpacked; 4 for packed Y, 2 for packed UV).
 		const char *vsSrc = R"(
 #version 300 es
+precision highp float;
 layout(location=0) in vec2 aPos;
-out vec2 vPos;
+uniform mat3 uInv;
+uniform vec2 uDstSize;
+uniform float uXScale;
+out vec3 vSrc;
 void main(){
-  vPos = aPos;
   gl_Position = vec4(aPos, 0.0, 1.0);
+  // Pixel coords this clip-space position maps to (== gl_FragCoord.xy - 0.5).
+  vec2 pix = (aPos * 0.5 + 0.5) * uDstSize - 0.5;
+  vSrc = uInv * vec3(pix.x * uXScale, pix.y, 1.0);
 }
 )";
 
 		const char *fsYSrc = R"(
 #version 300 es
 precision highp float;
-uniform mat3 uInv;
 uniform sampler2D uTex;
-in vec2 vPos;
+uniform vec2 uInvTexSize;
+in vec3 vSrc;
 out vec4 outColor;
 void main(){
-  // vPos is in clip space [-1..1]; convert to pixel coords in destination
-  vec2 frag = gl_FragCoord.xy - vec2(0.5, 0.5);
-  vec3 src = uInv * vec3(frag, 1.0);
-  vec2 s = src.xy / src.z;
-  // Sample from GL_RED texture; normalized coords
-  vec2 uv = (s + vec2(0.5, 0.5)) / vec2(textureSize(uTex, 0));
+  vec2 s = vSrc.xy / vSrc.z;
+  vec2 uv = (s + vec2(0.5, 0.5)) * uInvTexSize;
   float y = texture(uTex, uv).r;
   outColor = vec4(y, 0.0, 0.0, 1.0);
 }
@@ -441,23 +470,58 @@ void main(){
 		const char *fsUVSrc = R"(
 #version 300 es
 precision highp float;
-uniform mat3 uInv;
 uniform sampler2D uTex;
-in vec2 vPos;
+uniform vec2 uInvTexSize;
+in vec3 vSrc;
 out vec4 outColor;
 void main(){
-  vec2 frag = gl_FragCoord.xy - vec2(0.5, 0.5);
-  vec3 src = uInv * vec3(frag, 1.0);
-  vec2 s = src.xy / src.z;
-  vec2 uv = (s + vec2(0.5, 0.5)) / vec2(textureSize(uTex, 0));
+  vec2 s = vSrc.xy / vSrc.z;
+  vec2 uv = (s + vec2(0.5, 0.5)) * uInvTexSize;
   vec2 c = texture(uTex, uv).rg;
   outColor = vec4(c.r, c.g, 0.0, 1.0);
 }
 )";
 
+		// Packed variants: uDx is the source-coord step per full-res output pixel
+		// (column 0 of the inverse homography); vSrc is the coord of the first lane.
+		const char *fsYPackedSrc = R"(
+#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform vec2 uInvTexSize;
+uniform vec3 uDx;
+in vec3 vSrc;
+out vec4 outColor;
+void main(){
+  vec3 s = vSrc;
+  vec2 t0 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t1 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t2 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t3 = (s.xy / s.z + vec2(0.5)) * uInvTexSize;
+  outColor = vec4(texture(uTex, t0).r, texture(uTex, t1).r,
+                  texture(uTex, t2).r, texture(uTex, t3).r);
+}
+)";
+
+		const char *fsUVPackedSrc = R"(
+#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform vec2 uInvTexSize;
+uniform vec3 uDx;
+in vec3 vSrc;
+out vec4 outColor;
+void main(){
+  vec3 s = vSrc;
+  vec2 t0 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t1 = (s.xy / s.z + vec2(0.5)) * uInvTexSize;
+  outColor = vec4(texture(uTex, t0).rg, texture(uTex, t1).rg);
+}
+)";
+
 		GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-		GLuint fsY = compileShader(GL_FRAGMENT_SHADER, fsYSrc);
-		GLuint fsUV = compileShader(GL_FRAGMENT_SHADER, fsUVSrc);
+		GLuint fsY = compileShader(GL_FRAGMENT_SHADER, packed ? fsYPackedSrc : fsYSrc);
+		GLuint fsUV = compileShader(GL_FRAGMENT_SHADER, packed ? fsUVPackedSrc : fsUVSrc);
 
 		progY = linkProgram(vs, fsY);
 		uMatY = glGetUniformLocation(progY, "uInv");
@@ -469,6 +533,29 @@ void main(){
 		glDeleteShader(vs);
 		glDeleteShader(fsY);
 		glDeleteShader(fsUV);
+
+		// All uniforms are constant for the lifetime of the transform; set once.
+		glUseProgram(progY);
+		glUniformMatrix3fv(uMatY, 1, GL_FALSE, invY.data());
+		glUniform1i(uTexY, 0);
+		glUniform2f(glGetUniformLocation(progY, "uDstSize"),
+					static_cast<float>(packedYW), static_cast<float>(dstH));
+		glUniform1f(glGetUniformLocation(progY, "uXScale"), packed ? 4.f : 1.f);
+		glUniform2f(glGetUniformLocation(progY, "uInvTexSize"),
+					1.f / static_cast<float>(srcW), 1.f / static_cast<float>(srcH));
+		if (packed)
+			glUniform3f(glGetUniformLocation(progY, "uDx"), invY[0], invY[1], invY[2]);
+		glUseProgram(progUV);
+		glUniformMatrix3fv(uMatUV, 1, GL_FALSE, invUV.data());
+		glUniform1i(uTexUV, 0);
+		glUniform2f(glGetUniformLocation(progUV, "uDstSize"),
+					static_cast<float>(packedUVW), static_cast<float>(dstH / 2));
+		glUniform1f(glGetUniformLocation(progUV, "uXScale"), packed ? 2.f : 1.f);
+		glUniform2f(glGetUniformLocation(progUV, "uInvTexSize"),
+					2.f / static_cast<float>(srcW), 2.f / static_cast<float>(srcH));
+		if (packed)
+			glUniform3f(glGetUniformLocation(progUV, "uDx"), invUV[0], invUV[1], invUV[2]);
+		glUseProgram(0);
 
 		// Input textures
 		glGenTextures(1, &texY);
@@ -494,7 +581,10 @@ void main(){
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, dstW, dstH, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+		if (packed)
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, packedYW, dstH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		else
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, dstW, dstH, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
 
 		glGenFramebuffers(1, &fboY);
 		glBindFramebuffer(GL_FRAMEBUFFER, fboY);
@@ -508,7 +598,10 @@ void main(){
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, dstW / 2, dstH / 2, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+		if (packed)
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, packedUVW, dstH / 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		else
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, dstW / 2, dstH / 2, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
 
 		glGenFramebuffers(1, &fboUV);
 		glBindFramebuffer(GL_FRAMEBUFFER, fboUV);
@@ -520,6 +613,17 @@ void main(){
 
 		yBytes = static_cast<std::size_t>(dstW) * static_cast<std::size_t>(dstH);
 		uvBytes = (static_cast<std::size_t>(dstW) * static_cast<std::size_t>(dstH)) / 2u;
+
+		if (syncPbo)
+		{
+			glGenBuffers(1, &pboSyncY);
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, pboSyncY);
+			glBufferData(GL_PIXEL_PACK_BUFFER, yBytes, nullptr, GL_STREAM_READ);
+			glGenBuffers(1, &pboSyncUV);
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, pboSyncUV);
+			glBufferData(GL_PIXEL_PACK_BUFFER, uvBytes, nullptr, GL_STREAM_READ);
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		}
 
 		if (usePbo)
 		{
@@ -582,6 +686,10 @@ void main(){
 			glDeleteBuffers(2, pboY);
 		if (pboUV[0] || pboUV[1])
 			glDeleteBuffers(2, pboUV);
+		if (pboSyncY)
+			glDeleteBuffers(1, &pboSyncY);
+		if (pboSyncUV)
+			glDeleteBuffers(1, &pboSyncUV);
 		if (texY)
 			glDeleteTextures(1, &texY);
 		if (texUV)
@@ -771,15 +879,46 @@ void main(){
 			accUploadNs += (monoNs() - t0);
 	}
 
+	// Read the current framebuffer either directly into CPU memory, or via a
+	// PBO (GPU performs the tiled->linear conversion) + fence + map + memcpy.
+	void readbackPixels(GLuint pbo, int w, int h, GLenum fmt, size_t bytes, uint8_t *out)
+	{
+		if (!syncPbo)
+		{
+			glReadPixels(0, 0, w, h, fmt, GL_UNSIGNED_BYTE, out);
+			return;
+		}
+
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+		glReadPixels(0, 0, w, h, fmt, GL_UNSIGNED_BYTE, 0);
+		GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+		if (fence)
+		{
+			glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull); // 100ms cap
+			glDeleteSync(fence);
+		}
+		void *p = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT);
+		if (p)
+		{
+			std::memcpy(out, p, bytes);
+			glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		}
+		else
+		{
+			// Mapping failed; fall back to a direct read.
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+			glReadPixels(0, 0, w, h, fmt, GL_UNSIGNED_BYTE, out);
+		}
+	}
+
 	void renderY(uint8_t *outY)
 	{
 		glBindFramebuffer(GL_FRAMEBUFFER, fboY);
-		glViewport(0, 0, dstW, dstH);
+		glViewport(0, 0, packedYW, dstH);
 		glUseProgram(progY);
-		glUniformMatrix3fv(uMatY, 1, GL_FALSE, invY.data());
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texY);
-		glUniform1i(uTexY, 0);
 		glBindVertexArray(vao);
 		uint64_t tDraw0 = 0;
 		if (profile)
@@ -792,7 +931,7 @@ void main(){
 		uint64_t tRead0 = 0;
 		if (profile)
 			tRead0 = monoNs();
-		glReadPixels(0, 0, dstW, dstH, GL_RED, GL_UNSIGNED_BYTE, outY);
+		readbackPixels(pboSyncY, packedYW, dstH, packed ? GL_RGBA : GL_RED, yBytes, outY);
 		if (profileSync)
 			glFinish();
 		if (profile)
@@ -802,12 +941,10 @@ void main(){
 	void renderUV(uint8_t *outUV)
 	{
 		glBindFramebuffer(GL_FRAMEBUFFER, fboUV);
-		glViewport(0, 0, dstW / 2, dstH / 2);
+		glViewport(0, 0, packedUVW, dstH / 2);
 		glUseProgram(progUV);
-		glUniformMatrix3fv(uMatUV, 1, GL_FALSE, invUV.data());
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texUV);
-		glUniform1i(uTexUV, 0);
 		glBindVertexArray(vao);
 		uint64_t tDraw0 = 0;
 		if (profile)
@@ -820,7 +957,7 @@ void main(){
 		uint64_t tRead0 = 0;
 		if (profile)
 			tRead0 = monoNs();
-		glReadPixels(0, 0, dstW / 2, dstH / 2, GL_RG, GL_UNSIGNED_BYTE, outUV);
+		readbackPixels(pboSyncUV, packedUVW, dstH / 2, packed ? GL_RGBA : GL_RG, uvBytes, outUV);
 		if (profileSync)
 			glFinish();
 		if (profile)
