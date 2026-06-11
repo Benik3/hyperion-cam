@@ -487,6 +487,71 @@ static inline int64_t nowNs()
 		.count();
 }
 
+// SensorTimestamp is CLOCK_BOOTTIME; compare against the same clock.
+static inline int64_t bootNowNs()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+	return static_cast<int64_t>(ts.tv_sec) * 1000000000ll + ts.tv_nsec;
+}
+
+// --latency-stats: per-frame sensor-exposure -> send-complete latency percentiles.
+static bool _latencyStats = false;
+
+struct LatencyStats
+{
+	// Recorded only from the single worker thread that completes sends
+	// (transform thread in fused mode, send thread otherwise) - no locking.
+	std::vector<uint32_t> samplesUs;
+	int64_t windowStartNs{0};
+	uint64_t lastDropProcess{0};
+	uint64_t lastDropSend{0};
+
+	void record(int64_t sensorTsNs, const std::atomic<uint64_t> &dropProcess, const std::atomic<uint64_t> &dropSend)
+	{
+		const int64_t now = bootNowNs();
+		if (windowStartNs == 0)
+		{
+			windowStartNs = now;
+			samplesUs.reserve(512);
+		}
+
+		const int64_t d = now - sensorTsNs;
+		if (sensorTsNs > 0 && d > 0 && d < 10000000000ll)
+			samplesUs.push_back(static_cast<uint32_t>(d / 1000));
+
+		if (now - windowStartNs < 1000000000ll)
+			return;
+
+		if (!samplesUs.empty())
+		{
+			auto pct = [&](double p) -> double
+			{
+				size_t idx = static_cast<size_t>(p * static_cast<double>(samplesUs.size() - 1) + 0.5);
+				std::nth_element(samplesUs.begin(), samplesUs.begin() + idx, samplesUs.end());
+				return static_cast<double>(samplesUs[idx]) / 1000.0;
+			};
+			const double p50 = pct(0.50);
+			const double p95 = pct(0.95);
+			const double p99 = pct(0.99);
+			const auto [mn, mx] = std::minmax_element(samplesUs.begin(), samplesUs.end());
+			const uint64_t dp = dropProcess.load(std::memory_order_relaxed);
+			const uint64_t ds = dropSend.load(std::memory_order_relaxed);
+			fprintf(stderr, "[lat] n=%zu sensor->sent ms: p50=%.2f p95=%.2f p99=%.2f min=%.2f max=%.2f dropP=%llu dropS=%llu\n",
+					samplesUs.size(), p50, p95, p99,
+					static_cast<double>(*mn) / 1000.0, static_cast<double>(*mx) / 1000.0,
+					static_cast<unsigned long long>(dp - lastDropProcess),
+					static_cast<unsigned long long>(ds - lastDropSend));
+			lastDropProcess = dp;
+			lastDropSend = ds;
+		}
+		samplesUs.clear();
+		windowStartNs = now;
+	}
+};
+
+static LatencyStats _latStats;
+
 // Apply latency-first thread tuning: pin to a dedicated core (only when there
 // are enough cores to spare core 0 for the kernel/IRQs + libcamera's internal
 // pipeline thread) and raise to SCHED_FIFO. Degrades gracefully: a failure to
@@ -598,6 +663,12 @@ static int _maxPendingProcess = 0;
 static int _maxPendingSend = 0;
 static std::atomic<uint64_t> _droppedProcess{0};
 static std::atomic<uint64_t> _droppedSend{0};
+
+static inline void latencyRecord(int64_t sensorTsNs)
+{
+	if (_latencyStats)
+		_latStats.record(sensorTsNs, _droppedProcess, _droppedSend);
+}
 
 // Output crop ring buffer (used only when maxPendingSend > 0 to avoid per-frame allocations).
 static RgbRingBuffer _cropOut;
@@ -1550,7 +1621,7 @@ static bool cropNv12Into(const uint8_t *srcY, const uint8_t *srcUV,
 	return true;
 }
 
-static void flatBufSend(const uint8_t *img)
+static void flatBufSend(const uint8_t *img, int64_t sensorTsNs)
 {
 	const int64_t startNs = nowNs();
 	if (flatbufTryConnect())
@@ -1566,6 +1637,7 @@ static void flatBufSend(const uint8_t *img)
 		if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 			std::cout << "ERROR: Flatbuffer connection timeout\n";
 	}
+	latencyRecord(sensorTsNs);
 
 	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -1575,7 +1647,7 @@ static void flatBufSend(const uint8_t *img)
 	}
 }
 
-static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, int strideUV, int width, int height)
+static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, int strideUV, int width, int height, int64_t sensorTsNs)
 {
 	const int64_t startNs = nowNs();
 	if (flatbufTryConnect())
@@ -1591,6 +1663,7 @@ static void flatBufSendNv12(const uint8_t *y, const uint8_t *uv, int strideY, in
 		if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 			std::cout << "ERROR: Flatbuffer connection timeout\n";
 	}
+	latencyRecord(sensorTsNs);
 
 	int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -1671,7 +1744,7 @@ void *transformLoop(void *arg)
 	return 0;
 }
 
-static void transformImg(uint8_t *img)
+static void transformImg(uint8_t *img, int64_t sensorTsNs)
 {
 	const int64_t startNs = nowNs();
 	uint8_t *outRgb = nullptr;
@@ -1685,6 +1758,7 @@ static void transformImg(uint8_t *img)
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
 	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -1694,7 +1768,7 @@ static void transformImg(uint8_t *img)
 	}
 }
 
-static void transformImgNv12(uint8_t *y, uint8_t *uv)
+static void transformImgNv12(uint8_t *y, uint8_t *uv, int64_t sensorTsNs)
 {
 	const int64_t startNs = nowNs();
 	// Avoid NV12 <-> BGR conversions: warp Y and UV planes directly.
@@ -1813,6 +1887,7 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
 	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -1822,7 +1897,7 @@ static void transformImgNv12(uint8_t *y, uint8_t *uv)
 	}
 }
 
-static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY, int fdUV, int offUV)
+static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY, int fdUV, int offUV, int64_t sensorTsNs)
 {
 #ifndef HAVE_GPU_TRANSFORM
 	(void)y;
@@ -1831,6 +1906,7 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 	(void)offY;
 	(void)fdUV;
 	(void)offUV;
+	(void)sensorTsNs;
 	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
 	_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	return;
@@ -1863,6 +1939,7 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
 	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -1873,10 +1950,11 @@ static void transformImgNv12GpuDmabuf(uint8_t *y, uint8_t *uv, int fdY, int offY
 #endif
 }
 
-static void transformImgRgbGpu(uint8_t *img)
+static void transformImgRgbGpu(uint8_t *img, int64_t sensorTsNs)
 {
 #ifndef HAVE_GPU_TRANSFORM
 	(void)img;
+	(void)sensorTsNs;
 	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
 	_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	return;
@@ -1904,6 +1982,7 @@ static void transformImgRgbGpu(uint8_t *img)
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
 	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -1914,11 +1993,12 @@ static void transformImgRgbGpu(uint8_t *img)
 #endif
 }
 
-static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
+static void transformImgRgbGpuDmabuf(int fd, int offsetBytes, int64_t sensorTsNs)
 {
 #ifndef HAVE_GPU_TRANSFORM
 	(void)fd;
 	(void)offsetBytes;
+	(void)sensorTsNs;
 	std::cout << "ERROR: GPU transform not compiled in" << std::endl;
 	_pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	return;
@@ -1946,6 +2026,7 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes)
 	// the in-flight slot only after the send completes so newer frames are
 	// dropped while we're busy (latest-frame-wins, bounded latency).
 	sendRequestRaw(req.data(), static_cast<uint32_t>(req.size()));
+	latencyRecord(sensorTsNs);
 
 	int before = _pendingProcess.fetch_sub(1, std::memory_order_acq_rel);
 	if (before > 1 && _verbose)
@@ -1970,6 +2051,14 @@ static void requestComplete(Request *request)
 
 static void processRequest(Request *request)
 {
+	int64_t sensorTsNs = 0;
+	if (_latencyStats)
+	{
+		auto tsOpt = request->metadata().get(controls::SensorTimestamp);
+		if (tsOpt)
+			sensorTsNs = *tsOpt;
+	}
+
 	const Request::BufferMap &buffers = request->buffers();
 	for (auto bufferPair : buffers)
 	{
@@ -2084,13 +2173,13 @@ static void processRequest(Request *request)
 						int fdUV = p1.fd.get();
 						int offY = static_cast<int>(p0.offset);
 						int offUV = static_cast<int>(p1.offset);
-						_loopTr.callLater([y, uv, fdY, offY, fdUV, offUV]()
-										  { transformImgNv12GpuDmabuf(y, uv, fdY, offY, fdUV, offUV); });
+						_loopTr.callLater([y, uv, fdY, offY, fdUV, offUV, sensorTsNs]()
+										  { transformImgNv12GpuDmabuf(y, uv, fdY, offY, fdUV, offUV, sensorTsNs); });
 					}
 				}
 				else
-					_loopTr.callLater([y, uv]()
-									  { transformImgNv12(y, uv); });
+					_loopTr.callLater([y, uv, sensorTsNs]()
+									  { transformImgNv12(y, uv, sensorTsNs); });
 			}
 			else
 			{
@@ -2103,18 +2192,18 @@ static void processRequest(Request *request)
 						const FrameBuffer::Plane &p0 = buffer->planes()[0];
 						int fd = p0.fd.get();
 						int off = static_cast<int>(p0.offset);
-						_loopTr.callLater([fd, off]()
-										  { transformImgRgbGpuDmabuf(fd, off); });
+						_loopTr.callLater([fd, off, sensorTsNs]()
+										  { transformImgRgbGpuDmabuf(fd, off, sensorTsNs); });
 					}
 					else
 					{
-						_loopTr.callLater([img]()
-										  { transformImgRgbGpu(img); });
+						_loopTr.callLater([img, sensorTsNs]()
+										  { transformImgRgbGpu(img, sensorTsNs); });
 					}
 				}
 				else
-					_loopTr.callLater([img]()
-									  { transformImg(img); });
+					_loopTr.callLater([img, sensorTsNs]()
+									  { transformImg(img, sensorTsNs); });
 			}
 		}
 		else
@@ -2158,8 +2247,8 @@ static void processRequest(Request *request)
 						int outStrideUV = _outputCropWidth;
 						int outW = _outputCropWidth;
 						int outH = _outputCropHeight;
-						_loopFb.callLater([outY, outUV, outStrideY, outStrideUV, outW, outH]()
-										  { flatBufSendNv12(outY, outUV, outStrideY, outStrideUV, outW, outH); });
+						_loopFb.callLater([outY, outUV, outStrideY, outStrideUV, outW, outH, sensorTsNs]()
+										  { flatBufSendNv12(outY, outUV, outStrideY, outStrideUV, outW, outH, sensorTsNs); });
 					}
 					else
 					{
@@ -2177,14 +2266,14 @@ static void processRequest(Request *request)
 						}
 						int outW = _outputCropWidth;
 						int outH = _outputCropHeight;
-						_loopFb.callLater([yCrop = std::move(yCrop), uvCrop = std::move(uvCrop), outW, outH]() mutable
-										  { flatBufSendNv12(yCrop.data(), uvCrop.data(), outW, outW, outW, outH); });
+						_loopFb.callLater([yCrop = std::move(yCrop), uvCrop = std::move(uvCrop), outW, outH, sensorTsNs]() mutable
+										  { flatBufSendNv12(yCrop.data(), uvCrop.data(), outW, outW, outW, outH, sensorTsNs); });
 					}
 				}
 				else
 				{
-					_loopFb.callLater([y, uv]()
-									  { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend); });
+					_loopFb.callLater([y, uv, sensorTsNs]()
+									  { flatBufSendNv12(y, uv, _strideY, _strideUV, _imgWidthToSend, _imgHeightToSend, sensorTsNs); });
 				}
 			}
 			else
@@ -2206,7 +2295,7 @@ static void processRequest(Request *request)
 							continue;
 						}
 						uint8_t *croppedPtr = view.rgb;
-						_loopFb.callLater([croppedPtr]()
+						_loopFb.callLater([croppedPtr, sensorTsNs]()
 										  {
 							const int64_t startNs = nowNs();
 							if (flatbufTryConnect())
@@ -2222,6 +2311,7 @@ static void processRequest(Request *request)
 								if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 									std::cout << "ERROR: Flatbuffer connection timeout\n";
 							}
+							latencyRecord(sensorTsNs);
 
 							int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 							if (before > 1 && _verbose)
@@ -2234,7 +2324,7 @@ static void processRequest(Request *request)
 					{
 						std::vector<uint8_t> cropped = cropRgb(img, _imgWidthToSend, _imgHeightToSend, _strideBgr,
 															   _outputCropX, _outputCropY, _outputCropWidth, _outputCropHeight);
-						_loopFb.callLater([cropped = std::move(cropped)]() mutable
+						_loopFb.callLater([cropped = std::move(cropped), sensorTsNs]() mutable
 										  {
 						const int64_t startNs = nowNs();
 						if (flatbufTryConnect())
@@ -2250,6 +2340,7 @@ static void processRequest(Request *request)
 							if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 								std::cout << "ERROR: Flatbuffer connection timeout\n";
 						}
+						latencyRecord(sensorTsNs);
 
 						int before = _pendingSend.fetch_sub(1, std::memory_order_acq_rel);
 						if (before > 1 && _verbose)
@@ -2261,8 +2352,8 @@ static void processRequest(Request *request)
 				}
 				else
 				{
-					_loopFb.callLater([img]()
-									  { flatBufSend(img); });
+					_loopFb.callLater([img, sensorTsNs]()
+									  { flatBufSend(img, sensorTsNs); });
 				}
 			}
 		}
@@ -2348,7 +2439,8 @@ int main(int argc, char *argv[])
 		("reconnect-interval-ms", po::value<int>(&_flatbufReconnectIntervalMs)->default_value(250), "Min time between reconnect attempts in ms when disconnected")																								  //
 		("send-timeout-ms", po::value<int>(&_sendTimeoutMs)->default_value(100), "Socket send timeout in ms (SO_SNDTIMEO); abandons a frame if HyperHDR stalls")																									  //
 		("no-realtime", po::bool_switch(&_noRealtime)->default_value(false), "Disable SCHED_FIFO real-time scheduling (still pins threads to cores)")																											  //
-		("rt-priority", po::value<int>(&_rtPriority)->default_value(10), "SCHED_FIFO priority for capture/worker threads (1-99, default 10)");
+		("rt-priority", po::value<int>(&_rtPriority)->default_value(10), "SCHED_FIFO priority for capture/worker threads (1-99, default 10)")																													  //
+		("latency-stats", po::bool_switch(&_latencyStats)->default_value(false), "Print per-second sensor->send latency percentiles (p50/p95/p99) to stderr");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 
