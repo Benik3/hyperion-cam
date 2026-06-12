@@ -328,25 +328,32 @@ struct GpuRgbTransform::Impl
 		glEnableVertexAttribArray(0);
 		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
 
+		// Projective mapping evaluated per-vertex and interpolated as homogeneous
+		// coords (exact); the fragment shader only divides + fetches.
 		const char *vsSrc = R"(
 #version 300 es
+precision highp float;
 layout(location=0) in vec2 aPos;
+uniform mat3 uInv;
+uniform vec2 uDstSize;
+out vec3 vSrc;
 void main(){
   gl_Position = vec4(aPos, 0.0, 1.0);
+  vec2 pix = (aPos * 0.5 + 0.5) * uDstSize - 0.5;
+  vSrc = uInv * vec3(pix, 1.0);
 }
 )";
 
 		const char *fsSrc = R"(
 #version 300 es
 precision highp float;
-uniform mat3 uInv;
 uniform sampler2D uTex;
+uniform vec2 uInvTexSize;
+in vec3 vSrc;
 out vec4 outColor;
 void main(){
-  vec2 frag = gl_FragCoord.xy - vec2(0.5, 0.5);
-  vec3 src = uInv * vec3(frag, 1.0);
-  vec2 s = src.xy / src.z;
-  vec2 uv = (s + vec2(0.5, 0.5)) / vec2(textureSize(uTex, 0));
+  vec2 s = vSrc.xy / vSrc.z;
+  vec2 uv = (s + vec2(0.5, 0.5)) * uInvTexSize;
   vec3 c = texture(uTex, uv).rgb;
   outColor = vec4(c, 1.0);
 }
@@ -359,6 +366,16 @@ void main(){
 		uTex = glGetUniformLocation(prog, "uTex");
 		glDeleteShader(vs);
 		glDeleteShader(fs);
+
+		// Constant for the transform's lifetime; set once.
+		glUseProgram(prog);
+		glUniformMatrix3fv(uMat, 1, GL_FALSE, inv.data());
+		glUniform1i(uTex, 0);
+		glUniform2f(glGetUniformLocation(prog, "uDstSize"),
+					static_cast<float>(dstW), static_cast<float>(dstH));
+		glUniform2f(glGetUniformLocation(prog, "uInvTexSize"),
+					1.f / static_cast<float>(srcW), 1.f / static_cast<float>(srcH));
+		glUseProgram(0);
 
 		// Upload as RGBA8 (4 bytes/pixel). Many GLES drivers handle this far more
 		// efficiently than tightly-packed 3-byte GL_RGB uploads.
@@ -841,10 +858,8 @@ void main(){
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 		glViewport(0, 0, dstW, dstH);
 		glUseProgram(prog);
-		glUniformMatrix3fv(uMat, 1, GL_FALSE, inv.data());
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texIn[activeTex]);
-		glUniform1i(uTex, 0);
 		glBindVertexArray(vao);
 		if (profile)
 			t0 = monoNs();
