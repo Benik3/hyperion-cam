@@ -350,7 +350,7 @@ static inline void handleAutoFocusMetadata(Request *request)
 	if (_autoFocusPhase.load(std::memory_order_acquire) != 1)
 		return;
 
-	ControlList &md = request->metadata();
+	const ControlList &md = request->metadata();
 	auto afStateOpt = md.get(controls::AfState);
 	if (!afStateOpt)
 		return;
