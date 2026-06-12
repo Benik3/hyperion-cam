@@ -240,8 +240,10 @@ int FlatBufferConnection::connectToServer(const char *origin, const char *host, 
 		sndTimeout.tv_sec = _sendTimeoutMs / 1000;
 		sndTimeout.tv_usec = (_sendTimeoutMs % 1000) * 1000;
 
+		// Receive timeout only gates the one-time registration reply; keep it
+		// short so a wedged server can't stall the send/transform thread for long.
 		struct timeval timeout;
-		timeout.tv_sec = 5;
+		timeout.tv_sec = 2;
 		timeout.tv_usec = 0;
 
 		if (setsockopt(_sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&sndTimeout,
