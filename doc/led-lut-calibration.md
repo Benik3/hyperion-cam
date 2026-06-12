@@ -34,7 +34,7 @@ three unknown nonlinear devices (TV, camera, LEDs); we never characterize any of
 |---|---|---|
 | Calibration target | LED glow matches TV, relative | absolute accuracy not the goal; cancels camera+TV unknowns |
 | LUT location | grabber GPU shader, per-pixel | lowest latency; per-LED (post-averaging) would be mathematically cleaner but needs a HyperHDR fork |
-| Interpolation | tetrahedral (trilinear toggle) | user preference; standard for color LUTs |
+| Interpolation | ~~tetrahedral~~ → **trilinear 33³** (measured 2026-06-12, see Runtime) | tetra costs +8 ms p50 on v3d; dense trilinear matches its accuracy at +1 ms |
 | TV patch display | generated calib video + on-screen index coding | survives pause/seek/frame-rate conversion; no controllable HDMI source needed |
 | Measurement loop | open-loop sweeps + closed-loop verification pass | sweeps are fast and clean; verification catches model errors |
 | Eye anchor | white mandatory, extra colors optional | white is what users can match reliably |
@@ -118,12 +118,27 @@ space.
 
 ## Runtime (later milestone)
 
-`--lut <file>` loads a 17³ RGB→RGB LUT into a 3D texture; the NV12 warp fragment shader converts
-YUV→RGB, applies tetrahedral interpolation, converts back. Watch the packed Y pass: 4 output
-pixels per fragment → 4 LUT applications per fragment (~16–20 texture fetches with tetrahedral).
-Measure with `HYPERCAM_GL_PROFILE=1` + `--latency-stats` before accepting; fallbacks if too slow:
-trilinear (`HYPERCAM_LUT_TRILINEAR=1`), smaller LUT, or moving the LUT to a HyperHDR-side hook.
-No `--lut` → behavior identical to today. `--cpuonly` path: no LUT support in v1.
+The LUT is applied inside the packed NV12 warp fragment shaders: each pass samples both source
+planes (same normalized coordinate addresses Y and UV textures), converts YUV→RGB (full-range
+BT.601 — exact matrix irrelevant, calibration measures end-to-end through this shader), applies
+the LUT, converts back. No LUT enabled → shaders identical to today. `--cpuonly`: no LUT in v1.
+
+**Interpolation decision (measured on RPi4, prod config 640×480, 2026-06-12 — overrides the
+earlier tetrahedral preference):**
+
+| Variant | GPU render | sensor→sent p50 |
+|---|---|---|
+| baseline (no LUT) | 1.95 ms | 16.5 ms |
+| tetrahedral 17³ | ~9.5 ms | 24.5 ms |
+| trilinear 17³ | 2.91 ms | 17.45 ms |
+| trilinear 33³ | 3.00 ms | 17.55 ms |
+| trilinear 64³ | ~3.0 ms | 17.5 ms |
+
+Tetrahedral is **rejected** on v3d: 16 dependent `texelFetch`es + branching per packed Y fragment
+→ +8 ms p50. Chosen: **HW trilinear with a 33³ (or up to 64³) LUT** — trilinear's interpolation
+error shrinks ~quadratically with grid size, so a denser trilinear LUT replaces tetrahedral's
+accuracy at ~1/7 the cost. Net feature cost ~+1 ms p50, accepted. Test hooks (identity LUT):
+`HYPERCAM_LUT_TEST=1`, `HYPERCAM_LUT_TRILINEAR=1`, `HYPERCAM_LUT_SIZE=N`.
 
 ## Known caveats (documented, accepted)
 

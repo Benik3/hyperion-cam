@@ -168,6 +168,77 @@ namespace
 		}
 	}
 
+	// 3D-LUT GLSL chunk (test mode, see HYPERCAM_LUT_TEST). Full-range BT.601
+	// YUV<->RGB; the exact matrix is irrelevant for correction quality because
+	// the LED calibration measures end-to-end through this same shader.
+	static std::string lutGlslChunk(bool trilinear, int n)
+	{
+		std::string s = "uniform highp sampler3D uLut;\n";
+		s += "const float LUTN = " + std::to_string(n) + ".0;\n";
+		s += R"(
+vec3 yuv2rgb(float y, vec2 c){
+  float u = c.x - 0.5, v = c.y - 0.5;
+  return clamp(vec3(y + 1.402*v, y - 0.344136*u - 0.714136*v, y + 1.772*u), 0.0, 1.0);
+}
+)";
+		if (trilinear)
+		{
+			s += R"(
+vec3 applyLut(vec3 rgb){
+  vec3 coord = rgb * ((LUTN - 1.0) / LUTN) + 0.5 / LUTN;
+  return texture(uLut, coord).rgb;
+}
+)";
+		}
+		else
+		{
+			// Tetrahedral: 4 texel fetches; branch picks the tetrahedron by
+			// sorting the fractional coords.
+			s += R"(
+vec3 applyLut(vec3 rgb){
+  vec3 p = rgb * (LUTN - 1.0);
+  ivec3 i0 = ivec3(min(floor(p), vec3(LUTN - 2.0)));
+  vec3 f = p - vec3(i0);
+  ivec3 i1 = i0 + 1;
+  vec3 c000 = texelFetch(uLut, i0, 0).rgb;
+  vec3 c111 = texelFetch(uLut, i1, 0).rgb;
+  vec3 r;
+  if (f.x >= f.y) {
+    if (f.y >= f.z) {
+      vec3 ca = texelFetch(uLut, ivec3(i1.x, i0.y, i0.z), 0).rgb;
+      vec3 cb = texelFetch(uLut, ivec3(i1.x, i1.y, i0.z), 0).rgb;
+      r = (1.0-f.x)*c000 + (f.x-f.y)*ca + (f.y-f.z)*cb + f.z*c111;
+    } else if (f.x >= f.z) {
+      vec3 ca = texelFetch(uLut, ivec3(i1.x, i0.y, i0.z), 0).rgb;
+      vec3 cb = texelFetch(uLut, ivec3(i1.x, i0.y, i1.z), 0).rgb;
+      r = (1.0-f.x)*c000 + (f.x-f.z)*ca + (f.z-f.y)*cb + f.y*c111;
+    } else {
+      vec3 ca = texelFetch(uLut, ivec3(i0.x, i0.y, i1.z), 0).rgb;
+      vec3 cb = texelFetch(uLut, ivec3(i1.x, i0.y, i1.z), 0).rgb;
+      r = (1.0-f.z)*c000 + (f.z-f.x)*ca + (f.x-f.y)*cb + f.y*c111;
+    }
+  } else {
+    if (f.x >= f.z) {
+      vec3 ca = texelFetch(uLut, ivec3(i0.x, i1.y, i0.z), 0).rgb;
+      vec3 cb = texelFetch(uLut, ivec3(i1.x, i1.y, i0.z), 0).rgb;
+      r = (1.0-f.y)*c000 + (f.y-f.x)*ca + (f.x-f.z)*cb + f.z*c111;
+    } else if (f.y >= f.z) {
+      vec3 ca = texelFetch(uLut, ivec3(i0.x, i1.y, i0.z), 0).rgb;
+      vec3 cb = texelFetch(uLut, ivec3(i0.x, i1.y, i1.z), 0).rgb;
+      r = (1.0-f.y)*c000 + (f.y-f.z)*ca + (f.z-f.x)*cb + f.x*c111;
+    } else {
+      vec3 ca = texelFetch(uLut, ivec3(i0.x, i0.y, i1.z), 0).rgb;
+      vec3 cb = texelFetch(uLut, ivec3(i0.x, i1.y, i1.z), 0).rgb;
+      r = (1.0-f.z)*c000 + (f.z-f.y)*ca + (f.y-f.x)*cb + f.x*c111;
+    }
+  }
+  return r;
+}
+)";
+		}
+		return s;
+	}
+
 	static std::array<float, 9> mat3FromCv64(const cv::Mat &m)
 	{
 		std::array<float, 9> out{};
@@ -284,6 +355,16 @@ struct GpuNv12Transform::Impl
 	uint8_t *lastOutUV{nullptr};
 	bool haveLast{false};
 
+	// 3D-LUT test mode (HYPERCAM_LUT_TEST): identity LUT applied in the packed
+	// fragment shaders to measure the runtime cost of the LED-calibration LUT
+	// (doc/led-lut-calibration.md). Tetrahedral by default,
+	// HYPERCAM_LUT_TRILINEAR=1 for the HW-filtered variant,
+	// HYPERCAM_LUT_SIZE=N (default 17) for size scaling.
+	bool lutEnabled{false};
+	bool lutTrilinear{false};
+	int lutN{17};
+	GLuint texLut{0};
+
 	int srcW{0}, srcH{0};
 	int dstW{0}, dstH{0};
 
@@ -328,6 +409,25 @@ struct GpuNv12Transform::Impl
 		packedUVW = packed ? dstW / 4 : dstW / 2;
 		dmabufEnabled = true;
 		lastPrintNs = monoNs();
+
+		lutEnabled = envEnabled("HYPERCAM_LUT_TEST");
+		lutTrilinear = envEnabled("HYPERCAM_LUT_TRILINEAR");
+		if (const char *ls = std::getenv("HYPERCAM_LUT_SIZE"))
+		{
+			int v = std::atoi(ls);
+			if (v >= 2 && v <= 64)
+				lutN = v;
+		}
+		if (lutEnabled && !packed)
+		{
+			// Only the packed (production) shaders have LUT variants; the PBO
+			// render branch also doesn't bind the extra texture units.
+			std::cerr << "[gpuNv12] WARN: HYPERCAM_LUT_TEST requires the packed readback path; LUT disabled" << std::endl;
+			lutEnabled = false;
+		}
+		if (lutEnabled)
+			std::cerr << "[gpuNv12] LUT test enabled: " << lutN << "^3 "
+					  << (lutTrilinear ? "trilinear" : "tetrahedral") << std::endl;
 
 		// EGL init (headless pbuffer). We try default display first, then fall back
 		// to Mesa surfaceless if the default display can't initialize.
@@ -519,9 +619,57 @@ void main(){
 }
 )";
 
+		// LUT variants of the packed shaders. Both planes need full RGB, so each
+		// pass samples both source textures; the same normalized coordinate
+		// addresses both (resolution-independent; half-texel chroma siting is
+		// below NEAREST quantization).
+		const std::string lutHeader = R"(#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform vec2 uInvTexSize;
+uniform vec3 uDx;
+in vec3 vSrc;
+out vec4 outColor;
+)";
+
+		const std::string fsYPackedLutSrc = lutHeader +
+											"uniform sampler2D uTexC;\n" +
+											lutGlslChunk(lutTrilinear, lutN) + R"(
+float lumOf(vec2 t){
+  vec3 rgb = applyLut(yuv2rgb(texture(uTex, t).r, texture(uTexC, t).rg));
+  return dot(rgb, vec3(0.299, 0.587, 0.114));
+}
+void main(){
+  vec3 s = vSrc;
+  vec2 t0 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t1 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t2 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t3 = (s.xy / s.z + vec2(0.5)) * uInvTexSize;
+  outColor = vec4(lumOf(t0), lumOf(t1), lumOf(t2), lumOf(t3));
+}
+)";
+
+		const std::string fsUVPackedLutSrc = lutHeader +
+											 "uniform sampler2D uTexY2;\n" +
+											 lutGlslChunk(lutTrilinear, lutN) + R"(
+vec2 chromaOf(vec2 t){
+  vec3 rgb = applyLut(yuv2rgb(texture(uTexY2, t).r, texture(uTex, t).rg));
+  return vec2(dot(rgb, vec3(-0.168736, -0.331264, 0.5)) + 0.5,
+              dot(rgb, vec3(0.5, -0.418688, -0.081312)) + 0.5);
+}
+void main(){
+  vec3 s = vSrc;
+  vec2 t0 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
+  vec2 t1 = (s.xy / s.z + vec2(0.5)) * uInvTexSize;
+  outColor = vec4(chromaOf(t0), chromaOf(t1));
+}
+)";
+
 		GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-		GLuint fsY = compileShader(GL_FRAGMENT_SHADER, packed ? fsYPackedSrc : fsYSrc);
-		GLuint fsUV = compileShader(GL_FRAGMENT_SHADER, packed ? fsUVPackedSrc : fsUVSrc);
+		GLuint fsY = compileShader(GL_FRAGMENT_SHADER,
+								   lutEnabled ? fsYPackedLutSrc.c_str() : (packed ? fsYPackedSrc : fsYSrc));
+		GLuint fsUV = compileShader(GL_FRAGMENT_SHADER,
+									lutEnabled ? fsUVPackedLutSrc.c_str() : (packed ? fsUVPackedSrc : fsUVSrc));
 
 		progY = linkProgram(vs, fsY);
 		uMatY = glGetUniformLocation(progY, "uInv");
@@ -555,7 +703,46 @@ void main(){
 					2.f / static_cast<float>(srcW), 2.f / static_cast<float>(srcH));
 		if (packed)
 			glUniform3f(glGetUniformLocation(progUV, "uDx"), invUV[0], invUV[1], invUV[2]);
+		if (lutEnabled)
+		{
+			glUseProgram(progY);
+			glUniform1i(glGetUniformLocation(progY, "uTexC"), 1);
+			glUniform1i(glGetUniformLocation(progY, "uLut"), 2);
+			glUseProgram(progUV);
+			glUniform1i(glGetUniformLocation(progUV, "uTexY2"), 1);
+			glUniform1i(glGetUniformLocation(progUV, "uLut"), 2);
+		}
 		glUseProgram(0);
+
+		if (lutEnabled)
+		{
+			// Identity LUT (test mode): node i holds round(i*255/(N-1)).
+			glGenTextures(1, &texLut);
+			glBindTexture(GL_TEXTURE_3D, texLut);
+			const GLint lutFilter = lutTrilinear ? GL_LINEAR : GL_NEAREST;
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, lutFilter);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, lutFilter);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+			std::vector<uint8_t> lut(static_cast<std::size_t>(lutN) * lutN * lutN * 4u);
+			std::size_t o = 0;
+			for (int b = 0; b < lutN; b++)
+			{
+				for (int g = 0; g < lutN; g++)
+				{
+					for (int r = 0; r < lutN; r++)
+					{
+						lut[o++] = static_cast<uint8_t>((r * 255 + (lutN - 1) / 2) / (lutN - 1));
+						lut[o++] = static_cast<uint8_t>((g * 255 + (lutN - 1) / 2) / (lutN - 1));
+						lut[o++] = static_cast<uint8_t>((b * 255 + (lutN - 1) / 2) / (lutN - 1));
+						lut[o++] = 255;
+					}
+				}
+			}
+			glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, lutN, lutN, lutN, 0, GL_RGBA, GL_UNSIGNED_BYTE, lut.data());
+			glBindTexture(GL_TEXTURE_3D, 0);
+		}
 
 		// Input textures
 		glGenTextures(1, &texY);
@@ -690,6 +877,8 @@ void main(){
 			glDeleteBuffers(1, &pboSyncY);
 		if (pboSyncUV)
 			glDeleteBuffers(1, &pboSyncUV);
+		if (texLut)
+			glDeleteTextures(1, &texLut);
 		if (texY)
 			glDeleteTextures(1, &texY);
 		if (texUV)
@@ -917,6 +1106,13 @@ void main(){
 		glBindFramebuffer(GL_FRAMEBUFFER, fboY);
 		glViewport(0, 0, packedYW, dstH);
 		glUseProgram(progY);
+		if (lutEnabled)
+		{
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, texUV);
+			glActiveTexture(GL_TEXTURE2);
+			glBindTexture(GL_TEXTURE_3D, texLut);
+		}
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texY);
 		glBindVertexArray(vao);
@@ -943,6 +1139,13 @@ void main(){
 		glBindFramebuffer(GL_FRAMEBUFFER, fboUV);
 		glViewport(0, 0, packedUVW, dstH / 2);
 		glUseProgram(progUV);
+		if (lutEnabled)
+		{
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, texY);
+			glActiveTexture(GL_TEXTURE2);
+			glBindTexture(GL_TEXTURE_3D, texLut);
+		}
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texUV);
 		glBindVertexArray(vao);

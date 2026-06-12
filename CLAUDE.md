@@ -68,6 +68,7 @@ sudo systemctl start hypercam                                # restore!
 - **Combined Y+UV single FBO + single readback**: no gain; the apparent per-call fixed cost was GPU-wait, already pipelined. Reverted.
 - **`HYPERCAM_NV12_PBO` (double-buffered readback)**: hangs — process alive but zero frames. Pre-existing, env-gated, unfixed.
 - v3d `glReadPixels` cost scales with **pixel count**, not bytes → that's why RGBA-packing works.
+- **Tetrahedral 3D-LUT in the NV12 shader**: +8 ms p50 (render 1.95→9.5 ms) — 16 dependent `texelFetch`es + branches per packed fragment kill v3d. HW-**trilinear** LUT costs only +1 ms and is size-insensitive (17³≈64³); use a denser grid instead of tetra. Hooks: `HYPERCAM_LUT_TEST/_TRILINEAR/_SIZE`.
 
 ## GL transform details (gpuNv12Transform)
 
