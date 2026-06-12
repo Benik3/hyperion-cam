@@ -78,7 +78,7 @@ add_library(opencvTransform
 
 include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src ${LIBCAMERA_INCLUDE_DIRS} ${LIBEVENT_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 
-add_executable(hyperion-cam src/hyperion-cam.cpp src/event_loop.cpp src/ledCalib.cpp)
+add_executable(hyperion-cam src/hyperion-cam.cpp src/event_loop.cpp src/ledCalib.cpp src/ledCalibFit.cpp)
 
 target_link_libraries(hyperion-cam PkgConfig::LIBEVENT)
 target_link_libraries(hyperion-cam PkgConfig::LIBCAMERA)

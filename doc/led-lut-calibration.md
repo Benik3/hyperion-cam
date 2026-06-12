@@ -97,11 +97,35 @@ value in an 8³ grid + 17-step gray ramp: send solid frame, wait settle (HyperHD
 response, default 700 ms), measure LED ROI (and TV ROI as a darkness sanity check), record same
 stats as Phase 1.
 
-### Phase 3 — fit + LUT build (offline, later milestone)
+### Phase 3 — fit + LUT build (offline; implemented 2026-06-12: `--ledcalib-fit`)
 
-Fit smooth models to both sweeps; for each LUT node (input = runtime grabber value) compute the
-eye-corrected target glow (luminance proportional, anchored at white; hue-true clip when out of
-LED gamut) and invert the LED model → drive value. Output: LUT file for `--lut`.
+`hyperion-cam --ledcalib-fit --calib-out <dir> [--lut-out <file>] [--lut-size 33]` — no camera,
+reads the sweep files, writes `lut.cube` + `fit_report.json`, exits. Math (`src/ledCalibFit.cpp`):
+
+- **Model**: LED light adds linearly → `lin(reading) − lin(baseline) = A · [e_R(S_r), e_G(S_g),
+  e_B(S_b)]` with a 3×3 mixing matrix `A` and monotone per-channel drive curves `e_c`.
+- **Linearization**: camera response treated as a pure power law `x^p`; `p` is self-estimated
+  from the sweep's own additivity (single-channel axis readings must sum to mixed readings in
+  linear space) — no gamma assumption, no TV data needed.
+- **Fit**: alternating least squares — `z = A⁻¹·Y` bucketed by drive level rebuilds the curves,
+  then `A` refit by normal equations; 6 iterations, curves monotonized, `e(255)=1` normalized.
+- **Anchor**: encoded von-Kries gains act as `g^p` in linear light. Gains were measured against
+  *total* light (glow + ambient floor) and the viewer sees total light too, so the white pin and
+  every inversion target include the ambient term: solve `corr·(A·e(S) + ambient) = lin(v)`.
+  Targets below the ambient floor → LEDs off (the glow cannot be darker than the room).
+- **Gamut (hue-true)**: negative `e*` components → blend toward the luminance-matched gray until
+  feasible (desaturation, hue kept); overflow → scale the whole vector (chromaticity kept,
+  luminance reduced); then invert the monotone curves into drive values.
+- **Self-test**: `--ledcalib-fit-selftest` simulates a known chain (different per-channel LED
+  exponents, crosstalk matrix, ambient, measurement noise, encode gamma 2.2), runs the whole
+  pipeline, and closes the loop through the truth chain. Result 2026-06-12: exponent recovered
+  exactly, closed-loop error median 0.10 / p95 0.45 / max 1.9 encoded units at 33³ (max 1.04 at
+  65³), anchor round-trip error 0.05 drive units.
+
+`.cube` contract: standard Resolve format, `LUT_3D_SIZE N`, domain [0,1], red index fastest;
+values = LED drive / 255. Header comments carry fit stats. `fit_report.json` holds `p`, `A`,
+curve tables, residuals, and gamut percentages — check it before trusting a real-data LUT
+(`rel_resid_p95 > 0.10` prints a warning: noisy measurement or model mismatch).
 
 ### Phase 4 — verification (later milestone)
 
@@ -115,13 +139,20 @@ space.
 - `tv_sweep.csv` — `index, mean RGB, temporal-std RGB, spatial-std RGB, frames`
 - `led_sweep.csv` — `drive RGB, led-ROI stats, tv-ROI mean (sanity), frames`
 - `baseline.json` — LEDs-off / TV-black readings
+- `lut.cube`, `fit_report.json` — written by `--ledcalib-fit` (Phase 3)
 
 ## Runtime (later milestone)
 
 The LUT is applied inside the packed NV12 warp fragment shaders: each pass samples both source
-planes (same normalized coordinate addresses Y and UV textures), converts YUV→RGB (full-range
-BT.601 — exact matrix irrelevant, calibration measures end-to-end through this shader), applies
-the LUT, converts back. No LUT enabled → shaders identical to today. `--cpuonly`: no LUT in v1.
+planes (same normalized coordinate addresses Y and UV textures), converts YUV→RGB, applies the
+LUT, converts back. No LUT enabled → shaders identical to today. `--cpuonly`: no LUT in v1.
+
+**Range contract (fixed 2026-06-12):** the ISP emits *limited-range* (SMPTE170M) NV12, while the
+calibration measures in the ISP's full-range RGB-capture space — the LUT's input domain. The
+shader conversion is therefore **limited-range BT.601**; a full-range matrix would compress the
+runtime LUT inputs ~14% relative to the calibrated domain (systematic brightness/color error).
+Residual mismatch between ISP RGB888 output and ISP NV12 + this matrix (rounding, 4:2:0
+subsampling) is accepted.
 
 **Interpolation decision (measured on RPi4, prod config 640×480, 2026-06-12 — overrides the
 earlier tetrahedral preference):**

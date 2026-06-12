@@ -169,16 +169,21 @@ namespace
 	}
 
 	// 3D-LUT GLSL chunk (test mode, see HYPERCAM_LUT_TEST). Full-range BT.601
-	// YUV<->RGB; the exact matrix is irrelevant for correction quality because
-	// the LED calibration measures end-to-end through this same shader.
+	// YUV<->RGB conversion must be LIMITED-range BT.601: the ISP emits
+	// SMPTE170M NV12, and the calibration measures in the ISP's RGB-capture
+	// space. Limited-range here puts the shader's LUT input domain on that
+	// same full-range RGB scale; a full-range matrix would compress LUT
+	// inputs by ~14% vs the calibrated domain.
 	static std::string lutGlslChunk(bool trilinear, int n)
 	{
 		std::string s = "uniform highp sampler3D uLut;\n";
 		s += "const float LUTN = " + std::to_string(n) + ".0;\n";
 		s += R"(
 vec3 yuv2rgb(float y, vec2 c){
-  float u = c.x - 0.5, v = c.y - 0.5;
-  return clamp(vec3(y + 1.402*v, y - 0.344136*u - 0.714136*v, y + 1.772*u), 0.0, 1.0);
+  float yl = (y - 16.0/255.0) * (255.0/219.0);
+  float u = (c.x - 128.0/255.0) * (255.0/224.0);
+  float v = (c.y - 128.0/255.0) * (255.0/224.0);
+  return clamp(vec3(yl + 1.402*v, yl - 0.344136*u - 0.714136*v, yl + 1.772*u), 0.0, 1.0);
 }
 )";
 		if (trilinear)
@@ -637,7 +642,7 @@ out vec4 outColor;
 											lutGlslChunk(lutTrilinear, lutN) + R"(
 float lumOf(vec2 t){
   vec3 rgb = applyLut(yuv2rgb(texture(uTex, t).r, texture(uTexC, t).rg));
-  return dot(rgb, vec3(0.299, 0.587, 0.114));
+  return dot(rgb, vec3(0.299, 0.587, 0.114)) * (219.0/255.0) + 16.0/255.0;
 }
 void main(){
   vec3 s = vSrc;
@@ -654,8 +659,8 @@ void main(){
 											 lutGlslChunk(lutTrilinear, lutN) + R"(
 vec2 chromaOf(vec2 t){
   vec3 rgb = applyLut(yuv2rgb(texture(uTexY2, t).r, texture(uTex, t).rg));
-  return vec2(dot(rgb, vec3(-0.168736, -0.331264, 0.5)) + 0.5,
-              dot(rgb, vec3(0.5, -0.418688, -0.081312)) + 0.5);
+  return vec2(dot(rgb, vec3(-0.168736, -0.331264, 0.5)) * (224.0/255.0) + 128.0/255.0,
+              dot(rgb, vec3(0.5, -0.418688, -0.081312)) * (224.0/255.0) + 128.0/255.0);
 }
 void main(){
   vec3 s = vSrc;

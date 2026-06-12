@@ -30,6 +30,7 @@
 #include "hyperhdr_request_generated.h"
 #include "opencvTransform.h"
 #include "ledCalib.h"
+#include "ledCalibFit.h"
 
 #ifdef HAVE_GPU_TRANSFORM
 #include "gpuNv12Transform.h"
@@ -676,6 +677,10 @@ static std::string _ledCalibPhase;
 static std::string _calibTvRoiStr;
 static std::string _calibLedRoiStr;
 static LedCalibConfig _ledCalibCfg;
+// Phase 3 (offline, no camera): fit sweep measurements -> .cube LUT.
+static bool _ledCalibFit = false;
+static bool _ledCalibFitSelftest = false;
+static LedCalibFitConfig _ledCalibFitCfg;
 
 static void ledCalibSendSolid(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -2551,7 +2556,11 @@ int main(int argc, char *argv[])
 		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
 		("ledcalib-tv-patches", po::value<int>(&_ledCalibCfg.tvPatchCount)->default_value(216), "LED calib: patches in the calib video TV sweep (1-216, must match the generated video)")														  //
 		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(20), "LED calib: frames averaged per measurement")																										  //
-		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(700), "LED calib: settle time before each measurement (HyperHDR smoothing + LED response)");
+		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(700), "LED calib: settle time before each measurement (HyperHDR smoothing + LED response)")									  //
+		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
+		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
+		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
+		("lut-size", po::value<int>(&_ledCalibFitCfg.lutSize)->default_value(33), "LUT grid points per axis for --ledcalib-fit (2-65)");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 
@@ -2614,6 +2623,21 @@ int main(int argc, char *argv[])
 			_autoSatTargetG = tg;
 			_autoSatTargetB = tb;
 		}
+	}
+
+	// Offline LUT fit: no camera, no HyperHDR; runs on the measurement files
+	// and exits before any capture setup.
+	if (_ledCalibFit || _ledCalibFitSelftest)
+	{
+		_ledCalibFitCfg.calibDir = _ledCalibCfg.outDir;
+		_ledCalibFitCfg.verbose = _verbose;
+		if (_ledCalibFitCfg.lutSize < 2 || _ledCalibFitCfg.lutSize > 65)
+		{
+			std::cout << "ERROR: --lut-size must be 2-65" << std::endl;
+			return EXIT_FAILURE;
+		}
+		return _ledCalibFitSelftest ? runLedCalibFitSelftest(_ledCalibFitCfg)
+									: runLedCalibFit(_ledCalibFitCfg);
 	}
 
 	if (_gain < 1.0f)
