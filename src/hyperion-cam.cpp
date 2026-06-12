@@ -29,6 +29,7 @@
 #include "FlatBufferConnection.h"
 #include "hyperhdr_request_generated.h"
 #include "opencvTransform.h"
+#include "ledCalib.h"
 
 #ifdef HAVE_GPU_TRANSFORM
 #include "gpuNv12Transform.h"
@@ -664,6 +665,42 @@ static inline bool flatbufTryConnect()
 	const int64_t delayNs = static_cast<int64_t>(_flatbufReconnectIntervalMs) * 1000000ll;
 	_flatbufNextConnectAttemptNs.store(now + (delayNs > 0 ? delayNs : 0), std::memory_order_release);
 	return false;
+}
+
+// LED 3D-LUT calibration measurement mode (--ledcalib, doc/led-lut-calibration.md).
+// In this mode camera frames are never streamed to HyperHDR; the only flatbuffer
+// traffic is small solid-color frames driving all LEDs to one color.
+static bool _ledCalibMode = false;
+static LedCalib *_ledCalib = nullptr;
+static std::string _ledCalibPhase;
+static std::string _calibTvRoiStr;
+static std::string _calibLedRoiStr;
+static LedCalibConfig _ledCalibCfg;
+
+static void ledCalibSendSolid(uint8_t r, uint8_t g, uint8_t b)
+{
+	// Runs on the flatbuffer send loop. 64x36 solid RGB: HyperHDR averages
+	// regions, so every LED gets the same color regardless of layout.
+	constexpr int kW = 64;
+	constexpr int kH = 36;
+	static std::vector<uint8_t> buf(static_cast<size_t>(kW) * kH * 3u);
+	for (size_t i = 0; i < buf.size(); i += 3)
+	{
+		buf[i] = r;
+		buf[i + 1] = g;
+		buf[i + 2] = b;
+	}
+	if (flatbufTryConnect())
+	{
+		if (_flatbuf.setImage(buf.data(), kW, kH) < 0)
+			std::cout << "ERROR: Flatbuffer write timeout\n";
+	}
+	else
+	{
+		bool expected = false;
+		if (_flatbufConnErrorPrinted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			std::cout << "ERROR: Flatbuffer connection timeout\n";
+	}
 }
 
 // Optional backlog limits (0 = unlimited). When set, frames are dropped early to keep latency bounded.
@@ -2118,6 +2155,19 @@ static void processRequest(Request *request)
 		if (it == _mappedBuffers.end() || it->second.empty())
 			continue;
 
+		if (_ledCalibMode)
+		{
+			// Measurement only: camera frames are never streamed to HyperHDR in
+			// this mode (the calibration engine drives the LEDs with synthetic
+			// solid frames instead).
+			if (_ledCalib)
+			{
+				uint8_t *img = it->second[0].data();
+				_ledCalib->processFrame(img, _imgWidthToSend, _imgHeightToSend, _strideBgr, _bppBgr, _swapRb4);
+			}
+			continue;
+		}
+
 		if (autoCalibEnabled())
 		{
 			const int64_t now = nowNs();
@@ -2413,7 +2463,7 @@ static void processRequest(Request *request)
 	request->reuse(Request::ReuseBuffers);
 
 	// Only update controls per-frame when auto-calibration/focus features are enabled
-	if (autoCalibEnabled() || _autoFocusOnce)
+	if (autoCalibEnabled() || _autoFocusOnce || _ledCalibMode)
 	{
 		ControlList &c = request->controls();
 
@@ -2426,10 +2476,11 @@ static void processRequest(Request *request)
 		if (_gamma > 0.0f)
 			c.set(controls::Gamma, _gamma);
 
-		if (autoCalibEnabled())
+		if (autoCalibEnabled() || _ledCalibMode)
 		{
 			// Program per-request controls so that any updated _gain/_rGain/_bGain take effect
-			// without restarting the camera.
+			// without restarting the camera. For --ledcalib this keeps exposure/WB/gain
+			// locked: the camera must be a consistent comparator across all phases.
 			c.set(controls::AeEnable, false);
 			c.set(controls::AwbEnable, false);
 			c.set(controls::ExposureTime, _shutter);
@@ -2492,7 +2543,15 @@ int main(int argc, char *argv[])
 		("no-realtime", po::bool_switch(&_noRealtime)->default_value(false), "Disable SCHED_FIFO real-time scheduling (still pins threads to cores)")																											  //
 		("rt-priority", po::value<int>(&_rtPriority)->default_value(10), "SCHED_FIFO priority for capture/worker threads (1-99, default 10)")																													  //
 		("latency-stats", po::bool_switch(&_latencyStats)->default_value(false), "Print per-second sensor->send latency percentiles (p50/p95/p99) to stderr")																									  //
-		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread");
+		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread")														  //
+		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value("all"), "One-shot LED 3D-LUT calibration measurement and exit (optional phase: all|white|tv|led; see doc/led-lut-calibration.md)")									  //
+		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h in raw full-frame coords (pick from --imgout without --crop)")																	  //
+		("calib-led-roi", po::value<std::string>(&_calibLedRoiStr), "LED calib: ROI on the LED-lit wall, x,y,w,h in raw full-frame coords")																										  //
+		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
+		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
+		("ledcalib-tv-patches", po::value<int>(&_ledCalibCfg.tvPatchCount)->default_value(216), "LED calib: patches in the calib video TV sweep (1-216, must match the generated video)")														  //
+		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(20), "LED calib: frames averaged per measurement")																										  //
+		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(700), "LED calib: settle time before each measurement (HyperHDR smoothing + LED response)");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 
@@ -2722,6 +2781,78 @@ int main(int argc, char *argv[])
 		_autoCalibNextAllowedNs.store(0, std::memory_order_release);
 	}
 
+	_ledCalibMode = (vm.count("ledcalib") > 0);
+	if (_ledCalibMode)
+	{
+		if (autoCalibEnabled() || _hyperhdrCalib || !_imgOutPath.empty())
+		{
+			std::cout << "ERROR: --ledcalib must be run alone (no --autowb/--autogain/--autocalib/--autosat/--hyperhdr-calib/--imgout)" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (_ledCalibPhase != "all" && _ledCalibPhase != "white" && _ledCalibPhase != "tv" && _ledCalibPhase != "led")
+		{
+			std::cout << "ERROR: --ledcalib phase must be one of: all, white, tv, led" << std::endl;
+			return EXIT_FAILURE;
+		}
+		auto parseRoi = [](const std::string &s, LedCalibRoi &roi)
+		{
+			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
+		};
+		if (!parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi) || !parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi))
+		{
+			std::cout << "ERROR: --ledcalib requires --calib-tv-roi and --calib-led-roi as x,y,w,h" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (_ledCalibCfg.tvPatchCount < 1 || _ledCalibCfg.tvPatchCount > 216)
+		{
+			std::cout << "ERROR: --ledcalib-tv-patches must be 1-216 (3 base-6 index digits)" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (_ledCalibCfg.ledGrid < 2 || _ledCalibCfg.ledGrid > 16)
+		{
+			std::cout << "ERROR: --ledcalib-led-grid must be 2-16" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (_ledCalibCfg.measureFrames < 1)
+			_ledCalibCfg.measureFrames = 1;
+		if (_ledCalibCfg.settleMs < 0)
+			_ledCalibCfg.settleMs = 0;
+		if (!isatty(STDIN_FILENO))
+		{
+			std::cout << "ERROR: --ledcalib is interactive and needs a terminal on stdin" << std::endl;
+			return EXIT_FAILURE;
+		}
+		_ledCalibCfg.phase = _ledCalibPhase;
+		_ledCalibCfg.verbose = _verbose;
+
+		// Measurement uses the raw full frame: RGB capture, no sensor crop, no warp.
+		if (_useNv12 && _verbose)
+			std::cout << "INFO: --ledcalib forces RGB output; ignoring --nv12" << std::endl;
+		_useNv12 = false;
+		if (_transformEn)
+		{
+			std::cout << "INFO: --ledcalib ignores --transform (ROIs are raw-frame rectangles)" << std::endl;
+			_transformEn = false;
+		}
+		if (_cropEn)
+		{
+			std::cout << "INFO: --ledcalib ignores --crop (the LED wall must stay in view)" << std::endl;
+			_cropEn = false;
+		}
+		if (_outputCropEn)
+		{
+			std::cout << "INFO: --ledcalib ignores --output-crop" << std::endl;
+			_outputCropEn = false;
+		}
+
+		_ledCalib = new LedCalib(
+			_ledCalibCfg,
+			[](uint8_t r, uint8_t g, uint8_t b)
+			{ _loopFb.callLater([r, g, b]() { ledCalibSendSolid(r, g, b); }); },
+			[](int code)
+			{ imgOutExit(code); });
+	}
+
 	// Validate mutually exclusive options
 	if (_transformEn && _outputCropEn)
 	{
@@ -2740,7 +2871,7 @@ int main(int argc, char *argv[])
 	}
 
 	// Direct dispatch only in pure streaming mode (see declaration comment).
-	_directDispatch = !_noDirectDispatch && _imgOutPath.empty() && !autoCalibEnabled();
+	_directDispatch = !_noDirectDispatch && _imgOutPath.empty() && !autoCalibEnabled() && !_ledCalibMode;
 
 	// GPU transform is the default when compiled in and --transform is used.
 	// Use --cpuonly to force the CPU path.
@@ -3322,6 +3453,12 @@ int main(int argc, char *argv[])
 
 	// Clean Up
 	_camera->stop();
+	if (_ledCalib)
+	{
+		// Joins the keyboard thread and restores terminal raw mode.
+		delete _ledCalib;
+		_ledCalib = nullptr;
+	}
 	allocator->free(stream);
 	delete allocator;
 	if (_transformation)

@@ -2,7 +2,7 @@
 
 Low-latency camera grabber for HyperHDR ambilight. Captures the TV picture with a Raspberry Pi camera (libcamera), perspective-warps it to a rectangle, and streams it to HyperHDR over a flatbuffer socket. **Latency beats everything**: dropping frames and picture tearing are acceptable if they reduce delay. Targets RPi4 (primary) and RPi5.
 
-Usage/settings docs live in the GitHub Wiki (not in this repo). `doc/` does not exist.
+Usage/settings docs live in the GitHub Wiki (not in this repo). `doc/` holds design docs only (currently `led-lut-calibration.md`).
 
 ## Build
 
@@ -38,6 +38,7 @@ Key files:
 - `src/opencvTransform.cpp` — CPU fallback (`--cpuonly`), precomputed cv::remap maps
 - `src/FlatBufferConnection.cpp` — socket, registration, send, reply drain
 - `src/event_loop.h/.cpp` — libevent loop with small-buffer-optimized `callLater`
+- `src/ledCalib.cpp` — LED 3D-LUT calibration measurement engine (`--ledcalib`; design + procedure in `doc/led-lut-calibration.md`)
 
 ### Latency design decisions (deliberate — don't "fix")
 
@@ -88,3 +89,5 @@ sudo systemctl start hypercam                                # restore!
 ## Calibration modes (one-shot, exit when done)
 
 `--autowb`, `--autogain`, `--autocalib` (WB then gain), `--autosat [R,G,B]`, `--autofocus-once`, `--hyperhdr-calib` (forces NV12 1920x1080 16:9 output, INTER_LINEAR), `--imgout` / `--imgout-crophelp` (still capture; crophelp draws the sensor-crop rectangle). These paths are not latency-critical; they keep the event-loop dispatch and use per-frame camera controls.
+
+`--ledcalib [all|white|tv|led]` — LED 3D-LUT calibration measurement (interactive, needs a tty). Requires `--calib-tv-roi` and `--calib-led-roi` (raw full-frame coords); ignores `--transform`/`--crop`, never streams camera frames (drives LEDs via synthetic solid frames instead). The TV plays a video from `tools/gen-calib-video.py` whose index-code colors/timings must match `src/ledCalib.cpp`. Outputs measurement CSV/JSON into `--calib-out`. Full procedure: `doc/led-lut-calibration.md`.
