@@ -1,4 +1,5 @@
 #include "ledCalib.h"
+#include "ledCalibWeb.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,7 +23,8 @@ namespace
 	// From detecting the post-D3 black (detection lags ~kMinRun frames) to the start
 	// of the patch measurement window: 300 ms nominal gap + 350 ms margin - ~100 ms lag.
 	constexpr int64_t kPatchWindowDelayMs = 550;
-	constexpr int64_t kResendIntervalMs = 100; // keep HyperHDR fed while a color is held
+	constexpr int64_t kResendIntervalMs = 100;	  // keep HyperHDR fed while a color is held
+	constexpr int64_t kWebAckTimeoutMs = 8000;	  // page must ack a patch within this or we abort
 
 	int64_t steadyMs()
 	{
@@ -83,9 +85,11 @@ void LedCalib::Measurement::finish(double mean[2][3], double tstd[2][3], double 
 	active = false;
 }
 
-LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn)
-	: _cfg(cfg), _sendLed(std::move(sendLed)), _exit(std::move(exitFn))
+LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, LedCalibWeb *web)
+	: _cfg(cfg), _sendLed(std::move(sendLed)), _exit(std::move(exitFn)), _web(web)
 {
+	if (_cfg.tvWeb)
+		_cfg.tvPatchCount = _cfg.tvGrid * _cfg.tvGrid * _cfg.tvGrid;
 	_tvSeen.assign(static_cast<size_t>(std::max(1, _cfg.tvPatchCount)), false);
 
 	if (_cfg.phase == "white")
@@ -121,6 +125,16 @@ void LedCalib::keyboardLoop()
 			rawOk = true;
 	}
 
+	// Without a tty (e.g. running under systemd in --calib-tv-web mode) reading
+	// stdin returns EOF immediately and would busy-spin; idle instead and let
+	// the web page provide keys.
+	if (!rawOk)
+	{
+		while (!_kbStop.load(std::memory_order_acquire))
+			usleep(100000);
+		return;
+	}
+
 	while (!_kbStop.load(std::memory_order_acquire))
 	{
 		char c = 0;
@@ -137,8 +151,7 @@ void LedCalib::keyboardLoop()
 		// r == 0: VTIME timeout, loop and re-check the stop flag
 	}
 
-	if (rawOk)
-		tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+	tcsetattr(STDIN_FILENO, TCSANOW, &orig);
 }
 
 void LedCalib::processFrame(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb)
@@ -184,14 +197,26 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		runWhite(tv, led, nowMs);
 		break;
 	case Phase::Tv:
-		runTv(tv, led, nowMs);
+		if (_web)
+			runTvWeb(tv, led, nowMs);
+		else
+			runTv(tv, led, nowMs);
 		break;
 	case Phase::LedBaseline:
 	case Phase::LedSweep:
 		runLed(tv, led, nowMs);
 		break;
 	default:
-		break; // wait states: keys advance
+		// Web wait phases: re-print the URL every few seconds until the user starts.
+		if (_web && !_webStarted && nowMs - _lastUrlPrintMs >= 5000)
+		{
+			_lastUrlPrintMs = nowMs;
+			std::cout << (_web->clientConnected() ? "  page connected — tap 'begin' on the TV"
+												  : "  waiting for the page: open http://<this-pi>:")
+					  << (_web->clientConnected() ? "" : std::to_string(_web->port()) + "/")
+					  << std::endl;
+		}
+		break;
 	}
 }
 
@@ -314,6 +339,16 @@ void LedCalib::setLed(uint8_t r, uint8_t g, uint8_t b, int64_t nowMs)
 	_lastSendMs = nowMs;
 	if (_sendLed)
 		_sendLed(r, g, b);
+	// Keep the Phase 0 page overlay in sync with the LED drive (same seq: no
+	// new ack needed, just a display refresh).
+	if (_web && _phase == Phase::White)
+		_web->setState(255, 255, 255, true, r, g, b, _webSeq);
+}
+
+void LedCalib::webRefreshWhite()
+{
+	if (_web)
+		_web->setState(255, 255, 255, true, _drive[0], _drive[1], _drive[2], _webSeq);
 }
 
 void LedCalib::enterPhase(Phase p, int64_t nowMs)
@@ -322,23 +357,66 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 	switch (p)
 	{
 	case Phase::WhiteWait:
-		std::cout << "\nLedCalib phase 0 (eye anchor): put the calib video on its WHITE section\n"
-					 "(or any full-screen white) and press Enter. 'q' quits." << std::endl;
+		if (_web)
+		{
+			if (_webStarted)
+			{
+				enterPhase(Phase::White, nowMs);
+				return;
+			}
+			std::cout << "\nLedCalib phase 0 (eye anchor): open  http://<this-pi>:" << _web->port()
+					  << "/  in a FULLSCREEN browser on the PC connected to the TV (same HDMI input\n"
+						 "you normally watch), then tap 'begin'. 'q' quits." << std::endl;
+			_lastUrlPrintMs = nowMs;
+		}
+		else
+		{
+			std::cout << "\nLedCalib phase 0 (eye anchor): put the calib video on its WHITE section\n"
+						 "(or any full-screen white) and press Enter. 'q' quits." << std::endl;
+		}
 		break;
 	case Phase::White:
 		setLed(255, 255, 255, nowMs);
 		_whiteAccepted = false;
-		std::cout << "\nAdjust the LED white until the wall glow matches the TV white BY EYE:\n"
-					 "  1/2 = red -/+   3/4 = green -/+   5/6 = blue -/+\n"
+		if (_web)
+		{
+			_webSeq++;
+			webRefreshWhite();
+		}
+		std::cout << "\nAdjust the LED white until the wall glow matches the TV white BY EYE"
+					 << (_web ? " (buttons on the page, or keys here):\n" : ":\n")
+					 << "  1/2 = red -/+   3/4 = green -/+   5/6 = blue -/+\n"
 					 "  0 = toggle step (1/8)   Enter = accept   q = quit" << std::endl;
 		break;
 	case Phase::TvWait:
 		setLed(0, 0, 0, nowMs);
-		std::cout << "\nLedCalib phase 1 (TV sweep): LEDs are now off. Start the calib video\n"
-					 "TV-sweep section, then press Enter. Do not pause/seek during the sweep\n"
-					 "('f' finishes the phase early with the patches decoded so far)." << std::endl;
+		if (_web)
+		{
+			if (_webStarted)
+			{
+				enterPhase(Phase::Tv, nowMs);
+				return;
+			}
+			std::cout << "\nLedCalib phase 1 (TV sweep): open  http://<this-pi>:" << _web->port()
+					  << "/  fullscreen on the TV PC and tap 'begin'." << std::endl;
+			_lastUrlPrintMs = nowMs;
+		}
+		else
+		{
+			std::cout << "\nLedCalib phase 1 (TV sweep): LEDs are now off. Start the calib video\n"
+						 "TV-sweep section, then press Enter. Do not pause/seek during the sweep\n"
+						 "('f' finishes the phase early with the patches decoded so far)." << std::endl;
+		}
 		break;
 	case Phase::Tv:
+		if (_web)
+		{
+			buildTvPlan();
+			_tvPlanPos = 0;
+			std::cout << "TV sweep (web): " << _tvPlan.size() << " patches commanded directly." << std::endl;
+			showTvPatch(nowMs);
+			break;
+		}
 		_tvState = TvState::ScanSync;
 		_runClass = Sym::Other;
 		_runLen = 0;
@@ -347,8 +425,25 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		break;
 	case Phase::LedWait:
 		setLed(0, 0, 0, nowMs);
-		std::cout << "\nLedCalib phase 2 (LED sweep): stop the video / leave the TV showing\n"
-					 "black, keep the room dark, then press Enter." << std::endl;
+		if (_web)
+		{
+			// Drive the TV black through the page; no manual step needed.
+			_webSeq++;
+			_web->setState(0, 0, 0, false, 0, 0, 0, _webSeq);
+			if (_webStarted)
+			{
+				enterPhase(Phase::LedBaseline, nowMs);
+				return;
+			}
+			std::cout << "\nLedCalib phase 2 (LED sweep): open the page fullscreen on the TV PC\n"
+						 "and tap 'begin' (the page will black out the TV)." << std::endl;
+			_lastUrlPrintMs = nowMs;
+		}
+		else
+		{
+			std::cout << "\nLedCalib phase 2 (LED sweep): stop the video / leave the TV showing\n"
+						 "black, keep the room dark, then press Enter." << std::endl;
+		}
 		break;
 	case Phase::LedBaseline:
 		setLed(0, 0, 0, nowMs);
@@ -376,6 +471,13 @@ void LedCalib::handleKeys(int64_t nowMs)
 		std::lock_guard<std::mutex> lock(_kbMutex);
 		keys.swap(_keys);
 	}
+	// The web page is another key source (nudge/accept/start/quit buttons).
+	if (_web)
+	{
+		char c;
+		while (_web->popKey(c))
+			keys.push_back(c);
+	}
 
 	for (char c : keys)
 	{
@@ -386,6 +488,10 @@ void LedCalib::handleKeys(int64_t nowMs)
 			return;
 		}
 		const bool enter = (c == '\n' || c == '\r');
+		// In web mode the page's "begin" button arrives as enter and unlocks
+		// the unattended auto-advance of later wait phases.
+		if (_web && enter && (_phase == Phase::WhiteWait || _phase == Phase::TvWait || _phase == Phase::LedWait))
+			_webStarted = true;
 		switch (_phase)
 		{
 		case Phase::WhiteWait:
@@ -663,6 +769,11 @@ void LedCalib::recordTvPatch(int64_t nowMs)
 		return;
 	}
 
+	// Commanded patch RGB from the base-6 index grid (matches gen-calib-video.py).
+	rec.drive[0] = static_cast<uint8_t>((rec.idx / 36) * 255 / 5);
+	rec.drive[1] = static_cast<uint8_t>(((rec.idx / 6) % 6) * 255 / 5);
+	rec.drive[2] = static_cast<uint8_t>((rec.idx % 6) * 255 / 5);
+
 	if (_tvSeen[static_cast<size_t>(rec.idx)])
 	{
 		std::cout << "TV sweep: patch " << rec.idx << " re-measured; keeping the new reading" << std::endl;
@@ -731,6 +842,74 @@ void LedCalib::buildLedPlan()
 		const uint8_t v = static_cast<uint8_t>(n > 1 ? i * 255 / (n - 1) : 255);
 		_ledPlan.push_back({v, v, v});
 	}
+}
+
+void LedCalib::buildTvPlan()
+{
+	_tvPlan.clear();
+	const int g = std::max(2, _cfg.tvGrid);
+	for (int r = 0; r < g; r++)
+		for (int gg = 0; gg < g; gg++)
+			for (int b = 0; b < g; b++)
+				_tvPlan.push_back({static_cast<uint8_t>(r * 255 / (g - 1)),
+								   static_cast<uint8_t>(gg * 255 / (g - 1)),
+								   static_cast<uint8_t>(b * 255 / (g - 1))});
+}
+
+void LedCalib::showTvPatch(int64_t nowMs)
+{
+	const auto &p = _tvPlan[_tvPlanPos];
+	_tvSeq = ++_webSeq;
+	_web->setState(p[0], p[1], p[2], false, 0, 0, 0, _tvSeq);
+	_tvSettleUntilMs = -1; // wait for the page to ack the paint
+	_tvAckWaitStartMs = nowMs;
+}
+
+void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
+{
+	// Wait for the page to confirm it painted this patch, then settle.
+	if (_tvSettleUntilMs < 0)
+	{
+		if (_web->ackedSeq() >= _tvSeq)
+		{
+			_tvSettleUntilMs = nowMs + _cfg.settleMs;
+		}
+		else if (_tvAckWaitStartMs >= 0 && nowMs - _tvAckWaitStartMs > kWebAckTimeoutMs)
+		{
+			std::cout << "ERROR: web page did not acknowledge patch " << _tvPlanPos << "/" << _tvPlan.size()
+					  << " within " << (kWebAckTimeoutMs / 1000) << "s (page closed or left fullscreen?)" << std::endl;
+			finishAll(EXIT_FAILURE);
+		}
+		return;
+	}
+
+	if (nowMs < _tvSettleUntilMs)
+		return;
+	if (!_meas.active)
+		_meas.start(_cfg.measureFrames);
+	_meas.add(tv, led);
+	if (!_meas.done())
+		return;
+
+	SweepRecord rec;
+	rec.idx = static_cast<int>(_tvPlanPos);
+	rec.frames = _meas.target;
+	rec.drive[0] = _tvPlan[_tvPlanPos][0];
+	rec.drive[1] = _tvPlan[_tvPlanPos][1];
+	rec.drive[2] = _tvPlan[_tvPlanPos][2];
+	_meas.finish(rec.mean, rec.tstd, rec.sstd);
+	_tvRecords.push_back(rec);
+	_tvDecoded++;
+	if ((_tvDecoded % 10) == 0 || _tvDecoded == static_cast<int>(_tvPlan.size()) || _cfg.verbose)
+		std::cout << "TV sweep: " << _tvDecoded << "/" << _tvPlan.size() << " patches" << std::endl;
+
+	_tvPlanPos++;
+	if (_tvPlanPos >= _tvPlan.size())
+	{
+		finishTvPhase(nowMs);
+		return;
+	}
+	showTvPatch(nowMs);
 }
 
 void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
@@ -818,14 +997,15 @@ void LedCalib::writeTvSweep()
 {
 	const std::string path = _cfg.outDir + "/tv_sweep.csv";
 	std::ofstream f(path);
-	f << "index,tv_r,tv_g,tv_b,tv_r_tstd,tv_g_tstd,tv_b_tstd,tv_r_sstd,tv_g_sstd,tv_b_sstd,"
+	f << "index,patch_r,patch_g,patch_b,tv_r,tv_g,tv_b,tv_r_tstd,tv_g_tstd,tv_b_tstd,tv_r_sstd,tv_g_sstd,tv_b_sstd,"
 		 "led_r,led_g,led_b,led_r_tstd,led_g_tstd,led_b_tstd,led_r_sstd,led_g_sstd,led_b_sstd,frames\n";
 	std::vector<SweepRecord> sorted = _tvRecords;
 	std::sort(sorted.begin(), sorted.end(), [](const SweepRecord &a, const SweepRecord &b)
 			  { return a.idx < b.idx; });
 	for (const auto &r : sorted)
 	{
-		f << r.idx;
+		f << r.idx << "," << static_cast<int>(r.drive[0]) << "," << static_cast<int>(r.drive[1])
+		  << "," << static_cast<int>(r.drive[2]);
 		for (int roi = 0; roi < 2; roi++)
 		{
 			for (int c = 0; c < 3; c++)

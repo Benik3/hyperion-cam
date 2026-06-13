@@ -31,6 +31,7 @@
 #include "opencvTransform.h"
 #include "ledCalib.h"
 #include "ledCalibFit.h"
+#include "ledCalibWeb.h"
 
 #ifdef HAVE_GPU_TRANSFORM
 #include "gpuNv12Transform.h"
@@ -673,6 +674,8 @@ static inline bool flatbufTryConnect()
 // traffic is small solid-color frames driving all LEDs to one color.
 static bool _ledCalibMode = false;
 static LedCalib *_ledCalib = nullptr;
+static LedCalibWeb *_ledCalibWeb = nullptr;
+static int _ledCalibWebPort = 8080;
 static std::string _ledCalibPhase;
 static std::string _calibTvRoiStr;
 static std::string _calibLedRoiStr;
@@ -2557,6 +2560,9 @@ int main(int argc, char *argv[])
 		("ledcalib-tv-patches", po::value<int>(&_ledCalibCfg.tvPatchCount)->default_value(216), "LED calib: patches in the calib video TV sweep (1-216, must match the generated video)")														  //
 		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(20), "LED calib: frames averaged per measurement")																										  //
 		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(700), "LED calib: settle time before each measurement (HyperHDR smoothing + LED response)")									  //
+		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page (PC on the TV's HDMI) instead of the calib video")								  //
+		("calib-tv-port", po::value<int>(&_ledCalibWebPort)->default_value(8080), "LED calib: TV web page port (--calib-tv-web)")																					  //
+		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-12)")											  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
@@ -2837,11 +2843,18 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: --ledcalib-led-grid must be 2-16" << std::endl;
 			return EXIT_FAILURE;
 		}
+		if (_ledCalibCfg.tvWeb && (_ledCalibCfg.tvGrid < 2 || _ledCalibCfg.tvGrid > 12))
+		{
+			std::cout << "ERROR: --calib-tv-grid must be 2-12" << std::endl;
+			return EXIT_FAILURE;
+		}
 		if (_ledCalibCfg.measureFrames < 1)
 			_ledCalibCfg.measureFrames = 1;
 		if (_ledCalibCfg.settleMs < 0)
 			_ledCalibCfg.settleMs = 0;
-		if (!isatty(STDIN_FILENO))
+		// The web page supplies the start/nudge keys, so a tty is only required
+		// for the calib-video path.
+		if (!_ledCalibCfg.tvWeb && !isatty(STDIN_FILENO))
 		{
 			std::cout << "ERROR: --ledcalib is interactive and needs a terminal on stdin" << std::endl;
 			return EXIT_FAILURE;
@@ -2869,12 +2882,25 @@ int main(int argc, char *argv[])
 			_outputCropEn = false;
 		}
 
+		if (_ledCalibCfg.tvWeb)
+		{
+			_ledCalibWeb = new LedCalibWeb(_ledCalibWebPort);
+			if (!_ledCalibWeb->start())
+			{
+				std::cout << "ERROR: --ledcalib could not start the TV web server" << std::endl;
+				return EXIT_FAILURE;
+			}
+			std::cout << "INFO: --ledcalib TV web page on port " << _ledCalibWebPort
+					  << " (open http://<this-pi>:" << _ledCalibWebPort << "/ fullscreen on the TV PC)" << std::endl;
+		}
+
 		_ledCalib = new LedCalib(
 			_ledCalibCfg,
 			[](uint8_t r, uint8_t g, uint8_t b)
 			{ _loopFb.callLater([r, g, b]() { ledCalibSendSolid(r, g, b); }); },
 			[](int code)
-			{ imgOutExit(code); });
+			{ imgOutExit(code); },
+			_ledCalibWeb);
 	}
 
 	// Validate mutually exclusive options
@@ -3482,6 +3508,12 @@ int main(int argc, char *argv[])
 		// Joins the keyboard thread and restores terminal raw mode.
 		delete _ledCalib;
 		_ledCalib = nullptr;
+	}
+	if (_ledCalibWeb)
+	{
+		// Stops the HTTP thread (engine is gone, so no more setState calls).
+		delete _ledCalibWeb;
+		_ledCalibWeb = nullptr;
 	}
 	allocator->free(stream);
 	delete allocator;

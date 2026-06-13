@@ -62,7 +62,39 @@ Requirements during the run: dark room, HyperHDR running with the grabber as the
 source, HyperHDR color/smoothing settings in their final state (the LUT bakes them in — change
 them later and the LUT is stale).
 
+### Getting patches onto the TV: web page (default-recommended) vs calib video
+
+Two interchangeable ways to drive the TV. Both feed the same measurement loop; pick at the CLI.
+
+**Web path (`--calib-tv-web`, implemented 2026-06-12).** The grabber runs a tiny HTTP server
+(evhttp, on `--calib-tv-port`, default 8080) and you open `http://<pi>:8080/` in a **fullscreen**
+browser on a PC plugged into the TV. The grabber pushes the fullscreen color over SSE; the page
+paints it, double-`requestAnimationFrame`s to guarantee the frame is up, then `POST /ack?n=seq`.
+The grabber starts its settle timer **on the ack**, so timing covers only TV-internal latency, not
+network/paint lag — and a closed/frozen page is caught by an 8 s ack timeout (clean abort). Because
+the grabber *commands* each patch it never has to decode anything: the index-code state machine and
+the calib video are bypassed entirely. The page also hosts the Phase 0 nudge buttons (below) so the
+whole run is driven from the TV-side PC. `src/ledCalibWeb.cpp`.
+
+**Hard requirement:** plug the calib PC into the **same HDMI input / picture mode** you normally
+watch through. TVs apply different gamma/chroma/processing per input ("PC mode", "Game mode",
+4:4:4 vs 4:2:0); the camera-as-comparator only holds if the calib display path gets the same TV
+processing as runtime content. Browser color management is *not* the main risk (we measure the
+camera's reading of whatever the TV actually shows, not the commanded value) — the per-input TV
+processing difference is.
+
+**Video path (fallback, `tools/gen-calib-video.py`).** For users with no spare PC for the TV: play
+a generated video (USB stick / media app). Each patch is preceded by a base-6 index code the
+grabber decodes from the camera, so it survives pause/seek/frame-rate conversion. Kept working but
+secondary; see "Index coding" below.
+
 ### Phase 0 — eye anchor (interactive, ~2 min)
+
+Web path: page shows white fullscreen with the nudge UI; you stand at the TV and press the page's
+R/G/B ± buttons (or 1/2 3/4 5/6 keys) until the wall glow matches the TV white **by eye**, then
+Accept. Video path: same, but white comes from the calib video and you nudge over SSH/Pi tty.
+Output: anchor drive value, camera readings of both ROIs, von-Kries gains `g_c = tv_c / led_c`.
+All subsequent camera readings of LED light are multiplied by `g`.
 
 TV shows the white section of the calib video. LEDs driven white. The user nudges the LED drive
 RGB from the keyboard until the wall glow looks like the same white as the TV picture, then
@@ -71,11 +103,14 @@ accepts. Output: anchor drive value, camera readings of both ROIs, von-Kries gai
 
 ### Phase 1 — TV sweep (~15 min, unattended)
 
-LEDs forced black. The calib video shows a sequence of full-screen patches (default 6³ grid =
-216), each preceded by an index code so the grabber always knows which patch it is measuring —
-robust against pausing, seeking, TV frame-rate conversion, and dropped camera frames.
+LEDs forced black. A grid of full-screen patches (default 6³ = 216) is shown on the TV.
+Web path (`--calib-tv-web`, grid = `--calib-tv-grid`): the grabber commands each patch, waits for
+the page ack, settles, measures — and records the exact commanded patch RGB alongside the camera
+reading. Video path: the patches come from the calib video, each preceded by an index code so the
+grabber knows which patch it is measuring — robust against pausing, seeking, TV frame-rate
+conversion, and dropped camera frames.
 
-Index coding (defined by `tools/gen-calib-video.py`, decoded by the grabber):
+Index coding (video path only; defined by `tools/gen-calib-video.py`, decoded by the grabber):
 
 ```
 WHITE .4s | BLACK .3s | D1 .4s | BLACK .2s | D2 .4s | BLACK .2s | D3 .4s
@@ -91,7 +126,8 @@ stats that decide whether 8-bit averaging suffices or RAW is needed.
 
 ### Phase 2 — LED sweep (~10–15 min, unattended)
 
-TV shows the black section (or is paused on black). Baseline first: LEDs black, measure both
+TV shows black (web path blacks it out automatically; video path: pause on black). Baseline first:
+LEDs black, measure both
 ROIs (room ambient + TV black-level glow; subtracted later in the fit). Then for each drive
 value in an 8³ grid + 17-step gray ramp: send solid frame, wait settle (HyperHDR smoothing + LED
 response, default 700 ms), measure LED ROI (and TV ROI as a darkness sanity check), record same
@@ -127,6 +163,14 @@ values = LED drive / 255. Header comments carry fit stats. `fit_report.json` hol
 curve tables, residuals, and gamut percentages — check it before trusting a real-data LUT
 (`rel_resid_p95 > 0.10` prints a warning: noisy measurement or model mismatch).
 
+**Open: the v1 fit does not yet consume `tv_sweep.csv`.** The LUT is built entirely from the LED
+sweep + white anchor: the runtime LUT input is the camera's reading of the TV (`v`), and the fit
+maps `v` → eye-corrected target glow → drive without needing the TV's own transfer. The TV sweep is
+still recorded (now with exact commanded patch RGB in web mode) for two later uses: (a) gamut/
+coverage — restrict or weight LUT accuracy to colors the TV actually produces; (b) a richer
+metameric correction than the single white anchor (multiple TV/LED color correspondences → a 3×3
+instead of a diagonal). Until then it is verification/diagnostic data, not a fit input.
+
 ### Phase 4 — verification (later milestone)
 
 Closed-loop spot check on ~20 colors through the built LUT; report residuals in anchored camera
@@ -136,7 +180,7 @@ space.
 
 - `meta.json` — config echo, camera settings, timestamps
 - `white_anchor.json` — drive RGB, both ROI stats, von-Kries gains
-- `tv_sweep.csv` — `index, mean RGB, temporal-std RGB, spatial-std RGB, frames`
+- `tv_sweep.csv` — `index, commanded patch RGB, TV-ROI stats, LED-ROI stats, frames`
 - `led_sweep.csv` — `drive RGB, led-ROI stats, tv-ROI mean (sanity), frames`
 - `baseline.json` — LEDs-off / TV-black readings
 - `lut.cube`, `fit_report.json` — written by `--ledcalib-fit` (Phase 3)

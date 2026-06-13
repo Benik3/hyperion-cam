@@ -1,0 +1,361 @@
+#include "ledCalibWeb.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include <event2/buffer.h>
+#include <event2/event.h>
+#include <event2/http.h>
+#include <event2/keyvalq_struct.h>
+
+namespace
+{
+	// Fullscreen color display + Phase 0 nudge UI. Connects SSE immediately;
+	// fullscreen is requested on the first click (browsers require a gesture).
+	// After each painted frame it double-rAFs, then acks the seq so the grabber
+	// knows the TV actually shows the patch before it starts the settle timer.
+	const char *kPageHtml = R"HTML(<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hyperion-cam LED calib</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:sans-serif}
+  #fill{position:fixed;inset:0;background:#000}
+  #start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+         background:#111;color:#ccc;font-size:4vh;cursor:pointer;z-index:3;text-align:center}
+  #ui{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;
+      background:rgba(0,0,0,.55);color:#fff;padding:2vh 3vh;border-radius:1vh;display:none}
+  #ui.on{display:block}
+  #ui h2{margin:.2em 0;font-size:2.4vh;font-weight:normal}
+  #ui .drv{font-size:3vh;margin:.4em 0;font-variant-numeric:tabular-nums}
+  #ui button{font-size:2.6vh;margin:.2vh;padding:.4em .7em;min-width:2.6em}
+  #ui .accept{background:#2a7;color:#fff;border:none}
+  #st{position:fixed;left:1vh;bottom:1vh;color:#444;font-size:1.6vh;z-index:2}
+</style></head>
+<body>
+<div id="fill"></div>
+<div id="ui">
+  <h2>Match LED white to the TV white, by eye</h2>
+  <div class="drv">R <span id="dr">0</span>&nbsp; G <span id="dg">0</span>&nbsp; B <span id="db">0</span></div>
+  <div>
+    <button onclick="k('r-')">R&minus;</button><button onclick="k('r+')">R+</button>
+    <button onclick="k('g-')">G&minus;</button><button onclick="k('g+')">G+</button>
+    <button onclick="k('b-')">B&minus;</button><button onclick="k('b+')">B+</button>
+  </div>
+  <div style="margin-top:1vh">
+    <button onclick="k('step')">step</button>
+    <button class="accept" onclick="k('accept')">Accept</button>
+  </div>
+  <div style="margin-top:.6em;font-size:1.7vh;color:#aaa">keys: 1/2 3/4 5/6 = R/G/B &minus;/+ , 0 step, Enter accept</div>
+</div>
+<div id="st">connecting&hellip;</div>
+<div id="start" onclick="go()">Tap / click to begin (goes fullscreen)</div>
+<script>
+let lastSeq=-1;
+const fill=document.getElementById('fill'), ui=document.getElementById('ui'), st=document.getElementById('st');
+function k(c){fetch('/key?c='+encodeURIComponent(c),{method:'POST'}).catch(()=>{});}
+function go(){
+  const s=document.getElementById('start'); s.style.display='none';
+  const el=document.documentElement; if(el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+  k('start');
+}
+document.addEventListener('keydown',e=>{
+  const m={'1':'r-','2':'r+','3':'g-','4':'g+','5':'b-','6':'b+','0':'step'};
+  if(e.key in m) k(m[e.key]);
+  else if(e.key==='Enter') k('accept');
+  else if(e.key==='q') k('quit');
+});
+const es=new EventSource('/events');
+es.onopen=()=>{st.textContent='connected';};
+es.onerror=()=>{st.textContent='disconnected — is the grabber running?';};
+es.onmessage=ev=>{
+  let s; try{s=JSON.parse(ev.data);}catch(_){return;}
+  fill.style.background='rgb('+s.r+','+s.g+','+s.b+')';
+  if(s.controls){ui.classList.add('on');
+    document.getElementById('dr').textContent=s.lr;
+    document.getElementById('dg').textContent=s.lg;
+    document.getElementById('db').textContent=s.lb;}
+  else ui.classList.remove('on');
+  st.textContent='patch '+s.seq;
+  if(s.seq!==lastSeq){ lastSeq=s.seq;
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      fetch('/ack?n='+s.seq,{method:'POST'}).catch(()=>{});
+    }));
+  }
+};
+</script>
+</body></html>
+)HTML";
+
+	char keyToken(const std::string &c)
+	{
+		// Map page tokens to the characters the stdin reader / whiteKey expect.
+		if (c == "r-")
+			return '1';
+		if (c == "r+")
+			return '2';
+		if (c == "g-")
+			return '3';
+		if (c == "g+")
+			return '4';
+		if (c == "b-")
+			return '5';
+		if (c == "b+")
+			return '6';
+		if (c == "step")
+			return '0';
+		if (c == "accept" || c == "start")
+			return '\n';
+		if (c == "quit")
+			return 'q';
+		return 0;
+	}
+}
+
+struct LedCalibWeb::Impl
+{
+	int port;
+	event_base *base = nullptr;
+	evhttp *http = nullptr;
+	std::thread th;
+	std::atomic<bool> running{false};
+	std::atomic<bool> startFailed{false};
+
+	// state shown on the page (guarded by sm)
+	std::mutex sm;
+	uint8_t color[3] = {0, 0, 0};
+	uint8_t led[3] = {0, 0, 0};
+	bool controls = false;
+	uint32_t seq = 0;
+	bool dirty = true;
+
+	std::atomic<uint32_t> acked{0};
+	std::atomic<bool> hasClient{false};
+
+	// keys to the engine
+	std::mutex km;
+	std::deque<char> keys;
+
+	// single active SSE stream (last connection wins); base-thread only.
+	evhttp_request *sse = nullptr;
+	event *tick = nullptr;
+	int heartbeatCtr = 0;
+
+	explicit Impl(int p) : port(p) {}
+
+	void pushKey(char c)
+	{
+		if (!c)
+			return;
+		std::lock_guard<std::mutex> lk(km);
+		keys.push_back(c);
+	}
+
+	std::string buildSseData()
+	{
+		std::lock_guard<std::mutex> lk(sm);
+		char buf[160];
+		std::snprintf(buf, sizeof(buf),
+					  "data: {\"r\":%u,\"g\":%u,\"b\":%u,\"seq\":%u,\"controls\":%s,\"lr\":%u,\"lg\":%u,\"lb\":%u}\n\n",
+					  color[0], color[1], color[2], seq, controls ? "true" : "false",
+					  led[0], led[1], led[2]);
+		return buf;
+	}
+};
+
+// ---- evhttp callbacks (all on the base thread) ----
+
+namespace
+{
+	void cbRoot(evhttp_request *req, void *arg)
+	{
+		(void)arg;
+		evbuffer *out = evhttp_request_get_output_buffer(req);
+		evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Type", "text/html; charset=utf-8");
+		evbuffer_add(out, kPageHtml, std::strlen(kPageHtml));
+		evhttp_send_reply(req, 200, "OK", out);
+	}
+
+	void cbClose(evhttp_connection *conn, void *arg)
+	{
+		(void)conn;
+		auto *d = static_cast<LedCalibWeb::Impl *>(arg);
+		d->sse = nullptr;
+		d->hasClient.store(false, std::memory_order_release);
+	}
+
+	void cbEvents(evhttp_request *req, void *arg)
+	{
+		auto *d = static_cast<LedCalibWeb::Impl *>(arg);
+		evkeyvalq *oh = evhttp_request_get_output_headers(req);
+		evhttp_add_header(oh, "Content-Type", "text/event-stream");
+		evhttp_add_header(oh, "Cache-Control", "no-cache");
+		evhttp_add_header(oh, "Connection", "keep-alive");
+
+		// Replace any previous stream (last connection wins).
+		d->sse = req;
+		d->hasClient.store(true, std::memory_order_release);
+		{
+			std::lock_guard<std::mutex> lk(d->sm);
+			d->dirty = true; // push current state on the next tick
+		}
+		evhttp_send_reply_start(req, 200, "OK");
+		evhttp_connection *conn = evhttp_request_get_connection(req);
+		if (conn)
+			evhttp_connection_set_closecb(conn, cbClose, d);
+	}
+
+	void cbAck(evhttp_request *req, void *arg)
+	{
+		auto *d = static_cast<LedCalibWeb::Impl *>(arg);
+		const char *uri = evhttp_request_get_uri(req);
+		evkeyvalq q;
+		uint32_t n = 0;
+		if (uri && evhttp_parse_query(uri, &q) == 0)
+		{
+			const char *v = evhttp_find_header(&q, "n");
+			if (v)
+				n = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+			evhttp_clear_headers(&q);
+		}
+		uint32_t cur = d->acked.load(std::memory_order_relaxed);
+		while (n > cur && !d->acked.compare_exchange_weak(cur, n, std::memory_order_acq_rel))
+		{
+		}
+		evhttp_send_reply(req, 204, "No Content", nullptr);
+	}
+
+	void cbKey(evhttp_request *req, void *arg)
+	{
+		auto *d = static_cast<LedCalibWeb::Impl *>(arg);
+		const char *uri = evhttp_request_get_uri(req);
+		evkeyvalq q;
+		if (uri && evhttp_parse_query(uri, &q) == 0)
+		{
+			const char *v = evhttp_find_header(&q, "c");
+			if (v)
+				d->pushKey(keyToken(v));
+			evhttp_clear_headers(&q);
+		}
+		evhttp_send_reply(req, 204, "No Content", nullptr);
+	}
+
+	void cbTick(evutil_socket_t, short, void *arg)
+	{
+		auto *d = static_cast<LedCalibWeb::Impl *>(arg);
+		if (!d->sse)
+			return;
+		bool dirty;
+		{
+			std::lock_guard<std::mutex> lk(d->sm);
+			dirty = d->dirty;
+			d->dirty = false;
+		}
+		if (dirty)
+		{
+			const std::string msg = d->buildSseData();
+			evbuffer *buf = evbuffer_new();
+			evbuffer_add(buf, msg.data(), msg.size());
+			evhttp_send_reply_chunk(d->sse, buf);
+			evbuffer_free(buf);
+		}
+		// SSE comment heartbeat (~every 5 s) so a dead peer is noticed via closecb.
+		if (++d->heartbeatCtr >= 200)
+		{
+			d->heartbeatCtr = 0;
+			evbuffer *buf = evbuffer_new();
+			const char *hb = ": ping\n\n";
+			evbuffer_add(buf, hb, std::strlen(hb));
+			evhttp_send_reply_chunk(d->sse, buf);
+			evbuffer_free(buf);
+		}
+	}
+}
+
+LedCalibWeb::LedCalibWeb(int port) : _d(std::make_unique<Impl>(port)) {}
+
+LedCalibWeb::~LedCalibWeb()
+{
+	if (_d->running.load(std::memory_order_acquire) && _d->base)
+		event_base_loopbreak(_d->base);
+	if (_d->th.joinable())
+		_d->th.join();
+	if (_d->tick)
+		event_free(_d->tick);
+	if (_d->http)
+		evhttp_free(_d->http);
+	if (_d->base)
+		event_base_free(_d->base);
+}
+
+bool LedCalibWeb::start()
+{
+	_d->base = event_base_new();
+	if (!_d->base)
+	{
+		std::cout << "ERROR: ledcalib web: event_base_new failed" << std::endl;
+		return false;
+	}
+	_d->http = evhttp_new(_d->base);
+	if (!_d->http)
+	{
+		std::cout << "ERROR: ledcalib web: evhttp_new failed" << std::endl;
+		return false;
+	}
+	evhttp_set_cb(_d->http, "/", cbRoot, _d.get());
+	evhttp_set_cb(_d->http, "/events", cbEvents, _d.get());
+	evhttp_set_cb(_d->http, "/ack", cbAck, _d.get());
+	evhttp_set_cb(_d->http, "/key", cbKey, _d.get());
+
+	if (evhttp_bind_socket(_d->http, "0.0.0.0", static_cast<uint16_t>(_d->port)) != 0)
+	{
+		std::cout << "ERROR: ledcalib web: cannot bind port " << _d->port
+				  << " (in use? try --calib-tv-port)" << std::endl;
+		return false;
+	}
+
+	timeval tv{0, 25000}; // 25 ms SSE push cadence
+	_d->tick = event_new(_d->base, -1, EV_PERSIST, cbTick, _d.get());
+	event_add(_d->tick, &tv);
+
+	_d->running.store(true, std::memory_order_release);
+	_d->th = std::thread([this]
+						 { event_base_dispatch(_d->base); _d->running.store(false, std::memory_order_release); });
+	return true;
+}
+
+int LedCalibWeb::port() const { return _d->port; }
+
+void LedCalibWeb::setState(uint8_t r, uint8_t g, uint8_t b, bool showControls,
+						   uint8_t ledR, uint8_t ledG, uint8_t ledB, uint32_t seq)
+{
+	std::lock_guard<std::mutex> lk(_d->sm);
+	_d->color[0] = r;
+	_d->color[1] = g;
+	_d->color[2] = b;
+	_d->led[0] = ledR;
+	_d->led[1] = ledG;
+	_d->led[2] = ledB;
+	_d->controls = showControls;
+	_d->seq = seq;
+	_d->dirty = true;
+}
+
+uint32_t LedCalibWeb::ackedSeq() const { return _d->acked.load(std::memory_order_acquire); }
+
+bool LedCalibWeb::clientConnected() const { return _d->hasClient.load(std::memory_order_acquire); }
+
+bool LedCalibWeb::popKey(char &out)
+{
+	std::lock_guard<std::mutex> lk(_d->km);
+	if (_d->keys.empty())
+		return false;
+	out = _d->keys.front();
+	_d->keys.pop_front();
+	return true;
+}

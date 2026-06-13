@@ -27,6 +27,8 @@ struct LedCalibRoi
 	int h = 0;
 };
 
+class LedCalibWeb;
+
 struct LedCalibConfig
 {
 	LedCalibRoi tvRoi;	// inside the TV picture, raw full-frame coords
@@ -41,6 +43,9 @@ struct LedCalibConfig
 	// Index-code symbol classification (tolerant of an uncalibrated camera).
 	float symbolBlackThresh = 60.0f;   // max channel below this -> BLACK
 	float symbolChannelThresh = 0.55f; // channel "on" when > thresh * max channel
+	// Web TV-patch path (vs the calib-video index-code path).
+	bool tvWeb = false; // drive the TV via the browser page instead of a video
+	int tvGrid = 6;		// TV patch cube grid points per axis (web mode)
 	bool verbose = false;
 };
 
@@ -50,7 +55,9 @@ public:
 	using SendLedFn = std::function<void(uint8_t r, uint8_t g, uint8_t b)>;
 	using ExitFn = std::function<void(int code)>;
 
-	LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn);
+	// web may be null (calib-video path). When set, phases 0/1 are driven
+	// through the page instead of stdin + camera index decoding.
+	LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, LedCalibWeb *web = nullptr);
 	~LedCalib();
 
 	LedCalib(const LedCalib &) = delete;
@@ -148,6 +155,11 @@ private:
 	void onStableSym(Sym s, int64_t nowMs);
 	void recordTvPatch(int64_t nowMs);
 	void finishTvPhase(int64_t nowMs);
+	// Web TV-patch path.
+	void buildTvPlan();
+	void showTvPatch(int64_t nowMs);
+	void runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
+	void webRefreshWhite();
 	void runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
 	void buildLedPlan();
 
@@ -166,11 +178,15 @@ private:
 	LedCalibConfig _cfg;
 	SendLedFn _sendLed;
 	ExitFn _exit;
+	LedCalibWeb *_web = nullptr;
 
 	Phase _phase = Phase::Done;
 	int64_t _t0Ms = -1;
 	bool _finished = false;
 	bool _roiChecked = false;
+	bool _webStarted = false;	// page connected + user pressed start
+	uint32_t _webSeq = 0;		// monotonic display sequence for SSE/ack
+	int64_t _lastUrlPrintMs = 0; // throttle the "open this URL" prompt
 
 	// keyboard reader
 	std::thread _kbThread;
@@ -204,6 +220,13 @@ private:
 	std::vector<SweepRecord> _tvRecords;
 	std::vector<bool> _tvSeen;
 	int _tvDecoded = 0;
+
+	// TV sweep (web path)
+	std::vector<std::array<uint8_t, 3>> _tvPlan;
+	size_t _tvPlanPos = 0;
+	uint32_t _tvSeq = 0;		   // seq of the currently shown patch
+	int64_t _tvAckWaitStartMs = -1;
+	int64_t _tvSettleUntilMs = -1; // <0 = waiting for the page to ack the paint
 
 	// LED sweep
 	std::vector<std::array<uint8_t, 3>> _ledPlan;

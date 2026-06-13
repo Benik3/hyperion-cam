@@ -29,6 +29,9 @@ message(STATUS "    version: ${LIBEVENT_VERSION}")
 message(STATUS "    libraries: ${LIBEVENT_LINK_LIBRARIES}")
 message(STATUS "    include path: ${LIBEVENT_INCLUDE_DIRS}")
 
+# evhttp (LED-calib TV web page) lives in libevent_extra, not _pthreads/_core.
+pkg_check_modules(LIBEVENT_EXTRA REQUIRED IMPORTED_TARGET libevent_extra)
+
 find_package(Threads REQUIRED)
 find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
 find_package(OpenCV REQUIRED)
@@ -78,9 +81,10 @@ add_library(opencvTransform
 
 include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src ${LIBCAMERA_INCLUDE_DIRS} ${LIBEVENT_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 
-add_executable(hyperion-cam src/hyperion-cam.cpp src/event_loop.cpp src/ledCalib.cpp src/ledCalibFit.cpp)
+add_executable(hyperion-cam src/hyperion-cam.cpp src/event_loop.cpp src/ledCalib.cpp src/ledCalibFit.cpp src/ledCalibWeb.cpp)
 
 target_link_libraries(hyperion-cam PkgConfig::LIBEVENT)
+target_link_libraries(hyperion-cam PkgConfig::LIBEVENT_EXTRA)
 target_link_libraries(hyperion-cam PkgConfig::LIBCAMERA)
 target_link_libraries(hyperion-cam ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(hyperion-cam Boost::program_options)
