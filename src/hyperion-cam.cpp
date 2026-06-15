@@ -2661,6 +2661,7 @@ int main(int argc, char *argv[])
 		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page (PC on the TV's HDMI) instead of the calib video")								  //
 		("calib-tv-port", po::value<int>(&_ledCalibWebPort)->default_value(8080), "LED calib: TV web page port (--calib-tv-web)")																					  //
 		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-12)")											  //
+		("calib-no-anchor", po::bool_switch(&_ledCalibCfg.noAnchor)->default_value(false), "LED calib: skip the Phase 0 eye anchor (set white in HyperHDR instead; fit derives it from the sweep whites)") //
 		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //

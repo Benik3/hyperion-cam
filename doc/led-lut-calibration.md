@@ -178,13 +178,25 @@ values = LED drive / 255. Header comments carry fit stats. `fit_report.json` hol
 curve tables, residuals, and gamut percentages — check it before trusting a real-data LUT
 (`rel_resid_p95 > 0.10` prints a warning: noisy measurement or model mismatch).
 
-**Open: the v1 fit does not yet consume `tv_sweep.csv`.** The LUT is built entirely from the LED
-sweep + white anchor: the runtime LUT input is the camera's reading of the TV (`v`), and the fit
-maps `v` → eye-corrected target glow → drive without needing the TV's own transfer. The TV sweep is
-still recorded (now with exact commanded patch RGB in web mode) for two later uses: (a) gamut/
-coverage — restrict or weight LUT accuracy to colors the TV actually produces; (b) a richer
-metameric correction than the single white anchor (multiple TV/LED color correspondences → a 3×3
-instead of a diagonal). Until then it is verification/diagnostic data, not a fit input.
+**The fit consumes `tv_sweep.csv` only for the white point (so far).** The LUT is built from the
+LED sweep + the von-Kries white correction: the runtime LUT input is the camera's reading of the
+TV (`v`), and the fit maps `v` → eye-corrected target glow → drive without needing the TV's full
+transfer. The white correction comes either from `white_anchor.json` (Phase 0) or, when that's
+absent, is **derived from the sweep white points** — `cam_tv_white` (the white TV patch) and
+`cam_led_white` (LED at full drive), see "Skipping the anchor" below. The rest of the TV sweep is
+still unused, kept for two later uses: (a) gamut/coverage weighting; (b) a richer metameric
+correction than the diagonal white (multiple TV/LED correspondences → a 3×3).
+
+### Skipping the anchor (HyperHDR-WB workflow)
+
+If you set white in **HyperHDR's white balance** instead of the Phase 0 eye-match (e.g. to pull
+down bluish LEDs), you can skip Phase 0 with `--calib-no-anchor` (phase `all` starts at the TV
+sweep). `--ledcalib-fit` then derives the von-Kries gains from `cam_tv_white / cam_led_white` in
+the sweeps — identical result, because both establish the same eye-truth at white and the gains
+are what the LUT needs. **Timing rule:** HyperHDR WB (and all HyperHDR colour settings) are frozen
+into the LED sweep, so set your white balance *before* measuring; a big WB change *after* a
+measurement invalidates the LUT (re-measure). The TV sweep must include a near-white patch
+(the default cube grid's (255,255,255) corner does).
 
 ## Gamma ramp probe (`--ledcalib gamma`, implemented 2026-06-15)
 

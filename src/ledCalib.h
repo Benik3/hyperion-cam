@@ -46,6 +46,9 @@ struct LedCalibConfig
 	// Web TV-patch path (vs the calib-video index-code path).
 	bool tvWeb = false; // drive the TV via the browser page instead of a video
 	int tvGrid = 6;		// TV patch cube grid points per axis (web mode)
+	// Skip the Phase 0 eye anchor in phase "all" (HyperHDR-WB workflow): the
+	// white correction is derived from the sweep white points by --ledcalib-fit.
+	bool noAnchor = false;
 	// Gamma ramp probe (phase "gamma"): R/G/B/gray ramps, measure the camera's
 	// response to spot crush/clip. Always web-driven.
 	bool gammaRaw = false; // measure the raw Bayer stream instead of ISP RGB

@@ -100,8 +100,8 @@ LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, 
 		_phase = Phase::LedWait;
 	else if (_cfg.phase == "gamma")
 		_phase = Phase::GammaWait;
-	else
-		_phase = Phase::WhiteWait;
+	else // "all"
+		_phase = _cfg.noAnchor ? Phase::TvWait : Phase::WhiteWait;
 
 	_kbThread = std::thread(&LedCalib::keyboardLoop, this);
 }

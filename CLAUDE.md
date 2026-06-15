@@ -97,4 +97,4 @@ sudo systemctl start hypercam                                # restore!
 
 `--ledcalib gamma` (web-driven) — diagnostic R/G/B/gray ramp probe of the TV→camera transfer (crush/clip/crosstalk); writes `gamma.csv`. `--gamma-raw` reruns it on the sensor Bayer stream (`SBGGR10_CSI2P`, BGGR, MIPI RAW10 unpack + Bayer-plane ROI averaging) → `raw_gamma.csv` for an ISP-vs-RAW A/B at the ends. `--ledcalib-gamma-selftest` unit-tests the RAW10 unpack (no camera). `tools/plot-gamma.py` (stdlib→SVG) overlays both.
 
-`--ledcalib-fit` (offline, no camera) — fit `--calib-out` sweeps into a `.cube` LUT (`src/ledCalibFit.cpp`); `--ledcalib-fit-selftest` verifies the math on a simulated chain. Full procedure + math: `doc/led-lut-calibration.md`.
+`--ledcalib-fit` (offline, no camera) — fit `--calib-out` sweeps into a `.cube` LUT (`src/ledCalibFit.cpp`); `--ledcalib-fit-selftest` verifies the math on a simulated chain. White correction comes from `white_anchor.json` (Phase 0) or, if absent, is derived from the sweep white points (`--calib-no-anchor` + HyperHDR white balance set before measuring). Full procedure + math: `doc/led-lut-calibration.md`.
