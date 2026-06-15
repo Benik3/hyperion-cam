@@ -111,11 +111,17 @@ secondary; see "Index coding" below.
 
 ### Phase 0 — eye anchor (interactive, ~2 min)
 
-Web path: page shows white fullscreen with the nudge UI; you stand at the TV and press the page's
-R/G/B ± buttons (or 1/2 3/4 5/6 keys) until the wall glow matches the TV white **by eye**, then
-Accept. Video path: same, but white comes from the calib video and you nudge over SSH/Pi tty.
-Output: anchor drive value, camera readings of both ROIs, von-Kries gains `g_c = tv_c / led_c`.
-All subsequent camera readings of LED light are multiplied by `g`.
+Web path (needs `--calib-tv-web`): after you tap *begin*, the page shows a **full-screen white**
+field (the anchor overrides the windowed sweep geometry) and the grabber sends a solid white frame
+to HyperHDR, so the LEDs go white. Make the glow match the TV white **either** by tuning
+**HyperHDR's white balance** (recommended if your LEDs are off-white — e.g. bluish) **or** by
+nudging the LED drive with the page's R/G/B ± buttons (or 1/2 3/4 5/6 keys), then tap **Accept** on
+the page (no terminal input). Video path: same, but white comes from the calib video and you nudge
+over SSH/Pi tty. Output: anchor drive value, camera readings of both ROIs, von-Kries gains
+`g_c = tv_c / led_c`. All subsequent camera readings of LED light are multiplied by `g`. (If you
+tune in HyperHDR and leave the drive at full white, the measured anchor captures that — equivalent
+to `--calib-no-anchor` + sweep-derived white, but as a direct measurement.) The TV sweep then
+restores the windowed patch geometry.
 
 TV shows the white section of the calib video. LEDs driven white. The user nudges the LED drive
 RGB from the keyboard until the wall glow looks like the same white as the TV picture, then

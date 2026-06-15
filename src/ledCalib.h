@@ -49,6 +49,11 @@ struct LedCalibConfig
 	// Skip the Phase 0 eye anchor in phase "all" (HyperHDR-WB workflow): the
 	// white correction is derived from the sweep white points by --ledcalib-fit.
 	bool noAnchor = false;
+	// Configured window-patch geometry for the measurement sweeps. The Phase 0
+	// white field overrides this to fullscreen; the sweeps restore it.
+	double patchPct = 10.0;
+	double patchX = -1.0;
+	double patchY = -1.0;
 	// Gamma ramp probe (phase "gamma"): R/G/B/gray ramps, measure the camera's
 	// response to spot crush/clip. Always web-driven.
 	bool gammaRaw = false; // measure the raw Bayer stream instead of ISP RGB

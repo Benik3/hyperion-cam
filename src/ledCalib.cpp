@@ -384,17 +384,20 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		}
 		break;
 	case Phase::White:
-		setLed(255, 255, 255, nowMs);
+		setLed(255, 255, 255, nowMs); // also sends a solid white frame to HyperHDR (LEDs go white)
 		_whiteAccepted = false;
 		if (_web)
 		{
+			// The eye anchor uses a FULL-SCREEN white field (overrides the
+			// windowed sweep geometry) so the whole TV is the white reference.
+			_web->setPatchGeometry(100.0, -1.0, -1.0);
 			_webSeq++;
 			webRefreshWhite();
 		}
-		std::cout << "\nAdjust the LED white until the wall glow matches the TV white BY EYE"
-					 << (_web ? " (buttons on the page, or keys here):\n" : ":\n")
-					 << "  1/2 = red -/+   3/4 = green -/+   5/6 = blue -/+\n"
-					 "  0 = toggle step (1/8)   Enter = accept   q = quit" << std::endl;
+		std::cout << "\nMake the LED glow match the TV white: adjust HyperHDR's white balance\n"
+					 "(LEDs are now driven full white), or nudge here/on the page —\n"
+					 "  1/2 = red -/+   3/4 = green -/+   5/6 = blue -/+\n"
+					 "  0 = toggle step (1/8)   Enter/Accept = confirm   q = quit" << std::endl;
 		break;
 	case Phase::TvWait:
 		setLed(0, 0, 0, nowMs);
@@ -419,6 +422,8 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 	case Phase::Tv:
 		if (_web)
 		{
+			// Restore the windowed measurement geometry (Phase 0 forced fullscreen).
+			_web->setPatchGeometry(_cfg.patchPct, _cfg.patchX, _cfg.patchY);
 			buildTvPlan();
 			_tvPlanPos = 0;
 			std::cout << "TV sweep (web): " << _tvPlan.size() << " patches commanded directly." << std::endl;

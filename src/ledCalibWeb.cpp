@@ -49,7 +49,7 @@ namespace
 <div id="fill"></div>
 <div id="patch"></div>
 <div id="ui">
-  <h2>Match LED white to the TV white, by eye</h2>
+  <h2>Make the LED glow match the TV white — tune HyperHDR white balance, or nudge:</h2>
   <div class="drv">R <span id="dr">0</span>&nbsp; G <span id="dg">0</span>&nbsp; B <span id="db">0</span></div>
   <div>
     <button onclick="k('r-')">R&minus;</button><button onclick="k('r+')">R+</button>

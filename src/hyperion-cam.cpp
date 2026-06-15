@@ -2991,6 +2991,10 @@ int main(int argc, char *argv[])
 		_ledCalibCfg.gammaRefW = _width;
 		_ledCalibCfg.gammaRefH = _height;
 		_ledCalibRaw = gammaMode && _ledCalibCfg.gammaRaw;
+		// Configured sweep window geometry (Phase 0 overrides to fullscreen).
+		_ledCalibCfg.patchPct = _patchSize;
+		_ledCalibCfg.patchX = _patchX;
+		_ledCalibCfg.patchY = _patchY;
 
 		// Measurement uses the raw full frame: RGB capture, no sensor crop, no warp.
 		if (_useNv12 && _verbose)
