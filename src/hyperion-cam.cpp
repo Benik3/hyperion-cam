@@ -688,7 +688,89 @@ static LedCalibConfig _ledCalibCfg;
 static bool _ledCalibFit = false;
 static bool _ledCalibFitSelftest = false;
 static bool _ledCalibGammaSelftest = false;
+static bool _ledCalibWebDryrun = false;
 static LedCalibFitConfig _ledCalibFitCfg;
+
+// Camera-free dry run of the TV web page (--ledcalib-web-dryrun): start the
+// server and cycle demo patches so the page can be checked on the TV PC
+// (fullscreen, colors, Phase 0 nudge UI, ack/SSE) before a real run.
+static int runLedCalibWebDryrun(int port)
+{
+	LedCalibWeb web(port);
+	if (!web.start())
+		return EXIT_FAILURE;
+	std::cout << "ledcalib web dry-run: open  http://<this-pi>:" << port << "/  fullscreen on the\n"
+				 "TV PC and tap 'begin'. Cycling demo patches; Ctrl-C to stop.\n"
+				 "The WHITE step shows the Phase 0 nudge UI — its buttons/keys move the numbers.\n";
+
+	struct Step
+	{
+		uint8_t r, g, b;
+		bool controls;
+		const char *name;
+	};
+	const Step steps[] = {
+		{255, 255, 255, true, "WHITE + Phase-0 nudge UI"},
+		{255, 0, 0, false, "red"},
+		{0, 255, 0, false, "green"},
+		{0, 0, 255, false, "blue"},
+		{128, 128, 128, false, "gray 128"},
+		{255, 255, 255, false, "white"},
+		{0, 0, 0, false, "black"},
+	};
+	const int nSteps = static_cast<int>(sizeof(steps) / sizeof(steps[0]));
+	uint8_t drive[3] = {255, 255, 255};
+	uint32_t seq = 0;
+
+	for (int i = 0;; i = (i + 1) % nSteps)
+	{
+		const Step &s = steps[i];
+		++seq;
+		if (s.controls)
+			web.setState(s.r, s.g, s.b, true, drive[0], drive[1], drive[2], seq);
+		else
+			web.setState(s.r, s.g, s.b, false, 0, 0, 0, seq);
+		std::cout << "show seq=" << seq << "  " << s.name
+				  << "   client=" << (web.clientConnected() ? "yes" : "no")
+				  << " acked=" << web.ackedSeq() << std::endl;
+
+		// Hold ~4 s; live-apply nudges during the controls step so the buttons
+		// visibly move the numbers.
+		for (int t = 0; t < 40; t++)
+		{
+			char c;
+			bool changed = false;
+			while (web.popKey(c))
+			{
+				std::cout << "  key from page: '" << (c == '\n' ? 'N' : c) << "'" << std::endl;
+				if (s.controls)
+				{
+					int ch = -1, dir = 0;
+					switch (c)
+					{
+					case '1': ch = 0; dir = -8; break;
+					case '2': ch = 0; dir = 8; break;
+					case '3': ch = 1; dir = -8; break;
+					case '4': ch = 1; dir = 8; break;
+					case '5': ch = 2; dir = -8; break;
+					case '6': ch = 2; dir = 8; break;
+					default: break;
+					}
+					if (ch >= 0)
+					{
+						int v = std::clamp(static_cast<int>(drive[ch]) + dir, 0, 255);
+						drive[ch] = static_cast<uint8_t>(v);
+						changed = true;
+					}
+				}
+			}
+			if (changed)
+				web.setState(s.r, s.g, s.b, true, drive[0], drive[1], drive[2], seq);
+			usleep(100000);
+		}
+	}
+	return EXIT_SUCCESS;
+}
 
 static void ledCalibSendSolid(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -2574,6 +2656,7 @@ int main(int argc, char *argv[])
 		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
+		("ledcalib-web-dryrun", po::bool_switch(&_ledCalibWebDryrun)->default_value(false), "Start only the TV web page and cycle demo patches (no camera) to test it; uses --calib-tv-port")		  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
@@ -2645,6 +2728,10 @@ int main(int argc, char *argv[])
 	// Offline unit test: RAW10 Bayer unpack/averaging, no camera.
 	if (_ledCalibGammaSelftest)
 		return LedCalib::gammaRawSelftest() ? EXIT_SUCCESS : EXIT_FAILURE;
+
+	// Camera-free web-page dry run.
+	if (_ledCalibWebDryrun)
+		return runLedCalibWebDryrun(_ledCalibWebPort);
 
 	// Offline LUT fit: no camera, no HyperHDR; runs on the measurement files
 	// and exits before any capture setup.

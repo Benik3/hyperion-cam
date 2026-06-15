@@ -76,6 +76,11 @@ the grabber *commands* each patch it never has to decode anything: the index-cod
 the calib video are bypassed entirely. The page also hosts the Phase 0 nudge buttons (below) so the
 whole run is driven from the TV-side PC. `src/ledCalibWeb.cpp`.
 
+**Dry run:** `--ledcalib-web-dryrun --calib-tv-port 8080` starts only the page (no camera, no
+HyperHDR, no service stop needed) and cycles demo patches — WHITE with the Phase 0 nudge UI, then
+R/G/B/gray/white/black. Open it fullscreen on the TV PC to check fullscreen, colors, the nudge
+buttons (they move the numbers), and the SSE/ack connection before committing to a real run.
+
 **Hard requirement:** plug the calib PC into the **same HDMI input / picture mode** you normally
 watch through. TVs apply different gamma/chroma/processing per input ("PC mode", "Game mode",
 4:4:4 vs 4:2:0); the camera-as-comparator only holds if the calib display path gets the same TV
