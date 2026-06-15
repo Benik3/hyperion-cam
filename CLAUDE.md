@@ -95,4 +95,6 @@ sudo systemctl start hypercam                                # restore!
   - `--calib-tv-web` (recommended): grabber runs an evhttp+SSE server (`--calib-tv-port`, default 8080); open `http://<pi>:8080/` fullscreen in a browser on a PC on the TV's HDMI. Grabber commands each patch, page acks after paint → settle starts on ack. Page also hosts Phase 0 nudge UI. No video, no decoder. `src/ledCalibWeb.cpp` (libevent_extra). Requires the calib PC on the SAME TV input/picture-mode as the real source.
   - calib video (fallback, needs a tty): TV plays `tools/gen-calib-video.py` whose index-code colors/timings must match `src/ledCalib.cpp`.
 
+`--ledcalib gamma` (web-driven) — diagnostic R/G/B/gray ramp probe of the TV→camera transfer (crush/clip/crosstalk); writes `gamma.csv`. `--gamma-raw` reruns it on the sensor Bayer stream (`SBGGR10_CSI2P`, BGGR, MIPI RAW10 unpack + Bayer-plane ROI averaging) → `raw_gamma.csv` for an ISP-vs-RAW A/B at the ends. `--ledcalib-gamma-selftest` unit-tests the RAW10 unpack (no camera). `tools/plot-gamma.py` (stdlib→SVG) overlays both.
+
 `--ledcalib-fit` (offline, no camera) — fit `--calib-out` sweeps into a `.cube` LUT (`src/ledCalibFit.cpp`); `--ledcalib-fit-selftest` verifies the math on a simulated chain. Full procedure + math: `doc/led-lut-calibration.md`.

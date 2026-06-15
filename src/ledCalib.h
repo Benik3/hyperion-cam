@@ -46,6 +46,14 @@ struct LedCalibConfig
 	// Web TV-patch path (vs the calib-video index-code path).
 	bool tvWeb = false; // drive the TV via the browser page instead of a video
 	int tvGrid = 6;		// TV patch cube grid points per axis (web mode)
+	// Gamma ramp probe (phase "gamma"): R/G/B/gray ramps, measure the camera's
+	// response to spot crush/clip. Always web-driven.
+	bool gammaRaw = false; // measure the raw Bayer stream instead of ISP RGB
+	int gammaStep = 1;	   // ramp step in code values (1 = every level 0..255)
+	// Resolution the TV ROI was picked at (processed --imgout); used to scale
+	// the ROI into the raw stream's native dimensions for --gamma-raw.
+	int gammaRefW = 0;
+	int gammaRefH = 0;
 	bool verbose = false;
 };
 
@@ -68,6 +76,15 @@ public:
 	/// conventions used by the autocalib paths).
 	void processFrame(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb);
 
+	/// Feed one Bayer frame for the --gamma-raw run. fourcc is the libcamera
+	/// pixel-format fourcc (e.g. SRGGB10_CSI2P) used to pick the unpack +
+	/// Bayer phase. width/height are the raw stream dimensions.
+	void processRawFrame(const uint8_t *img, int width, int height, int strideBytes, uint32_t fourcc);
+
+	/// Unit-test the RAW10 CSI2P unpack + Bayer-plane averaging on a synthetic
+	/// frame. Returns true on PASS. Static so it needs no camera/web.
+	static bool gammaRawSelftest();
+
 private:
 	enum class Phase
 	{
@@ -78,6 +95,8 @@ private:
 		LedWait,
 		LedBaseline,
 		LedSweep,
+		GammaWait,
+		Gamma,
 		Done
 	};
 
@@ -160,6 +179,14 @@ private:
 	void showTvPatch(int64_t nowMs);
 	void runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
 	void webRefreshWhite();
+
+	// Gamma ramp probe.
+	void buildGammaPlan();
+	void showGammaPatch(int64_t nowMs);
+	void runGamma(const RoiSample &meas, int64_t nowMs);
+	void writeGammaCsv();
+	RoiSample sampleRoiBayer(const uint8_t *img, int width, int height, int strideBytes,
+							 uint32_t fourcc, const LedCalibRoi &roi) const;
 	void runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
 	void buildLedPlan();
 
@@ -227,6 +254,21 @@ private:
 	uint32_t _tvSeq = 0;		   // seq of the currently shown patch
 	int64_t _tvAckWaitStartMs = -1;
 	int64_t _tvSettleUntilMs = -1; // <0 = waiting for the page to ack the paint
+
+	// Gamma ramp probe
+	struct GammaRecord
+	{
+		int chan = 0;  // 0=R 1=G 2=B 3=gray
+		int level = 0; // commanded code value 0..255
+		double mean[3] = {};
+		double tstd[3] = {};
+		double sstd[3] = {};
+		int frames = 0;
+	};
+	std::vector<std::array<int, 4>> _gammaPlan; // {chan, r, g, b}
+	std::vector<GammaRecord> _gammaRecords;
+	size_t _gammaPos = 0;
+	LedCalibRoi _rawRoi; // tvRoi scaled into raw-stream coords (--gamma-raw)
 
 	// LED sweep
 	std::vector<std::array<uint8_t, 3>> _ledPlan;

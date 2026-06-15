@@ -171,6 +171,34 @@ coverage — restrict or weight LUT accuracy to colors the TV actually produces;
 metameric correction than the single white anchor (multiple TV/LED color correspondences → a 3×3
 instead of a diagonal). Until then it is verification/diagnostic data, not a fit input.
 
+## Gamma ramp probe (`--ledcalib gamma`, implemented 2026-06-15)
+
+A standalone feasibility/diagnostic step, separate from the full calib: characterize the
+**TV → camera transfer per channel** before trusting the pipeline. Shows R `(v,0,0)`, G, B and
+gray `(v,v,v)` ramps (v = 0..255, `--gamma-step`, default every level → 4×256 patches), measures
+the TV ROI, writes a CSV. Web-driven (requires `--calib-tv-web`); needs only `--calib-tv-roi`.
+Locked exposure, LEDs off — this isolates what the camera sees from the TV. The curve is the
+**combined TV∘camera** response (can't separate them from this test), which is exactly the LUT
+input domain. Reading it: a flat low end = shadow crush, a flat high end = highlight clip,
+per-channel divergence = the camera/TV channel imbalance the LUT must correct; recording all three
+measured components also exposes cross-channel bleed.
+
+**ISP vs RAW (two sequential runs, `--gamma-raw`).** Run 1 measures the ISP-RGB output (8-bit,
+the LUT domain). Run 2 reconfigures the camera to the sensor's Bayer stream and measures the same
+ramp by **Bayer-plane ROI averaging** (no demosaic): unpacks MIPI RAW10 (4 px / 5 bytes) and
+averages the R / (Gr+Gb) / B sites. This sensor negotiates `SBGGR10_CSI2P` 1536×864 (BGGR);
+`libcamera`'s `fourcc()` returns the base `'BG10'`-style code (packing is a modifier), so the
+Bayer-phase table keys on those, defaulting to BGGR. The TV ROI (picked at the processed
+resolution) is scaled into raw coords per-axis — fine because the patch is uniform; the run prints
+the scaled raw ROI to sanity-check it lands on the TV. RAW is 10-bit (0..1023). Purpose: see
+whether RAW preserves gradation at the ends where the ISP crushes/clips — the evidence for the
+still-open "RAW for measurement precision" question. `--ledcalib-gamma-selftest` unit-tests the
+RAW10 unpack + plane averaging on a synthetic frame (no camera).
+
+Output: `gamma.csv` and/or `raw_gamma.csv` (`channel,level,meas RGB,temporal-std,spatial-std,
+frames`). `tools/plot-gamma.py` (stdlib-only → SVG) overlays both runs, normalized, so crush/clip
+and ISP-vs-RAW divergence are visible in a browser on the Pi.
+
 ### Phase 4 — verification (later milestone)
 
 Closed-loop spot check on ~20 colors through the built LUT; report residuals in anchored camera

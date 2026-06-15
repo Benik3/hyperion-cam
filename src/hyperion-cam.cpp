@@ -673,6 +673,10 @@ static inline bool flatbufTryConnect()
 // In this mode camera frames are never streamed to HyperHDR; the only flatbuffer
 // traffic is small solid-color frames driving all LEDs to one color.
 static bool _ledCalibMode = false;
+static bool _ledCalibRaw = false;	   // --ledcalib gamma --gamma-raw: capture Bayer
+static uint32_t _ledCalibRawFourcc = 0; // negotiated raw pixel-format fourcc
+static int _ledCalibRawW = 0;
+static int _ledCalibRawH = 0;
 static LedCalib *_ledCalib = nullptr;
 static LedCalibWeb *_ledCalibWeb = nullptr;
 static int _ledCalibWebPort = 8080;
@@ -683,6 +687,7 @@ static LedCalibConfig _ledCalibCfg;
 // Phase 3 (offline, no camera): fit sweep measurements -> .cube LUT.
 static bool _ledCalibFit = false;
 static bool _ledCalibFitSelftest = false;
+static bool _ledCalibGammaSelftest = false;
 static LedCalibFitConfig _ledCalibFitCfg;
 
 static void ledCalibSendSolid(uint8_t r, uint8_t g, uint8_t b)
@@ -2171,7 +2176,10 @@ static void processRequest(Request *request)
 			if (_ledCalib)
 			{
 				uint8_t *img = it->second[0].data();
-				_ledCalib->processFrame(img, _imgWidthToSend, _imgHeightToSend, _strideBgr, _bppBgr, _swapRb4);
+				if (_ledCalibRaw)
+					_ledCalib->processRawFrame(img, _ledCalibRawW, _ledCalibRawH, _strideBgr, _ledCalibRawFourcc);
+				else
+					_ledCalib->processFrame(img, _imgWidthToSend, _imgHeightToSend, _strideBgr, _bppBgr, _swapRb4);
 			}
 			continue;
 		}
@@ -2563,6 +2571,9 @@ int main(int argc, char *argv[])
 		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page (PC on the TV's HDMI) instead of the calib video")								  //
 		("calib-tv-port", po::value<int>(&_ledCalibWebPort)->default_value(8080), "LED calib: TV web page port (--calib-tv-web)")																					  //
 		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-12)")											  //
+		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
+		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
+		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
@@ -2630,6 +2641,10 @@ int main(int argc, char *argv[])
 			_autoSatTargetB = tb;
 		}
 	}
+
+	// Offline unit test: RAW10 Bayer unpack/averaging, no camera.
+	if (_ledCalibGammaSelftest)
+		return LedCalib::gammaRawSelftest() ? EXIT_SUCCESS : EXIT_FAILURE;
 
 	// Offline LUT fit: no camera, no HyperHDR; runs on the measurement files
 	// and exits before any capture setup.
@@ -2819,18 +2834,24 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: --ledcalib must be run alone (no --autowb/--autogain/--autocalib/--autosat/--hyperhdr-calib/--imgout)" << std::endl;
 			return EXIT_FAILURE;
 		}
-		if (_ledCalibPhase != "all" && _ledCalibPhase != "white" && _ledCalibPhase != "tv" && _ledCalibPhase != "led")
+		if (_ledCalibPhase != "all" && _ledCalibPhase != "white" && _ledCalibPhase != "tv" &&
+			_ledCalibPhase != "led" && _ledCalibPhase != "gamma")
 		{
-			std::cout << "ERROR: --ledcalib phase must be one of: all, white, tv, led" << std::endl;
+			std::cout << "ERROR: --ledcalib phase must be one of: all, white, tv, led, gamma" << std::endl;
 			return EXIT_FAILURE;
 		}
+		const bool gammaMode = (_ledCalibPhase == "gamma");
 		auto parseRoi = [](const std::string &s, LedCalibRoi &roi)
 		{
 			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
 		};
-		if (!parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi) || !parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi))
+		// Gamma probe needs only the TV ROI; the full calib needs both.
+		const bool roiOk = gammaMode ? parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi)
+									 : (parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi) && parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi));
+		if (!roiOk)
 		{
-			std::cout << "ERROR: --ledcalib requires --calib-tv-roi and --calib-led-roi as x,y,w,h" << std::endl;
+			std::cout << "ERROR: --ledcalib requires --calib-tv-roi"
+					  << (gammaMode ? "" : " and --calib-led-roi") << " as x,y,w,h" << std::endl;
 			return EXIT_FAILURE;
 		}
 		if (_ledCalibCfg.tvPatchCount < 1 || _ledCalibCfg.tvPatchCount > 216)
@@ -2859,8 +2880,18 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: --ledcalib is interactive and needs a terminal on stdin" << std::endl;
 			return EXIT_FAILURE;
 		}
+		// Gamma probe is always web-driven (it shows arbitrary ramp patches).
+		if (gammaMode && !_ledCalibCfg.tvWeb)
+		{
+			std::cout << "ERROR: --ledcalib gamma requires --calib-tv-web" << std::endl;
+			return EXIT_FAILURE;
+		}
 		_ledCalibCfg.phase = _ledCalibPhase;
 		_ledCalibCfg.verbose = _verbose;
+		// Raw ROI scaling reference = the resolution the ROI was picked at.
+		_ledCalibCfg.gammaRefW = _width;
+		_ledCalibCfg.gammaRefH = _height;
+		_ledCalibRaw = gammaMode && _ledCalibCfg.gammaRaw;
 
 		// Measurement uses the raw full frame: RGB capture, no sensor crop, no warp.
 		if (_useNv12 && _verbose)
@@ -3018,9 +3049,10 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	// Stream
+	// Stream. The --gamma-raw probe needs the sensor's Bayer stream; everything
+	// else uses the processed Viewfinder stream.
 	std::unique_ptr<CameraConfiguration> config =
-		_camera->generateConfiguration({StreamRole::Viewfinder});
+		_camera->generateConfiguration({_ledCalibRaw ? StreamRole::Raw : StreamRole::Viewfinder});
 
 	// Apply native libcamera transform (rotation + horizontal/vertical flip)
 	if (_rotate != 0 || _hflip || _vflip)
@@ -3100,7 +3132,15 @@ int main(int argc, char *argv[])
 		std::cout << std::endl;
 	}
 
-	if (_useNv12)
+	if (_ledCalibRaw)
+	{
+		// Keep the Raw role's negotiated Bayer format (e.g. SRGGB10_CSI2P);
+		// _bppBgr is irrelevant for the packed raw path.
+		if (_verbose)
+			std::cout << "INFO: --gamma-raw using raw stream format "
+					  << streamConfig.pixelFormat.toString() << std::endl;
+	}
+	else if (_useNv12)
 	{
 		streamConfig.pixelFormat = libcamera::formats::NV12;
 	}
@@ -3192,7 +3232,16 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if (_useNv12)
+	if (_ledCalibRaw)
+	{
+		_ledCalibRawFourcc = streamConfig.pixelFormat.fourcc();
+		_ledCalibRawW = static_cast<int>(streamConfig.size.width);
+		_ledCalibRawH = static_cast<int>(streamConfig.size.height);
+		_strideBgr = static_cast<int>(streamConfig.stride);
+		std::cout << "INFO: --gamma-raw stream " << _ledCalibRawW << "x" << _ledCalibRawH
+				  << " " << streamConfig.pixelFormat.toString() << " stride=" << _strideBgr << std::endl;
+	}
+	else if (_useNv12)
 	{
 		if (streamConfig.pixelFormat != libcamera::formats::NV12)
 		{
