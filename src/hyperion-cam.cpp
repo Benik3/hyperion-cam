@@ -682,8 +682,9 @@ static LedCalibWeb *_ledCalibWeb = nullptr;
 static int _ledCalibWebPort = 8080;
 // Window-patch geometry for the TV page: patch area as % of screen (100 =
 // fullscreen), top-left position in screen-% (<0 = centered). Smaller patches
-// dodge the TV's automatic brightness limiting on bright full-screen fields.
-static double _patchSize = 100.0;
+// dodge the TV's automatic brightness limiting on bright full-screen fields;
+// 10% is the default (set --patch-size 100 for fullscreen).
+static double _patchSize = 10.0;
 static double _patchX = -1.0;
 static double _patchY = -1.0;
 static std::string _ledCalibPhase;
@@ -2664,7 +2665,7 @@ int main(int argc, char *argv[])
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
 		("ledcalib-web-dryrun", po::bool_switch(&_ledCalibWebDryrun)->default_value(false), "Start only the TV web page and cycle demo patches (no camera) to test it; uses --calib-tv-port")		  //
-		("patch-size", po::value<double>(&_patchSize)->default_value(100.0), "TV patch window size as % of screen area (e.g. 10 or 3; 100=fullscreen) to avoid TV auto-dimming")						  //
+		("patch-size", po::value<double>(&_patchSize)->default_value(10.0), "TV patch window size as % of screen area (default 10; 100=fullscreen) to avoid TV auto-dimming")						  //
 		("patch-x", po::value<double>(&_patchX)->default_value(-1.0), "TV patch top-left X in screen-% (<0 = centered)")																			  //
 		("patch-y", po::value<double>(&_patchY)->default_value(-1.0), "TV patch top-left Y in screen-% (<0 = centered)")																			  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //

@@ -79,7 +79,7 @@ whole run is driven from the TV-side PC. `src/ledCalibWeb.cpp`.
 **Window patches (`--patch-size`, `--patch-x`, `--patch-y`).** TVs (especially OLED) dim bright
 full-screen fields via ABL/ASBL, distorting the measurement. `--patch-size` shrinks the patch to
 a percentage of screen **area** (calibration convention; e.g. `10` or `3`) on a black surround;
-default `100` = fullscreen (unchanged behaviour). `--patch-x`/`--patch-y` place the patch top-left
+**default `10`** (set `--patch-size 100` for a fullscreen field). `--patch-x`/`--patch-y` place the patch top-left
 in screen-percent, default centered (`<0`). The box preserves the screen aspect ratio. When a
 window is used you must pick `--calib-tv-roi` **inside** the patch — view it via the dry run +
 `--imgout`. The page's status label (bottom-left) shows `seq: R, G, B` in dim gray to limit OLED
