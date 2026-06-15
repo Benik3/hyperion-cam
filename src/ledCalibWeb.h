@@ -29,6 +29,11 @@ public:
 
 	int port() const;
 
+	/// Window-patch geometry: pct = patch area as a percentage of the screen
+	/// (100 = fullscreen), x/y = top-left position in screen-percent (<0 =
+	/// centered). Constant for a run; call once before/after start().
+	void setPatchGeometry(double pct, double x, double y);
+
 	/// Set what the page shows. seq must strictly increase whenever a new
 	/// patch needs a fresh ack; pass the same seq to merely update the overlay
 	/// (e.g. nudge feedback) without expecting a new ack. showControls draws

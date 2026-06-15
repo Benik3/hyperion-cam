@@ -25,7 +25,9 @@ namespace
 <title>hyperion-cam LED calib</title>
 <style>
   html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:sans-serif}
+  /* #fill is the black surround; #patch is the (optionally windowed) colour. */
   #fill{position:fixed;inset:0;background:#000}
+  #patch{position:fixed;left:0;top:0;width:100%;height:100%;background:#000}
   #start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
          background:#111;color:#ccc;font-size:4vh;cursor:pointer;z-index:3;text-align:center}
   #ui{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;
@@ -35,10 +37,13 @@ namespace
   #ui .drv{font-size:3vh;margin:.4em 0;font-variant-numeric:tabular-nums}
   #ui button{font-size:2.6vh;margin:.2vh;padding:.4em .7em;min-width:2.6em}
   #ui .accept{background:#2a7;color:#fff;border:none}
-  #st{position:fixed;left:1vh;bottom:1vh;color:#444;font-size:1.6vh;z-index:2}
+  /* Dim gray, low luminance, to limit OLED retention of the static label. */
+  #st{position:fixed;left:1vh;bottom:1vh;color:#555;font-size:1.6vh;z-index:2;
+      font-variant-numeric:tabular-nums}
 </style></head>
 <body>
 <div id="fill"></div>
+<div id="patch"></div>
 <div id="ui">
   <h2>Match LED white to the TV white, by eye</h2>
   <div class="drv">R <span id="dr">0</span>&nbsp; G <span id="dg">0</span>&nbsp; B <span id="db">0</span></div>
@@ -56,14 +61,28 @@ namespace
 <div id="st">connecting&hellip;</div>
 <div id="start" onclick="go()">Tap / click to begin (goes fullscreen)</div>
 <script>
-let lastSeq=-1;
-const fill=document.getElementById('fill'), ui=document.getElementById('ui'), st=document.getElementById('st');
+let lastSeq=-1, last=null;
+const fill=document.getElementById('fill'), patch=document.getElementById('patch'),
+      ui=document.getElementById('ui'), st=document.getElementById('st');
 function k(c){fetch('/key?c='+encodeURIComponent(c),{method:'POST'}).catch(()=>{});}
 function go(){
   const s=document.getElementById('start'); s.style.display='none';
   const el=document.documentElement; if(el.requestFullscreen) el.requestFullscreen().catch(()=>{});
   k('start');
 }
+function layout(s){
+  const W=window.innerWidth, H=window.innerHeight;
+  let bw=W, bh=H, lx=0, ly=0;
+  if(s.wp<100){
+    const f=Math.sqrt(Math.max(s.wp,0.01)/100);   // patch area = wp% of screen
+    bw=Math.round(W*f); bh=Math.round(H*f);
+    lx = s.wx<0 ? Math.round((W-bw)/2) : Math.min(Math.max(Math.round(W*s.wx/100),0),W-bw);
+    ly = s.wy<0 ? Math.round((H-bh)/2) : Math.min(Math.max(Math.round(H*s.wy/100),0),H-bh);
+  }
+  patch.style.left=lx+'px'; patch.style.top=ly+'px';
+  patch.style.width=bw+'px'; patch.style.height=bh+'px';
+}
+window.addEventListener('resize',()=>{ if(last) layout(last); });
 document.addEventListener('keydown',e=>{
   const m={'1':'r-','2':'r+','3':'g-','4':'g+','5':'b-','6':'b+','0':'step'};
   if(e.key in m) k(m[e.key]);
@@ -75,13 +94,15 @@ es.onopen=()=>{st.textContent='connected';};
 es.onerror=()=>{st.textContent='disconnected — is the grabber running?';};
 es.onmessage=ev=>{
   let s; try{s=JSON.parse(ev.data);}catch(_){return;}
-  fill.style.background='rgb('+s.r+','+s.g+','+s.b+')';
+  last=s;
+  patch.style.background='rgb('+s.r+','+s.g+','+s.b+')';
+  layout(s);
   if(s.controls){ui.classList.add('on');
     document.getElementById('dr').textContent=s.lr;
     document.getElementById('dg').textContent=s.lg;
     document.getElementById('db').textContent=s.lb;}
   else ui.classList.remove('on');
-  st.textContent='patch '+s.seq;
+  st.textContent=s.seq+': '+s.r+', '+s.g+', '+s.b;
   if(s.seq!==lastSeq){ lastSeq=s.seq;
     requestAnimationFrame(()=>requestAnimationFrame(()=>{
       fetch('/ack?n='+s.seq,{method:'POST'}).catch(()=>{});
@@ -133,6 +154,7 @@ struct LedCalibWeb::Impl
 	bool controls = false;
 	uint32_t seq = 0;
 	bool dirty = true;
+	double wp = 100.0, wx = -1.0, wy = -1.0; // window-patch geometry (% / %pos)
 
 	std::atomic<uint32_t> acked{0};
 	std::atomic<bool> hasClient{false};
@@ -159,11 +181,12 @@ struct LedCalibWeb::Impl
 	std::string buildSseData()
 	{
 		std::lock_guard<std::mutex> lk(sm);
-		char buf[160];
+		char buf[220];
 		std::snprintf(buf, sizeof(buf),
-					  "data: {\"r\":%u,\"g\":%u,\"b\":%u,\"seq\":%u,\"controls\":%s,\"lr\":%u,\"lg\":%u,\"lb\":%u}\n\n",
+					  "data: {\"r\":%u,\"g\":%u,\"b\":%u,\"seq\":%u,\"controls\":%s,\"lr\":%u,\"lg\":%u,\"lb\":%u,"
+					  "\"wp\":%.3f,\"wx\":%.3f,\"wy\":%.3f}\n\n",
 					  color[0], color[1], color[2], seq, controls ? "true" : "false",
-					  led[0], led[1], led[2]);
+					  led[0], led[1], led[2], wp, wx, wy);
 		return buf;
 	}
 };
@@ -330,6 +353,15 @@ bool LedCalibWeb::start()
 }
 
 int LedCalibWeb::port() const { return _d->port; }
+
+void LedCalibWeb::setPatchGeometry(double pct, double x, double y)
+{
+	std::lock_guard<std::mutex> lk(_d->sm);
+	_d->wp = pct;
+	_d->wx = x;
+	_d->wy = y;
+	_d->dirty = true;
+}
 
 void LedCalibWeb::setState(uint8_t r, uint8_t g, uint8_t b, bool showControls,
 						   uint8_t ledR, uint8_t ledG, uint8_t ledB, uint32_t seq)

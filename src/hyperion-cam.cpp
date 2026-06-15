@@ -680,6 +680,12 @@ static int _ledCalibRawH = 0;
 static LedCalib *_ledCalib = nullptr;
 static LedCalibWeb *_ledCalibWeb = nullptr;
 static int _ledCalibWebPort = 8080;
+// Window-patch geometry for the TV page: patch area as % of screen (100 =
+// fullscreen), top-left position in screen-% (<0 = centered). Smaller patches
+// dodge the TV's automatic brightness limiting on bright full-screen fields.
+static double _patchSize = 100.0;
+static double _patchX = -1.0;
+static double _patchY = -1.0;
 static std::string _ledCalibPhase;
 static std::string _calibTvRoiStr;
 static std::string _calibLedRoiStr;
@@ -697,6 +703,7 @@ static LedCalibFitConfig _ledCalibFitCfg;
 static int runLedCalibWebDryrun(int port)
 {
 	LedCalibWeb web(port);
+	web.setPatchGeometry(_patchSize, _patchX, _patchY);
 	if (!web.start())
 		return EXIT_FAILURE;
 	std::cout << "ledcalib web dry-run: open  http://<this-pi>:" << port << "/  fullscreen on the\n"
@@ -2657,6 +2664,9 @@ int main(int argc, char *argv[])
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
 		("ledcalib-web-dryrun", po::bool_switch(&_ledCalibWebDryrun)->default_value(false), "Start only the TV web page and cycle demo patches (no camera) to test it; uses --calib-tv-port")		  //
+		("patch-size", po::value<double>(&_patchSize)->default_value(100.0), "TV patch window size as % of screen area (e.g. 10 or 3; 100=fullscreen) to avoid TV auto-dimming")						  //
+		("patch-x", po::value<double>(&_patchX)->default_value(-1.0), "TV patch top-left X in screen-% (<0 = centered)")																			  //
+		("patch-y", po::value<double>(&_patchY)->default_value(-1.0), "TV patch top-left Y in screen-% (<0 = centered)")																			  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
@@ -3002,14 +3012,23 @@ int main(int argc, char *argv[])
 
 		if (_ledCalibCfg.tvWeb)
 		{
+			if (_patchSize <= 0.0 || _patchSize > 100.0)
+			{
+				std::cout << "ERROR: --patch-size must be in (0, 100]" << std::endl;
+				return EXIT_FAILURE;
+			}
 			_ledCalibWeb = new LedCalibWeb(_ledCalibWebPort);
+			_ledCalibWeb->setPatchGeometry(_patchSize, _patchX, _patchY);
 			if (!_ledCalibWeb->start())
 			{
 				std::cout << "ERROR: --ledcalib could not start the TV web server" << std::endl;
 				return EXIT_FAILURE;
 			}
 			std::cout << "INFO: --ledcalib TV web page on port " << _ledCalibWebPort
-					  << " (open http://<this-pi>:" << _ledCalibWebPort << "/ fullscreen on the TV PC)" << std::endl;
+					  << " (open http://<this-pi>:" << _ledCalibWebPort << "/ fullscreen on the TV PC); patch "
+					  << _patchSize << "% " << (_patchX < 0 && _patchY < 0 ? "centered" : "positioned") << std::endl;
+			if (_patchSize < 100.0)
+				std::cout << "       NOTE: pick --calib-tv-roi INSIDE the patch window (see it via --ledcalib-web-dryrun + --imgout)" << std::endl;
 		}
 
 		_ledCalib = new LedCalib(

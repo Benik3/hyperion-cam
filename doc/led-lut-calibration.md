@@ -76,10 +76,20 @@ the grabber *commands* each patch it never has to decode anything: the index-cod
 the calib video are bypassed entirely. The page also hosts the Phase 0 nudge buttons (below) so the
 whole run is driven from the TV-side PC. `src/ledCalibWeb.cpp`.
 
-**Dry run:** `--ledcalib-web-dryrun --calib-tv-port 8080` starts only the page (no camera, no
-HyperHDR, no service stop needed) and cycles demo patches — WHITE with the Phase 0 nudge UI, then
-R/G/B/gray/white/black. Open it fullscreen on the TV PC to check fullscreen, colors, the nudge
-buttons (they move the numbers), and the SSE/ack connection before committing to a real run.
+**Window patches (`--patch-size`, `--patch-x`, `--patch-y`).** TVs (especially OLED) dim bright
+full-screen fields via ABL/ASBL, distorting the measurement. `--patch-size` shrinks the patch to
+a percentage of screen **area** (calibration convention; e.g. `10` or `3`) on a black surround;
+default `100` = fullscreen (unchanged behaviour). `--patch-x`/`--patch-y` place the patch top-left
+in screen-percent, default centered (`<0`). The box preserves the screen aspect ratio. When a
+window is used you must pick `--calib-tv-roi` **inside** the patch — view it via the dry run +
+`--imgout`. The page's status label (bottom-left) shows `seq: R, G, B` in dim gray to limit OLED
+retention of the static text.
+
+**Dry run:** `--ledcalib-web-dryrun --calib-tv-port 8080 [--patch-size 10 --patch-x .. --patch-y ..]`
+starts only the page (no camera, no HyperHDR, no service stop needed) and cycles demo patches —
+WHITE with the Phase 0 nudge UI, then R/G/B/gray/white/black. Open it fullscreen on the TV PC to
+check the patch size/position, colors, the nudge buttons (they move the numbers), and the SSE/ack
+connection before committing to a real run.
 
 **Hard requirement:** plug the calib PC into the **same HDMI input / picture mode** you normally
 watch through. TVs apply different gamma/chroma/processing per input ("PC mode", "Game mode",
