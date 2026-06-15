@@ -50,6 +50,12 @@ shutter/gain/wbgain from the command line, disables ScalerCrop and perspective t
 streams camera frames to HyperHDR. The only thing it sends to HyperHDR is synthetic solid-color
 frames (small RGB image over the existing flatbuffer socket) to drive all LEDs to one color.
 
+**Picking the TV ROI against the patch window:** the page's start screen (before you tap *begin*)
+draws an **example patch** — a dim-gray rectangle with a red outline — at the exact configured
+size/position. Run the **dry run** (`--ledcalib-web-dryrun`, camera-free) to show it on the TV,
+then capture the camera's view with `hyperion-cam --imgout still.jpg` in another terminal (the dry
+run doesn't hold the camera) and pick `--calib-tv-roi` inside the red rectangle.
+
 The user provides two axis-aligned ROIs in raw full-frame coordinates (pick them from an
 `--imgout` still taken without `--crop`):
 

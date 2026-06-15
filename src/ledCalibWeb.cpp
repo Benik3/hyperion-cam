@@ -28,8 +28,12 @@ namespace
   /* #fill is the black surround; #patch is the (optionally windowed) colour. */
   #fill{position:fixed;inset:0;background:#000}
   #patch{position:fixed;left:0;top:0;width:100%;height:100%;background:#000}
-  #start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-         background:#111;color:#ccc;font-size:4vh;cursor:pointer;z-index:3;text-align:center}
+  #start{position:fixed;inset:0;background:#111;cursor:pointer;z-index:3}
+  /* example patch outline so the user can screenshot (--imgout) and place the ROI */
+  #example{position:absolute;box-sizing:border-box;background:#555;border:4px solid #e22}
+  #starttext{position:absolute;left:0;right:0;top:3vh;text-align:center;color:#ccc;
+             font-size:3vh;padding:0 4vh;text-shadow:0 0 4px #000}
+  #starttext small{font-size:1.9vh;color:#bbb}
   #ui{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;
       background:rgba(0,0,0,.55);color:#fff;padding:2vh 3vh;border-radius:1vh;display:none}
   #ui.on{display:block}
@@ -59,11 +63,18 @@ namespace
   <div style="margin-top:.6em;font-size:1.7vh;color:#aaa">keys: 1/2 3/4 5/6 = R/G/B &minus;/+ , 0 step, Enter accept</div>
 </div>
 <div id="st">connecting&hellip;</div>
-<div id="start" onclick="go()">Tap / click to begin (goes fullscreen)</div>
+<div id="start" onclick="go()">
+  <div id="example"></div>
+  <div id="starttext">Tap / click to begin (goes fullscreen)<br>
+    <small id="starthint">The red rectangle marks the patch area — screenshot it now
+    (run <b>--imgout</b> while this is shown) and set <b>--calib-tv-roi</b> inside it.</small>
+  </div>
+</div>
 <script>
 let lastSeq=-1, last=null;
 const fill=document.getElementById('fill'), patch=document.getElementById('patch'),
-      ui=document.getElementById('ui'), st=document.getElementById('st');
+      ui=document.getElementById('ui'), st=document.getElementById('st'),
+      example=document.getElementById('example'), hint=document.getElementById('starthint');
 function k(c){fetch('/key?c='+encodeURIComponent(c),{method:'POST'}).catch(()=>{});}
 function go(){
   const s=document.getElementById('start'); s.style.display='none';
@@ -79,8 +90,12 @@ function layout(s){
     lx = s.wx<0 ? Math.round((W-bw)/2) : Math.min(Math.max(Math.round(W*s.wx/100),0),W-bw);
     ly = s.wy<0 ? Math.round((H-bh)/2) : Math.min(Math.max(Math.round(H*s.wy/100),0),H-bh);
   }
-  patch.style.left=lx+'px'; patch.style.top=ly+'px';
-  patch.style.width=bw+'px'; patch.style.height=bh+'px';
+  for(const el of [patch, example]){
+    el.style.left=lx+'px'; el.style.top=ly+'px';
+    el.style.width=bw+'px'; el.style.height=bh+'px';
+  }
+  hint.textContent = 'patch '+(s.wp>=100?'fullscreen':s.wp+'% of screen, '+bw+'×'+bh+' px')+
+    ' — screenshot it now (run --imgout) and set --calib-tv-roi inside the red rectangle.';
 }
 window.addEventListener('resize',()=>{ if(last) layout(last); });
 document.addEventListener('keydown',e=>{
