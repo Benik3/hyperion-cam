@@ -1383,6 +1383,14 @@ void LedCalib::finishAll(int code)
 	// Leave the LEDs dark; ignore the resend throttle so this final frame goes out.
 	if (_sendLed)
 		_sendLed(0, 0, 0);
+	// Blank the TV page so it doesn't hold the last (e.g. white) patch on screen.
+	// The web server runs on its own thread; give its SSE tick a moment to push
+	// before we exit and tear it down.
+	if (_web)
+	{
+		_web->setState(0, 0, 0, false, 0, 0, 0, ++_webSeq);
+		usleep(200000);
+	}
 	std::cout << "LedCalib finished (" << (code == EXIT_SUCCESS ? "ok" : "failed") << ")" << std::endl;
 	if (_exit)
 		_exit(code);
