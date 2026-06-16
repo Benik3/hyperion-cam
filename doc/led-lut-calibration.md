@@ -289,9 +289,15 @@ space.
 
 ## Runtime (later milestone)
 
-The LUT is applied inside the packed NV12 warp fragment shaders: each pass samples both source
-planes (same normalized coordinate addresses Y and UV textures), converts YUV→RGB, applies the
-LUT, converts back. No LUT enabled → shaders identical to today. `--cpuonly`: no LUT in v1.
+**Implemented 2026-06-16: `--lut <file.cube>`.** Loads the `.cube` from `--ledcalib-fit` as a
+trilinear RGBA8 3D texture and applies it inside the packed NV12 warp shaders: each pass samples
+both source planes, converts YUV→RGB (limited-range BT.601), **× shading gain (if `--shading-map`)
+then the LUT**, converts back. One unified colour-correction shader composes shading + LUT (sharing
+the single round trip); either may be absent; no flags → shaders identical to today. `--cpuonly`:
+no LUT. Measured cost on the prod config: LUT 1.95→2.88 ms render (p50 16.5→17.3); LUT+shading
+3.08 ms / 17.5 — composing adds only ~0.2 ms over LUT alone. Texture units: Y/UV=0/1, LUT=2,
+shade=3. The env identity-LUT test (`HYPERCAM_LUT_TEST`) still works for profiling when no real
+`--lut` is given.
 
 **Range contract (fixed 2026-06-12):** the ISP emits *limited-range* (SMPTE170M) NV12, while the
 calibration measures in the ISP's full-range RGB-capture space — the LUT's input domain. The

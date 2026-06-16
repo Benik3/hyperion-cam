@@ -10,6 +10,9 @@ public:
 	// shadeGains (optional): per-output-position RGB gain map, shadeU*shadeV*3
 	// floats in [0,1], row-major (cell (i,j) at (j*shadeU+i)*3). Applied in the
 	// warp shader (--shading-map / ALSC correction). nullptr = disabled.
+	// lutRgb (optional): N*N*N*3 floats in [0,1], red index fastest (.cube
+	// order), applied as a trilinear 3D LUT in the warp shader (--lut).
+	// Composes with the shading gain. nullptr = disabled.
 	GpuNv12Transform(int srcWidth,
 					 int srcHeight,
 					 const cv::Point2f *srcQuad,
@@ -18,7 +21,9 @@ public:
 					 bool highQuality = false,
 					 const float *shadeGains = nullptr,
 					 int shadeU = 0,
-					 int shadeV = 0);
+					 int shadeV = 0,
+					 const float *lutRgb = nullptr,
+					 int lutSize = 0);
 	~GpuNv12Transform();
 
 	GpuNv12Transform(const GpuNv12Transform &) = delete;

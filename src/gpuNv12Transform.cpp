@@ -369,6 +369,7 @@ struct GpuNv12Transform::Impl
 	bool lutTrilinear{false};
 	int lutN{17};
 	GLuint texLut{0};
+	std::vector<uint8_t> lutData; // RGBA8 N^3 real LUT (--lut); empty = env identity
 
 	// Shading / ALSC correction (--shading-map): per-output-position RGB gain
 	// applied in the warp shader. Independent of the LUT test above.
@@ -404,9 +405,29 @@ struct GpuNv12Transform::Impl
 	GLint texFilter{GL_NEAREST};
 
 	Impl(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality,
-		 const float *shadeGains, int shadeUin, int shadeVin)
+		 const float *shadeGains, int shadeUin, int shadeVin, const float *lutRgb, int lutSize)
 		: srcW(srcWidth), srcH(srcHeight), dstW(dstWidth), dstH(dstHeight)
 	{
+		// Real 3D LUT from --lut (.cube). Trilinear in production. RGBA8, red
+		// index fastest (matches the runtime sampler + .cube order).
+		if (lutRgb && lutSize >= 2)
+		{
+			lutEnabled = true;
+			lutTrilinear = true;
+			lutN = lutSize;
+			const std::size_t n3 = static_cast<std::size_t>(lutN) * lutN * lutN;
+			lutData.resize(n3 * 4u);
+			for (std::size_t k = 0; k < n3; k++)
+			{
+				for (int c = 0; c < 3; c++)
+				{
+					float v = lutRgb[k * 3 + c];
+					v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+					lutData[k * 4 + c] = static_cast<uint8_t>(v * 255.f + 0.5f);
+				}
+				lutData[k * 4 + 3] = 255;
+			}
+		}
 		// Shading gain map (packed-path only; needs the RGB round-trip shaders).
 		if (shadeGains && shadeUin >= 2 && shadeVin >= 2)
 		{
@@ -441,21 +462,28 @@ struct GpuNv12Transform::Impl
 		dmabufEnabled = true;
 		lastPrintNs = monoNs();
 
-		lutEnabled = envEnabled("HYPERCAM_LUT_TEST");
-		lutTrilinear = envEnabled("HYPERCAM_LUT_TRILINEAR");
-		if (const char *ls = std::getenv("HYPERCAM_LUT_SIZE"))
+		// Env LUT test (identity, for profiling) only if no real --lut was given.
+		if (lutData.empty() && envEnabled("HYPERCAM_LUT_TEST"))
 		{
-			int v = std::atoi(ls);
-			if (v >= 2 && v <= 64)
-				lutN = v;
+			lutEnabled = true;
+			lutTrilinear = envEnabled("HYPERCAM_LUT_TRILINEAR");
+			if (const char *ls = std::getenv("HYPERCAM_LUT_SIZE"))
+			{
+				int v = std::atoi(ls);
+				if (v >= 2 && v <= 64)
+					lutN = v;
+			}
 		}
 		if (lutEnabled && !packed)
 		{
-			// Only the packed (production) shaders have LUT variants; the PBO
-			// render branch also doesn't bind the extra texture units.
-			std::cerr << "[gpuNv12] WARN: HYPERCAM_LUT_TEST requires the packed readback path; LUT disabled" << std::endl;
+			// Only the packed shaders have the LUT round trip; the PBO render
+			// branch also doesn't bind the extra texture units.
+			std::cerr << "[gpuNv12] WARN: 3D LUT requires the packed readback path; LUT disabled" << std::endl;
 			lutEnabled = false;
+			lutData.clear();
 		}
+		if (lutEnabled && !lutData.empty())
+			std::cerr << "[gpuNv12] LUT enabled: " << lutN << "^3 trilinear (from file)" << std::endl;
 		if (lutEnabled)
 			std::cerr << "[gpuNv12] LUT test enabled: " << lutN << "^3 "
 					  << (lutTrilinear ? "trilinear" : "tetrahedral") << std::endl;
@@ -672,96 +700,60 @@ in vec3 vSrc;
 out vec4 outColor;
 )";
 
-		const std::string fsYPackedLutSrc = lutHeader +
-											"uniform sampler2D uTexC;\n" +
-											lutGlslChunk(lutTrilinear, lutN) + R"(
-float lumOf(vec2 t){
-  vec3 rgb = applyLut(yuv2rgb(texture(uTex, t).r, texture(uTexC, t).rg));
-  return dot(rgb, vec3(0.299, 0.587, 0.114)) * (219.0/255.0) + 16.0/255.0;
-}
-void main(){
-  vec3 s = vSrc;
-  vec2 t0 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
-  vec2 t1 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
-  vec2 t2 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
-  vec2 t3 = (s.xy / s.z + vec2(0.5)) * uInvTexSize;
-  outColor = vec4(lumOf(t0), lumOf(t1), lumOf(t2), lumOf(t3));
-}
-)";
-
-		const std::string fsUVPackedLutSrc = lutHeader +
-											 "uniform sampler2D uTexY2;\n" +
-											 lutGlslChunk(lutTrilinear, lutN) + R"(
-vec2 chromaOf(vec2 t){
-  vec3 rgb = applyLut(yuv2rgb(texture(uTexY2, t).r, texture(uTex, t).rg));
-  return vec2(dot(rgb, vec3(-0.168736, -0.331264, 0.5)) * (224.0/255.0) + 128.0/255.0,
-              dot(rgb, vec3(0.5, -0.418688, -0.081312)) * (224.0/255.0) + 128.0/255.0);
-}
-void main(){
-  vec3 s = vSrc;
-  vec2 t0 = (s.xy / s.z + vec2(0.5)) * uInvTexSize; s += uDx;
-  vec2 t1 = (s.xy / s.z + vec2(0.5)) * uInvTexSize;
-  outColor = vec4(chromaOf(t0), chromaOf(t1));
-}
-)";
-
-		// Shading variants: per-output-position RGB gain (2D map sampled by
-		// gl_FragCoord) applied via a limited-range YUV<->RGB round trip. The
-		// gain is sampled once per fragment (shading is smooth across 4 lanes).
-		const std::string fsYPackedShadeSrc = lutHeader +
-											  "uniform sampler2D uTexC;\nuniform sampler2D uShade;\nuniform vec2 uFboSize;\n" + R"(
+		// Unified colour-correction shader: warp + limited-range YUV<->RGB round
+		// trip, optionally x shading gain (2D map by output pos) then 3D LUT.
+		// Composes both; either may be absent. Sampled per lane (gain once per
+		// fragment, smooth). uTex=0, other plane=1, uLut=2, uShade=3.
+		const std::string yuvGlsl = R"(
 vec3 yuv2rgb(float y, vec2 c){
   float yl=(y-16.0/255.0)*(255.0/219.0);
   float u=(c.x-128.0/255.0)*(255.0/224.0), v=(c.y-128.0/255.0)*(255.0/224.0);
   return vec3(yl+1.402*v, yl-0.344136*u-0.714136*v, yl+1.772*u);
 }
-float lumOf(vec2 t, vec3 g){
-  vec3 rgb=clamp(yuv2rgb(texture(uTex,t).r, texture(uTexC,t).rg)*g, 0.0, 1.0);
-  return dot(rgb, vec3(0.299,0.587,0.114))*(219.0/255.0)+16.0/255.0;
-}
-void main(){
-  vec3 g = texture(uShade, gl_FragCoord.xy/uFboSize).rgb;
-  vec3 s=vSrc;
-  vec2 t0=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
-  vec2 t1=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
-  vec2 t2=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
-  vec2 t3=(s.xy/s.z+vec2(0.5))*uInvTexSize;
-  outColor=vec4(lumOf(t0,g),lumOf(t1,g),lumOf(t2,g),lumOf(t3,g));
-}
 )";
-		const std::string fsUVPackedShadeSrc = lutHeader +
-											   "uniform sampler2D uTexY2;\nuniform sampler2D uShade;\nuniform vec2 uFboSize;\n" + R"(
-vec3 yuv2rgb(float y, vec2 c){
-  float yl=(y-16.0/255.0)*(255.0/219.0);
-  float u=(c.x-128.0/255.0)*(255.0/224.0), v=(c.y-128.0/255.0)*(255.0/224.0);
-  return vec3(yl+1.402*v, yl-0.344136*u-0.714136*v, yl+1.772*u);
-}
-vec2 chromaOf(vec2 t, vec3 g){
-  vec3 rgb=clamp(yuv2rgb(texture(uTexY2,t).r, texture(uTex,t).rg)*g, 0.0, 1.0);
-  return vec2(dot(rgb, vec3(-0.168736,-0.331264,0.5))*(224.0/255.0)+128.0/255.0,
-              dot(rgb, vec3(0.5,-0.418688,-0.081312))*(224.0/255.0)+128.0/255.0);
-}
-void main(){
-  vec3 g = texture(uShade, gl_FragCoord.xy/uFboSize).rgb;
-  vec3 s=vSrc;
-  vec2 t0=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
-  vec2 t1=(s.xy/s.z+vec2(0.5))*uInvTexSize;
-  outColor=vec4(chromaOf(t0,g),chromaOf(t1,g));
-}
-)";
+		auto buildColor = [&](bool isY) -> std::string
+		{
+			const char *primary = isY ? "uTex" : "uTexY2";
+			const char *other = isY ? "uTexC" : "uTex";
+			std::string s = lutHeader;
+			s += isY ? "uniform sampler2D uTexC;\n" : "uniform sampler2D uTexY2;\n";
+			if (shadeEnabled)
+				s += "uniform sampler2D uShade;\nuniform vec2 uFboSize;\n";
+			if (lutEnabled)
+				s += lutGlslChunk(lutTrilinear, lutN); // uLut + yuv2rgb + applyLut
+			else
+				s += yuvGlsl;
+			s += isY ? "float colorOf(vec2 t, vec3 g){\n" : "vec2 colorOf(vec2 t, vec3 g){\n";
+			s += std::string("  vec3 rgb = yuv2rgb(texture(") + primary + ", t).r, texture(" + other + ", t).rg);\n";
+			if (shadeEnabled)
+				s += "  rgb *= g;\n";
+			s += "  rgb = clamp(rgb, 0.0, 1.0);\n";
+			if (lutEnabled)
+				s += "  rgb = applyLut(rgb);\n";
+			s += isY ? "  return dot(rgb, vec3(0.299,0.587,0.114))*(219.0/255.0)+16.0/255.0;\n}\n"
+					 : "  return vec2(dot(rgb, vec3(-0.168736,-0.331264,0.5))*(224.0/255.0)+128.0/255.0,\n"
+					   "              dot(rgb, vec3(0.5,-0.418688,-0.081312))*(224.0/255.0)+128.0/255.0);\n}\n";
+			s += "void main(){\n";
+			s += shadeEnabled ? "  vec3 g = texture(uShade, gl_FragCoord.xy/uFboSize).rgb;\n" : "  vec3 g = vec3(1.0);\n";
+			s += "  vec3 s = vSrc;\n";
+			if (isY)
+				s += "  vec2 t0=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;\n"
+					 "  vec2 t1=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;\n"
+					 "  vec2 t2=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;\n"
+					 "  vec2 t3=(s.xy/s.z+vec2(0.5))*uInvTexSize;\n"
+					 "  outColor=vec4(colorOf(t0,g),colorOf(t1,g),colorOf(t2,g),colorOf(t3,g));\n}\n";
+			else
+				s += "  vec2 t0=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;\n"
+					 "  vec2 t1=(s.xy/s.z+vec2(0.5))*uInvTexSize;\n"
+					 "  outColor=vec4(colorOf(t0,g),colorOf(t1,g));\n}\n";
+			return s;
+		};
 
-		const char *ySrc = packed ? fsYPackedSrc : fsYSrc;
-		const char *uvSrc = packed ? fsUVPackedSrc : fsUVSrc;
-		if (lutEnabled)
-		{
-			ySrc = fsYPackedLutSrc.c_str();
-			uvSrc = fsUVPackedLutSrc.c_str();
-		}
-		else if (shadeEnabled)
-		{
-			ySrc = fsYPackedShadeSrc.c_str();
-			uvSrc = fsUVPackedShadeSrc.c_str();
-		}
+		const bool colorOp = lutEnabled || shadeEnabled;
+		const std::string ySrcStr = colorOp ? buildColor(true) : "";
+		const std::string uvSrcStr = colorOp ? buildColor(false) : "";
+		const char *ySrc = colorOp ? ySrcStr.c_str() : (packed ? fsYPackedSrc : fsYSrc);
+		const char *uvSrc = colorOp ? uvSrcStr.c_str() : (packed ? fsUVPackedSrc : fsUVSrc);
 		GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
 		GLuint fsY = compileShader(GL_FRAGMENT_SHADER, ySrc);
 		GLuint fsUV = compileShader(GL_FRAGMENT_SHADER, uvSrc);
@@ -798,27 +790,29 @@ void main(){
 					2.f / static_cast<float>(srcW), 2.f / static_cast<float>(srcH));
 		if (packed)
 			glUniform3f(glGetUniformLocation(progUV, "uDx"), invUV[0], invUV[1], invUV[2]);
-		if (lutEnabled)
+		if (colorOp)
 		{
+			// uTex=0, other plane=1, uLut=2, uShade=3.
 			glUseProgram(progY);
 			glUniform1i(glGetUniformLocation(progY, "uTexC"), 1);
-			glUniform1i(glGetUniformLocation(progY, "uLut"), 2);
+			if (lutEnabled)
+				glUniform1i(glGetUniformLocation(progY, "uLut"), 2);
+			if (shadeEnabled)
+			{
+				glUniform1i(glGetUniformLocation(progY, "uShade"), 3);
+				glUniform2f(glGetUniformLocation(progY, "uFboSize"),
+							static_cast<float>(packedYW), static_cast<float>(dstH));
+			}
 			glUseProgram(progUV);
 			glUniform1i(glGetUniformLocation(progUV, "uTexY2"), 1);
-			glUniform1i(glGetUniformLocation(progUV, "uLut"), 2);
-		}
-		if (shadeEnabled)
-		{
-			glUseProgram(progY);
-			glUniform1i(glGetUniformLocation(progY, "uTexC"), 1);
-			glUniform1i(glGetUniformLocation(progY, "uShade"), 2);
-			glUniform2f(glGetUniformLocation(progY, "uFboSize"),
-						static_cast<float>(packedYW), static_cast<float>(dstH));
-			glUseProgram(progUV);
-			glUniform1i(glGetUniformLocation(progUV, "uTexY2"), 1);
-			glUniform1i(glGetUniformLocation(progUV, "uShade"), 2);
-			glUniform2f(glGetUniformLocation(progUV, "uFboSize"),
-						static_cast<float>(packedUVW), static_cast<float>(dstH / 2));
+			if (lutEnabled)
+				glUniform1i(glGetUniformLocation(progUV, "uLut"), 2);
+			if (shadeEnabled)
+			{
+				glUniform1i(glGetUniformLocation(progUV, "uShade"), 3);
+				glUniform2f(glGetUniformLocation(progUV, "uFboSize"),
+							static_cast<float>(packedUVW), static_cast<float>(dstH / 2));
+			}
 		}
 		glUseProgram(0);
 
@@ -838,7 +832,6 @@ void main(){
 
 		if (lutEnabled)
 		{
-			// Identity LUT (test mode): node i holds round(i*255/(N-1)).
 			glGenTextures(1, &texLut);
 			glBindTexture(GL_TEXTURE_3D, texLut);
 			const GLint lutFilter = lutTrilinear ? GL_LINEAR : GL_NEAREST;
@@ -847,22 +840,29 @@ void main(){
 			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-			std::vector<uint8_t> lut(static_cast<std::size_t>(lutN) * lutN * lutN * 4u);
-			std::size_t o = 0;
-			for (int b = 0; b < lutN; b++)
+			std::vector<uint8_t> lut;
+			const uint8_t *data;
+			if (!lutData.empty())
 			{
-				for (int g = 0; g < lutN; g++)
-				{
-					for (int r = 0; r < lutN; r++)
-					{
-						lut[o++] = static_cast<uint8_t>((r * 255 + (lutN - 1) / 2) / (lutN - 1));
-						lut[o++] = static_cast<uint8_t>((g * 255 + (lutN - 1) / 2) / (lutN - 1));
-						lut[o++] = static_cast<uint8_t>((b * 255 + (lutN - 1) / 2) / (lutN - 1));
-						lut[o++] = 255;
-					}
-				}
+				data = lutData.data(); // real LUT from --lut
 			}
-			glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, lutN, lutN, lutN, 0, GL_RGBA, GL_UNSIGNED_BYTE, lut.data());
+			else
+			{
+				// Identity LUT (env test): node i holds round(i*255/(N-1)).
+				lut.resize(static_cast<std::size_t>(lutN) * lutN * lutN * 4u);
+				std::size_t o = 0;
+				for (int b = 0; b < lutN; b++)
+					for (int g = 0; g < lutN; g++)
+						for (int r = 0; r < lutN; r++)
+						{
+							lut[o++] = static_cast<uint8_t>((r * 255 + (lutN - 1) / 2) / (lutN - 1));
+							lut[o++] = static_cast<uint8_t>((g * 255 + (lutN - 1) / 2) / (lutN - 1));
+							lut[o++] = static_cast<uint8_t>((b * 255 + (lutN - 1) / 2) / (lutN - 1));
+							lut[o++] = 255;
+						}
+				data = lut.data();
+			}
+			glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, lutN, lutN, lutN, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
 			glBindTexture(GL_TEXTURE_3D, 0);
 		}
 
@@ -1230,19 +1230,20 @@ void main(){
 		glBindFramebuffer(GL_FRAMEBUFFER, fboY);
 		glViewport(0, 0, packedYW, dstH);
 		glUseProgram(progY);
-		if (lutEnabled)
+		if (lutEnabled || shadeEnabled)
 		{
 			glActiveTexture(GL_TEXTURE1);
 			glBindTexture(GL_TEXTURE_2D, texUV);
-			glActiveTexture(GL_TEXTURE2);
-			glBindTexture(GL_TEXTURE_3D, texLut);
-		}
-		else if (shadeEnabled)
-		{
-			glActiveTexture(GL_TEXTURE1);
-			glBindTexture(GL_TEXTURE_2D, texUV);
-			glActiveTexture(GL_TEXTURE2);
-			glBindTexture(GL_TEXTURE_2D, texShade);
+			if (lutEnabled)
+			{
+				glActiveTexture(GL_TEXTURE2);
+				glBindTexture(GL_TEXTURE_3D, texLut);
+			}
+			if (shadeEnabled)
+			{
+				glActiveTexture(GL_TEXTURE3);
+				glBindTexture(GL_TEXTURE_2D, texShade);
+			}
 		}
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texY);
@@ -1270,19 +1271,20 @@ void main(){
 		glBindFramebuffer(GL_FRAMEBUFFER, fboUV);
 		glViewport(0, 0, packedUVW, dstH / 2);
 		glUseProgram(progUV);
-		if (lutEnabled)
+		if (lutEnabled || shadeEnabled)
 		{
 			glActiveTexture(GL_TEXTURE1);
 			glBindTexture(GL_TEXTURE_2D, texY);
-			glActiveTexture(GL_TEXTURE2);
-			glBindTexture(GL_TEXTURE_3D, texLut);
-		}
-		else if (shadeEnabled)
-		{
-			glActiveTexture(GL_TEXTURE1);
-			glBindTexture(GL_TEXTURE_2D, texY);
-			glActiveTexture(GL_TEXTURE2);
-			glBindTexture(GL_TEXTURE_2D, texShade);
+			if (lutEnabled)
+			{
+				glActiveTexture(GL_TEXTURE2);
+				glBindTexture(GL_TEXTURE_3D, texLut);
+			}
+			if (shadeEnabled)
+			{
+				glActiveTexture(GL_TEXTURE3);
+				glBindTexture(GL_TEXTURE_2D, texShade);
+			}
 		}
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texUV);
@@ -1489,9 +1491,9 @@ void main(){
 };
 
 GpuNv12Transform::GpuNv12Transform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality,
-								   const float *shadeGains, int shadeU, int shadeV)
+								   const float *shadeGains, int shadeU, int shadeV, const float *lutRgb, int lutSize)
 {
-	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight, highQuality, shadeGains, shadeU, shadeV);
+	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight, highQuality, shadeGains, shadeU, shadeV, lutRgb, lutSize);
 }
 
 GpuNv12Transform::~GpuNv12Transform()
@@ -1512,7 +1514,7 @@ bool GpuNv12Transform::transformDmabuf(int fdY, int offsetYBytes, int strideY, i
 
 #else
 
-GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int, bool, const float *, int, int)
+GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int, bool, const float *, int, int, const float *, int)
 {
 	throw std::runtime_error("GPU transform support not compiled in (missing EGL/GLES3 dev libs)");
 }

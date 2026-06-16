@@ -1954,6 +1954,53 @@ static bool loadShadingMap(const std::string &path)
 	return true;
 }
 
+// --lut: load a .cube 3D LUT (from --ledcalib-fit) for the warp shader.
+static std::string _lutPath;
+static std::vector<float> _lutData; // N^3 * 3, red index fastest
+static int _lutSize = 0;
+
+static bool loadCubeLut(const std::string &path)
+{
+	std::ifstream f(path);
+	if (!f)
+	{
+		std::cout << "ERROR: cannot open LUT " << path << std::endl;
+		return false;
+	}
+	int N = 0;
+	std::vector<float> vals;
+	std::string line;
+	while (std::getline(f, line))
+	{
+		int n;
+		if (std::sscanf(line.c_str(), " LUT_3D_SIZE %d", &n) == 1)
+		{
+			N = n;
+			continue;
+		}
+		float r, g, b;
+		if (std::sscanf(line.c_str(), "%f %f %f", &r, &g, &b) == 3)
+		{
+			vals.push_back(r);
+			vals.push_back(g);
+			vals.push_back(b);
+		}
+	}
+	if (N < 2 || N > 65)
+	{
+		std::cout << "ERROR: LUT missing/invalid LUT_3D_SIZE (" << N << ")" << std::endl;
+		return false;
+	}
+	if (static_cast<int>(vals.size()) != N * N * N * 3)
+	{
+		std::cout << "ERROR: LUT has " << vals.size() / 3 << " entries, expected " << (N * N * N) << std::endl;
+		return false;
+	}
+	_lutSize = N;
+	_lutData = std::move(vals);
+	return true;
+}
+
 // Bilinear-sample the loaded shading gain at output position (u,v) in [0,1]
 // (cell centers at ((i+0.5)/U,(j+0.5)/V), matching the runtime gain texture).
 static void sampleShadeGain(double u, double v, double g[3])
@@ -1996,8 +2043,9 @@ void *transformLoop(void *arg)
 	if (_useNv12 && _useGpu)
 	{
 		const float *sg = _shadeGains.empty() ? nullptr : _shadeGains.data();
+		const float *lut = _lutData.empty() ? nullptr : _lutData.data();
 		_gpuNv12 = new GpuNv12Transform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend,
-										_hyperhdrCalib, sg, _shadeU, _shadeV);
+										_hyperhdrCalib, sg, _shadeU, _shadeV, lut, _lutSize);
 	}
 	if (!_useNv12 && _useGpu)
 		_gpuRgb = new GpuRgbTransform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend, _hyperhdrCalib);
@@ -2733,6 +2781,7 @@ int main(int argc, char *argv[])
 		("rt-priority", po::value<int>(&_rtPriority)->default_value(10), "SCHED_FIFO priority for capture/worker threads (1-99, default 10)")																													  //
 		("latency-stats", po::bool_switch(&_latencyStats)->default_value(false), "Print per-second sensor->send latency percentiles (p50/p95/p99) to stderr")																									  //
 		("shading-map", po::value<std::string>(&_shadingMapPath), "Apply an ALSC shading-correction map (shading.csv from --ledcalib shading) in the NV12 warp shader")								  //
+		("lut", po::value<std::string>(&_lutPath), "Apply a 3D color LUT (.cube from --ledcalib-fit) in the NV12 warp shader; composes with --shading-map")									  //
 		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread")														  //
 		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value("all"), "One-shot LED 3D-LUT calibration measurement and exit (optional phase: all|white|tv|led; see doc/led-lut-calibration.md)")									  //
 		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h in raw full-frame coords (pick from --imgout without --crop)")																	  //
@@ -2769,6 +2818,8 @@ int main(int argc, char *argv[])
 	// Load the ALSC shading map early so both the LED-calib TV measurement and
 	// the production warp shader can use it.
 	if (!_shadingMapPath.empty() && !loadShadingMap(_shadingMapPath))
+		return EXIT_FAILURE;
+	if (!_lutPath.empty() && !loadCubeLut(_lutPath))
 		return EXIT_FAILURE;
 
 	_flatbuf.setConnectTimeoutMs(_flatbufConnectTimeoutMs);
@@ -3254,6 +3305,16 @@ int main(int argc, char *argv[])
 		{
 			std::cout << "WARNING: --shading-map is only applied on the NV12 GPU transform path; ignored here" << std::endl;
 			_shadeGains.clear();
+		}
+	}
+	if (!_lutData.empty())
+	{
+		if (_useNv12 && _useGpu)
+			std::cout << "INFO: LUT " << _lutSize << "^3 loaded from " << _lutPath << std::endl;
+		else
+		{
+			std::cout << "WARNING: --lut is only applied on the NV12 GPU transform path; ignored here" << std::endl;
+			_lutData.clear();
 		}
 	}
 
