@@ -257,6 +257,18 @@ the production `--crop` + `--transform`, unlike the LED sweep (which needs the f
   passed. NV12 GPU path only.
 - The wall/LED-ROI is left uncorrected on purpose: its (constant) shading cancels between the white
   anchor and the LED sweep, so it doesn't affect the LED calibration.
+
+**TV-sweep / gamma consistency with shaded production.** The TV-side measurements (`--ledcalib
+tv`, `gamma`) keep the production `--crop`, and when `--shading-map` (+ `--transform`) is given
+they scale the TV-ROI reading by the shading gain at that ROI's output position (mapped through the
+homography, bilinear-sampled — the same gain the shader applies there). This makes the LUT input
+domain match the shaded production output **without** running the GPU warp in the calib path:
+crop+warp are geometric and don't change a uniform patch's colour (locked AE/WB), so only the
+shading gain has to be reproduced. It also resolves the "wrong part of the TV" worry — after
+shading every position reads the same flattened value, so the global LUT is valid everywhere and
+the exact ROI choice stops mattering. The LED wall ROI is left unshaded (see above); `all`/`led`
+ignore `--shading-map` (they need the full frame and can't keep the TV crop) — run `tv` and `led`
+as separate phases and derive white from the sweeps (`--calib-no-anchor`).
 - **Verify on the real TV** (can't be checked off-Pi): show uniform gray with the map applied — it
   should get *flatter*, not worse. If a corner gets worse it's an axis flip in the gain texture
   upload, a one-line fix.

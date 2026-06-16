@@ -1954,6 +1954,31 @@ static bool loadShadingMap(const std::string &path)
 	return true;
 }
 
+// Bilinear-sample the loaded shading gain at output position (u,v) in [0,1]
+// (cell centers at ((i+0.5)/U,(j+0.5)/V), matching the runtime gain texture).
+static void sampleShadeGain(double u, double v, double g[3])
+{
+	g[0] = g[1] = g[2] = 1.0;
+	if (_shadeGains.empty())
+		return;
+	double fx = std::clamp(u, 0.0, 1.0) * _shadeU - 0.5;
+	double fy = std::clamp(v, 0.0, 1.0) * _shadeV - 0.5;
+	fx = std::clamp(fx, 0.0, static_cast<double>(_shadeU - 1));
+	fy = std::clamp(fy, 0.0, static_cast<double>(_shadeV - 1));
+	const int i0 = static_cast<int>(std::floor(fx)), j0 = static_cast<int>(std::floor(fy));
+	const int i1 = std::min(i0 + 1, _shadeU - 1), j1 = std::min(j0 + 1, _shadeV - 1);
+	const double tx = fx - i0, ty = fy - j0;
+	for (int c = 0; c < 3; c++)
+	{
+		const double a = _shadeGains[(static_cast<std::size_t>(j0) * _shadeU + i0) * 3 + c];
+		const double b = _shadeGains[(static_cast<std::size_t>(j0) * _shadeU + i1) * 3 + c];
+		const double cc = _shadeGains[(static_cast<std::size_t>(j1) * _shadeU + i0) * 3 + c];
+		const double d = _shadeGains[(static_cast<std::size_t>(j1) * _shadeU + i1) * 3 + c];
+		const double top = a + (b - a) * tx, bot = cc + (d - cc) * tx;
+		g[c] = top + (bot - top) * ty;
+	}
+}
+
 void *transformLoop(void *arg)
 {
 	// Pin + RT before creating the EGL context so all GL work runs on this thread.
@@ -2741,6 +2766,11 @@ int main(int argc, char *argv[])
 	po::store(po::parse_command_line(argc, argv, options), vm);
 	po::notify(vm);
 
+	// Load the ALSC shading map early so both the LED-calib TV measurement and
+	// the production warp shader can use it.
+	if (!_shadingMapPath.empty() && !loadShadingMap(_shadingMapPath))
+		return EXIT_FAILURE;
+
 	_flatbuf.setConnectTimeoutMs(_flatbufConnectTimeoutMs);
 	_flatbuf.setSendTimeoutMs(_sendTimeoutMs);
 
@@ -3002,6 +3032,7 @@ int main(int argc, char *argv[])
 		}
 		const bool gammaMode = (_ledCalibPhase == "gamma");
 		const bool shadingMode = (_ledCalibPhase == "shading");
+		const bool tvMode = (_ledCalibPhase == "tv");
 		auto parseRoi = [](const std::string &s, LedCalibRoi &roi)
 		{
 			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
@@ -3098,14 +3129,49 @@ int main(int argc, char *argv[])
 		if (_useNv12 && _verbose)
 			std::cout << "INFO: --ledcalib forces RGB output; ignoring --nv12" << std::endl;
 		_useNv12 = false;
+		// TV-side phases (tv/gamma/shading) keep the production --crop so their
+		// geometry matches runtime; phases that measure the LED wall (all/led/
+		// white) need the full frame.
+		const bool keepCrop = shadingMode || gammaMode || tvMode;
 		_transformEn = false; // we sample the frame directly; no GPU warp
-		if (!shadingMode && _cropEn)
+		if (!keepCrop && _cropEn)
 		{
 			std::cout << "INFO: --ledcalib ignores --crop (the LED wall must stay in view)" << std::endl;
 			_cropEn = false;
 		}
-		else if (shadingMode && _cropEn && _verbose)
-			std::cout << "INFO: --ledcalib shading keeps --crop to match production geometry" << std::endl;
+		else if (keepCrop && _cropEn && _verbose)
+			std::cout << "INFO: --ledcalib " << _ledCalibPhase << " keeps --crop to match production geometry" << std::endl;
+
+		// TV-side shading correction: scale TV-ROI measurements by the shading
+		// gain at the ROI position so the LUT-calibration input domain matches
+		// the shaded production output (tv/gamma only; the LED wall is left
+		// uncorrected). Raw gamma is diagnostic and not shaded.
+		if (!_shadeGains.empty())
+		{
+			if ((tvMode || (gammaMode && !_ledCalibCfg.gammaRaw)))
+			{
+				if (vm.count("transform") == 0)
+				{
+					std::cout << "ERROR: --ledcalib " << _ledCalibPhase
+							  << " with --shading-map needs --transform to locate the ROI in the map" << std::endl;
+					return EXIT_FAILURE;
+				}
+				const double cx = _ledCalibCfg.tvRoi.x + _ledCalibCfg.tvRoi.w / 2.0;
+				const double cy = _ledCalibCfg.tvRoi.y + _ledCalibCfg.tvRoi.h / 2.0;
+				cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
+				cv::Mat H = cv::getPerspectiveTransform(_imgQuad, dstUnit);
+				const double xw = H.at<double>(0, 0) * cx + H.at<double>(0, 1) * cy + H.at<double>(0, 2);
+				const double yw = H.at<double>(1, 0) * cx + H.at<double>(1, 1) * cy + H.at<double>(1, 2);
+				const double ww = H.at<double>(2, 0) * cx + H.at<double>(2, 1) * cy + H.at<double>(2, 2);
+				sampleShadeGain(xw / ww, yw / ww, _ledCalibCfg.tvShadeGain);
+				std::cout << "INFO: TV shading gain at ROI (u,v=" << xw / ww << "," << yw / ww << "): "
+						  << _ledCalibCfg.tvShadeGain[0] << "," << _ledCalibCfg.tvShadeGain[1] << ","
+						  << _ledCalibCfg.tvShadeGain[2] << std::endl;
+			}
+			else
+				std::cout << "WARNING: --shading-map ignored for --ledcalib " << _ledCalibPhase
+						  << " (only tv/gamma measure the shaded TV; all/led use the full frame)" << std::endl;
+		}
 		if (_outputCropEn)
 		{
 			std::cout << "INFO: --ledcalib ignores --output-crop" << std::endl;
@@ -3178,11 +3244,10 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	// Load the ALSC shading map (applied in the NV12 GPU warp shader only).
-	if (!_shadingMapPath.empty())
+	// Shading map: applied in the NV12 GPU warp shader at runtime. (For the
+	// LED-calib TV measurement it's applied to the ROI directly, set earlier.)
+	if (!_shadeGains.empty() && !_ledCalibMode)
 	{
-		if (!loadShadingMap(_shadingMapPath))
-			return EXIT_FAILURE;
 		if (_useNv12 && _useGpu)
 			std::cout << "INFO: shading map " << _shadeU << "x" << _shadeV << " loaded from " << _shadingMapPath << std::endl;
 		else

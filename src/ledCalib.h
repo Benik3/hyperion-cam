@@ -61,6 +61,10 @@ struct LedCalibConfig
 	int shadingGridV = 14;	 // grid rows down the TV (output v)
 	bool haveHomography = false;
 	double invHomography[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}; // unit-square (u,v in [0,1]) -> input px
+	// Shading gain at the TV ROI's output position (from --shading-map), applied
+	// to TV-side measurements so the LUT-calibration input domain matches the
+	// shaded production output. {1,1,1} = no shading. tv/gamma phases only.
+	double tvShadeGain[3] = {1.0, 1.0, 1.0};
 	// Gamma ramp probe (phase "gamma"): R/G/B/gray ramps, measure the camera's
 	// response to spot crush/clip. Always web-driven.
 	bool gammaRaw = false; // measure the raw Bayer stream instead of ISP RGB

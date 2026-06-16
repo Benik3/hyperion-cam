@@ -207,7 +207,14 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		return;
 	}
 
-	const RoiSample tv = sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.tvRoi);
+	RoiSample tv = sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.tvRoi);
+	// Match the shaded production output: scale the TV reading by the shading
+	// gain at this ROI's position (identity unless --shading-map was given).
+	for (int c = 0; c < 3; c++)
+	{
+		tv.mean[c] *= _cfg.tvShadeGain[c];
+		tv.sstd[c] *= _cfg.tvShadeGain[c];
+	}
 	const RoiSample led = (_cfg.phase == "gamma") ? RoiSample{}
 												  : sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.ledRoi);
 
