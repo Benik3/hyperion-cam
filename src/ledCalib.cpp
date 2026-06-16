@@ -177,12 +177,8 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		// (it samples the whole TV quad via the homography).
 		const bool gamma = (_cfg.phase == "gamma");
 		const bool shading = (_cfg.phase == "shading");
-		if (shading && !_cfg.haveHomography)
-		{
-			std::cout << "ERROR: --ledcalib shading needs --transform (the TV quad)" << std::endl;
-			finishAll(EXIT_FAILURE);
-			return;
-		}
+		// Shading without --transform samples the full frame (camera captures
+		// only the clean TV); with --transform it samples the TV quad.
 		if (!shading && (!inFrame(_cfg.tvRoi) || (!gamma && !inFrame(_cfg.ledRoi))))
 		{
 			std::cout << "ERROR: LedCalib ROI outside the " << width << "x" << height
@@ -1283,8 +1279,16 @@ void LedCalib::runShading(const uint8_t *img, int width, int height, int strideB
 
 	const int U = _cfg.shadingGridU, V = _cfg.shadingGridV;
 	const double *H = _cfg.invHomography;
+	const bool useH = _cfg.haveHomography;
 	auto mapH = [&](double u, double v, double &x, double &y)
 	{
+		if (!useH)
+		{
+			// No --transform: unit square -> full frame (clean-TV capture).
+			x = u * width;
+			y = v * height;
+			return;
+		}
 		double xp = H[0] * u + H[1] * v + H[2];
 		double yp = H[3] * u + H[4] * v + H[5];
 		double wp = H[6] * u + H[7] * v + H[8];

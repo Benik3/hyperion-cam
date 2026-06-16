@@ -3115,21 +3115,27 @@ int main(int argc, char *argv[])
 				std::cout << "ERROR: --shading-level must be 1..255" << std::endl;
 				return EXIT_FAILURE;
 			}
-			if (!_transformEn)
+			if (_transformEn)
 			{
-				std::cout << "ERROR: --ledcalib shading needs --transform (the TV quad), same as production" << std::endl;
-				return EXIT_FAILURE;
+				// Inverse homography: unit square (u,v in [0,1]) -> input pixels,
+				// matching the production warp's quad ordering (TL,TR,BL,BR).
+				cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
+				cv::Mat Huv = cv::getPerspectiveTransform(_imgQuad, dstUnit);
+				cv::Mat invUv;
+				cv::invert(Huv, invUv);
+				for (int r = 0; r < 3; r++)
+					for (int c = 0; c < 3; c++)
+						_ledCalibCfg.invHomography[r * 3 + c] = invUv.at<double>(r, c);
+				_ledCalibCfg.haveHomography = true;
 			}
-			// Inverse homography: unit square (u,v in [0,1]) -> input pixels,
-			// matching the production warp's quad ordering (TL,TR,BL,BR).
-			cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
-			cv::Mat Huv = cv::getPerspectiveTransform(_imgQuad, dstUnit);
-			cv::Mat invUv;
-			cv::invert(Huv, invUv);
-			for (int r = 0; r < 3; r++)
-				for (int c = 0; c < 3; c++)
-					_ledCalibCfg.invHomography[r * 3 + c] = invUv.at<double>(r, c);
-			_ledCalibCfg.haveHomography = true;
+			else
+			{
+				// No --transform: sample the full frame (camera must capture only
+				// the clean TV screen).
+				_ledCalibCfg.haveHomography = false;
+				std::cout << "INFO: --ledcalib shading without --transform: sampling the full frame "
+							 "(the camera must see only the clean TV screen)" << std::endl;
+			}
 		}
 		if (_ledCalibCfg.tvPatchCount < 1 || _ledCalibCfg.tvPatchCount > 216)
 		{
@@ -3201,21 +3207,27 @@ int main(int argc, char *argv[])
 		{
 			if ((tvMode || (gammaMode && !_ledCalibCfg.gammaRaw)))
 			{
-				if (vm.count("transform") == 0)
-				{
-					std::cout << "ERROR: --ledcalib " << _ledCalibPhase
-							  << " with --shading-map needs --transform to locate the ROI in the map" << std::endl;
-					return EXIT_FAILURE;
-				}
 				const double cx = _ledCalibCfg.tvRoi.x + _ledCalibCfg.tvRoi.w / 2.0;
 				const double cy = _ledCalibCfg.tvRoi.y + _ledCalibCfg.tvRoi.h / 2.0;
-				cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
-				cv::Mat H = cv::getPerspectiveTransform(_imgQuad, dstUnit);
-				const double xw = H.at<double>(0, 0) * cx + H.at<double>(0, 1) * cy + H.at<double>(0, 2);
-				const double yw = H.at<double>(1, 0) * cx + H.at<double>(1, 1) * cy + H.at<double>(1, 2);
-				const double ww = H.at<double>(2, 0) * cx + H.at<double>(2, 1) * cy + H.at<double>(2, 2);
-				sampleShadeGain(xw / ww, yw / ww, _ledCalibCfg.tvShadeGain);
-				std::cout << "INFO: TV shading gain at ROI (u,v=" << xw / ww << "," << yw / ww << "): "
+				double u, v;
+				if (vm.count("transform") > 0)
+				{
+					cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
+					cv::Mat H = cv::getPerspectiveTransform(_imgQuad, dstUnit);
+					const double xw = H.at<double>(0, 0) * cx + H.at<double>(0, 1) * cy + H.at<double>(0, 2);
+					const double yw = H.at<double>(1, 0) * cx + H.at<double>(1, 1) * cy + H.at<double>(1, 2);
+					const double ww = H.at<double>(2, 0) * cx + H.at<double>(2, 1) * cy + H.at<double>(2, 2);
+					u = xw / ww;
+					v = yw / ww;
+				}
+				else
+				{
+					// Full-frame (clean-TV) capture: ROI position is the output position.
+					u = cx / std::max(1, _width);
+					v = cy / std::max(1, _height);
+				}
+				sampleShadeGain(u, v, _ledCalibCfg.tvShadeGain);
+				std::cout << "INFO: TV shading gain at ROI (u,v=" << u << "," << v << "): "
 						  << _ledCalibCfg.tvShadeGain[0] << "," << _ledCalibCfg.tvShadeGain[1] << ","
 						  << _ledCalibCfg.tvShadeGain[2] << std::endl;
 			}

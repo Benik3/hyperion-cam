@@ -72,6 +72,12 @@ sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain --ledcalib shading --calib-t
 Open page → **tap begin**. Fills the TV with gray 180, samples a 24×14 grid, writes
 `cal/shading.csv`, prints `max colour (R/G,B/G) drift center->edge: X%`.
 
+> `--crop`/`--transform` are **optional**. They're only needed when the camera sees more than the
+> screen (it crops/warps to the TV quad). If your camera is aimed so the frame is **only the clean
+> TV screen**, omit them — shading then samples the full frame, and the TV sweep ROIs are plain
+> full-frame coords. The same applies to Step 2. Requirement either way: the measured region must be
+> **only the TV picture** (no bezel, wall, or reflections in frame).
+
 **Decide:** `X < ~2%` → skip shading (don't pass `--shading-map` anywhere). Larger (common on LCD)
 → keep `cal/shading.csv`.
 
