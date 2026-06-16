@@ -690,6 +690,7 @@ static double _patchY = -1.0;
 static std::string _ledCalibPhase;
 static std::string _calibTvRoiStr;
 static std::string _calibLedRoiStr;
+static std::string _shadingGridStr;
 static LedCalibConfig _ledCalibCfg;
 // Phase 3 (offline, no camera): fit sweep measurements -> .cube LUT.
 static bool _ledCalibFit = false;
@@ -2664,6 +2665,8 @@ int main(int argc, char *argv[])
 		("calib-no-anchor", po::bool_switch(&_ledCalibCfg.noAnchor)->default_value(false), "LED calib: skip the Phase 0 eye anchor (set white in HyperHDR instead; fit derives it from the sweep whites)") //
 		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
+		("shading-level", po::value<int>(&_ledCalibCfg.shadingLevel)->default_value(180), "LED calib (phase shading): safe gray code value for the full-TV field (avoid clip/ABL)")					  //
+		("shading-grid", po::value<std::string>(&_shadingGridStr)->default_value("24x14"), "LED calib (phase shading): sample grid across the TV as UxV")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
 		("ledcalib-web-dryrun", po::bool_switch(&_ledCalibWebDryrun)->default_value(false), "Start only the TV web page and cycle demo patches (no camera) to test it; uses --calib-tv-port")		  //
 		("patch-size", po::value<double>(&_patchSize)->default_value(10.0), "TV patch window size as % of screen area (default 10; 100=fullscreen) to avoid TV auto-dimming")						  //
@@ -2934,24 +2937,59 @@ int main(int argc, char *argv[])
 			return EXIT_FAILURE;
 		}
 		if (_ledCalibPhase != "all" && _ledCalibPhase != "white" && _ledCalibPhase != "tv" &&
-			_ledCalibPhase != "led" && _ledCalibPhase != "gamma")
+			_ledCalibPhase != "led" && _ledCalibPhase != "gamma" && _ledCalibPhase != "shading")
 		{
-			std::cout << "ERROR: --ledcalib phase must be one of: all, white, tv, led, gamma" << std::endl;
+			std::cout << "ERROR: --ledcalib phase must be one of: all, white, tv, led, gamma, shading" << std::endl;
 			return EXIT_FAILURE;
 		}
 		const bool gammaMode = (_ledCalibPhase == "gamma");
+		const bool shadingMode = (_ledCalibPhase == "shading");
 		auto parseRoi = [](const std::string &s, LedCalibRoi &roi)
 		{
 			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
 		};
-		// Gamma probe needs only the TV ROI; the full calib needs both.
-		const bool roiOk = gammaMode ? parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi)
-									 : (parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi) && parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi));
+		// Shading samples the whole TV quad (no ROIs); gamma needs only the TV
+		// ROI; the full calib needs both.
+		bool roiOk = true;
+		if (!shadingMode)
+			roiOk = gammaMode ? parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi)
+							  : (parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi) && parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi));
 		if (!roiOk)
 		{
 			std::cout << "ERROR: --ledcalib requires --calib-tv-roi"
 					  << (gammaMode ? "" : " and --calib-led-roi") << " as x,y,w,h" << std::endl;
 			return EXIT_FAILURE;
+		}
+		if (shadingMode)
+		{
+			int gu = 0, gv = 0;
+			if (sscanf(_shadingGridStr.c_str(), "%dx%d", &gu, &gv) != 2 || gu < 2 || gv < 2 || gu > 128 || gv > 128)
+			{
+				std::cout << "ERROR: --shading-grid must be UxV (2..128 each), e.g. 24x14" << std::endl;
+				return EXIT_FAILURE;
+			}
+			_ledCalibCfg.shadingGridU = gu;
+			_ledCalibCfg.shadingGridV = gv;
+			if (_ledCalibCfg.shadingLevel < 1 || _ledCalibCfg.shadingLevel > 255)
+			{
+				std::cout << "ERROR: --shading-level must be 1..255" << std::endl;
+				return EXIT_FAILURE;
+			}
+			if (!_transformEn)
+			{
+				std::cout << "ERROR: --ledcalib shading needs --transform (the TV quad), same as production" << std::endl;
+				return EXIT_FAILURE;
+			}
+			// Inverse homography: unit square (u,v in [0,1]) -> input pixels,
+			// matching the production warp's quad ordering (TL,TR,BL,BR).
+			cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
+			cv::Mat Huv = cv::getPerspectiveTransform(_imgQuad, dstUnit);
+			cv::Mat invUv;
+			cv::invert(Huv, invUv);
+			for (int r = 0; r < 3; r++)
+				for (int c = 0; c < 3; c++)
+					_ledCalibCfg.invHomography[r * 3 + c] = invUv.at<double>(r, c);
+			_ledCalibCfg.haveHomography = true;
 		}
 		if (_ledCalibCfg.tvPatchCount < 1 || _ledCalibCfg.tvPatchCount > 216)
 		{
@@ -2979,10 +3017,10 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: --ledcalib is interactive and needs a terminal on stdin" << std::endl;
 			return EXIT_FAILURE;
 		}
-		// Gamma probe is always web-driven (it shows arbitrary ramp patches).
-		if (gammaMode && !_ledCalibCfg.tvWeb)
+		// Gamma/shading are always web-driven (they show full-screen fields).
+		if ((gammaMode || shadingMode) && !_ledCalibCfg.tvWeb)
 		{
-			std::cout << "ERROR: --ledcalib gamma requires --calib-tv-web" << std::endl;
+			std::cout << "ERROR: --ledcalib " << _ledCalibPhase << " requires --calib-tv-web" << std::endl;
 			return EXIT_FAILURE;
 		}
 		_ledCalibCfg.phase = _ledCalibPhase;
@@ -2996,20 +3034,20 @@ int main(int argc, char *argv[])
 		_ledCalibCfg.patchX = _patchX;
 		_ledCalibCfg.patchY = _patchY;
 
-		// Measurement uses the raw full frame: RGB capture, no sensor crop, no warp.
+		// Measurement uses RGB capture and samples the frame directly (the GPU
+		// warp is never run here). Shading needs the production --crop so the
+		// captured geometry matches runtime; it samples the TV quad in software.
 		if (_useNv12 && _verbose)
 			std::cout << "INFO: --ledcalib forces RGB output; ignoring --nv12" << std::endl;
 		_useNv12 = false;
-		if (_transformEn)
-		{
-			std::cout << "INFO: --ledcalib ignores --transform (ROIs are raw-frame rectangles)" << std::endl;
-			_transformEn = false;
-		}
-		if (_cropEn)
+		_transformEn = false; // we sample the frame directly; no GPU warp
+		if (!shadingMode && _cropEn)
 		{
 			std::cout << "INFO: --ledcalib ignores --crop (the LED wall must stay in view)" << std::endl;
 			_cropEn = false;
 		}
+		else if (shadingMode && _cropEn && _verbose)
+			std::cout << "INFO: --ledcalib shading keeps --crop to match production geometry" << std::endl;
 		if (_outputCropEn)
 		{
 			std::cout << "INFO: --ledcalib ignores --output-crop" << std::endl;

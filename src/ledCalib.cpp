@@ -100,6 +100,8 @@ LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, 
 		_phase = Phase::LedWait;
 	else if (_cfg.phase == "gamma")
 		_phase = Phase::GammaWait;
+	else if (_cfg.phase == "shading")
+		_phase = Phase::ShadingWait;
 	else // "all"
 		_phase = _cfg.noAnchor ? Phase::TvWait : Phase::WhiteWait;
 
@@ -171,9 +173,17 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		{
 			return r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= width && r.y + r.h <= height;
 		};
-		// Gamma mode only needs the TV ROI (no LED measurement).
+		// Gamma/shading need no LED ROI; shading needs no TV ROI either
+		// (it samples the whole TV quad via the homography).
 		const bool gamma = (_cfg.phase == "gamma");
-		if (!inFrame(_cfg.tvRoi) || (!gamma && !inFrame(_cfg.ledRoi)))
+		const bool shading = (_cfg.phase == "shading");
+		if (shading && !_cfg.haveHomography)
+		{
+			std::cout << "ERROR: --ledcalib shading needs --transform (the TV quad)" << std::endl;
+			finishAll(EXIT_FAILURE);
+			return;
+		}
+		if (!shading && (!inFrame(_cfg.tvRoi) || (!gamma && !inFrame(_cfg.ledRoi))))
 		{
 			std::cout << "ERROR: LedCalib ROI outside the " << width << "x" << height
 					  << " frame (tv " << _cfg.tvRoi.x << "," << _cfg.tvRoi.y << "," << _cfg.tvRoi.w << "," << _cfg.tvRoi.h
@@ -183,6 +193,18 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 			return;
 		}
 		enterPhase(_phase, nowMs);
+	}
+
+	// Shading samples the whole TV quad from the raw frame; the fixed TV/LED
+	// ROIs are not used.
+	if (_phase == Phase::Shading || _phase == Phase::ShadingWait)
+	{
+		handleKeys(nowMs);
+		if (_finished)
+			return;
+		if (_phase == Phase::Shading)
+			runShading(img, width, height, strideBytes, bpp, swapRb, nowMs);
+		return;
 	}
 
 	const RoiSample tv = sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.tvRoi);
@@ -493,6 +515,37 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 				  << "." << std::endl;
 		showGammaPatch(nowMs);
 		break;
+	case Phase::ShadingWait:
+		setLed(0, 0, 0, nowMs); // LEDs off; this maps the TV/lens, not the LEDs
+		if (_webStarted)
+		{
+			enterPhase(Phase::Shading, nowMs);
+			return;
+		}
+		std::cout << "\nLedCalib shading (ALSC) calibration: open  http://<this-pi>:"
+				  << (_web ? _web->port() : 0) << "/  fullscreen on the TV PC and tap 'begin'.\n"
+					 "A safe gray (" << _cfg.shadingLevel << ") fills the whole TV; keep the room dark." << std::endl;
+		_lastUrlPrintMs = nowMs;
+		break;
+	case Phase::Shading:
+	{
+		// Full-screen safe gray; sample the TV quad once it has settled.
+		if (_web)
+		{
+			_web->setPatchGeometry(100.0, -1.0, -1.0);
+			_webSeq++;
+			const uint8_t g = static_cast<uint8_t>(_cfg.shadingLevel);
+			_web->setState(g, g, g, false, 0, 0, 0, _webSeq);
+		}
+		const std::size_t cells = static_cast<std::size_t>(_cfg.shadingGridU) * _cfg.shadingGridV;
+		_shadeSum.assign(cells * 3, 0.0);
+		_shadeCount.assign(cells, 0);
+		_shadeFrames = 0;
+		_shadeSettleUntilMs = nowMs + std::max(_cfg.settleMs, 500);
+		std::cout << "Shading: " << _cfg.shadingGridU << "x" << _cfg.shadingGridV
+				  << " grid across the TV, gray " << _cfg.shadingLevel << "; settling..." << std::endl;
+		break;
+	}
 	case Phase::Done:
 		break;
 	}
@@ -525,13 +578,18 @@ void LedCalib::handleKeys(int64_t nowMs)
 		// In web mode the page's "begin" button arrives as enter and unlocks
 		// the unattended auto-advance of later wait phases.
 		if (_web && enter && (_phase == Phase::WhiteWait || _phase == Phase::TvWait ||
-							  _phase == Phase::LedWait || _phase == Phase::GammaWait))
+							  _phase == Phase::LedWait || _phase == Phase::GammaWait ||
+							  _phase == Phase::ShadingWait))
 			_webStarted = true;
 		switch (_phase)
 		{
 		case Phase::WhiteWait:
 			if (enter)
 				enterPhase(Phase::White, nowMs);
+			break;
+		case Phase::ShadingWait:
+			if (enter)
+				enterPhase(Phase::Shading, nowMs);
 			break;
 		case Phase::TvWait:
 			if (enter)
@@ -1207,6 +1265,131 @@ bool LedCalib::gammaRawSelftest()
 			  << " (expect " << valR << "," << valG << "," << valB << ") -> " << (ok ? "PASS" : "FAIL")
 			  << std::endl;
 	return ok;
+}
+
+// ---- Shading (ALSC) calibration ----
+
+void LedCalib::runShading(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb, int64_t nowMs)
+{
+	if (nowMs < _shadeSettleUntilMs)
+		return;
+
+	const int U = _cfg.shadingGridU, V = _cfg.shadingGridV;
+	const double *H = _cfg.invHomography;
+	auto mapH = [&](double u, double v, double &x, double &y)
+	{
+		double xp = H[0] * u + H[1] * v + H[2];
+		double yp = H[3] * u + H[4] * v + H[5];
+		double wp = H[6] * u + H[7] * v + H[8];
+		if (std::fabs(wp) < 1e-9)
+			wp = (wp < 0 ? -1e-9 : 1e-9);
+		x = xp / wp;
+		y = yp / wp;
+	};
+
+	for (int j = 0; j < V; j++)
+	{
+		for (int i = 0; i < U; i++)
+		{
+			double xs[4], ys[4];
+			mapH(static_cast<double>(i) / U, static_cast<double>(j) / V, xs[0], ys[0]);
+			mapH(static_cast<double>(i + 1) / U, static_cast<double>(j) / V, xs[1], ys[1]);
+			mapH(static_cast<double>(i) / U, static_cast<double>(j + 1) / V, xs[2], ys[2]);
+			mapH(static_cast<double>(i + 1) / U, static_cast<double>(j + 1) / V, xs[3], ys[3]);
+			const double xmin = std::min({xs[0], xs[1], xs[2], xs[3]});
+			const double xmax = std::max({xs[0], xs[1], xs[2], xs[3]});
+			const double ymin = std::min({ys[0], ys[1], ys[2], ys[3]});
+			const double ymax = std::max({ys[0], ys[1], ys[2], ys[3]});
+			LedCalibRoi roi;
+			roi.x = static_cast<int>(std::floor(xmin));
+			roi.y = static_cast<int>(std::floor(ymin));
+			roi.w = std::max(1, static_cast<int>(std::ceil(xmax - xmin)));
+			roi.h = std::max(1, static_cast<int>(std::ceil(ymax - ymin)));
+			const RoiSample s = sampleRoi(img, width, height, strideBytes, bpp, swapRb, roi);
+			const std::size_t idx = static_cast<std::size_t>(j) * U + i;
+			for (int c = 0; c < 3; c++)
+				_shadeSum[idx * 3 + c] += s.mean[c];
+			_shadeCount[idx]++;
+		}
+	}
+
+	if (++_shadeFrames >= _cfg.measureFrames)
+	{
+		if (!ensureOutDir())
+		{
+			finishAll(EXIT_FAILURE);
+			return;
+		}
+		writeShadingMap();
+		finishAll(EXIT_SUCCESS);
+	}
+}
+
+void LedCalib::writeShadingMap()
+{
+	const int U = _cfg.shadingGridU, V = _cfg.shadingGridV;
+	std::vector<double> m(static_cast<std::size_t>(U) * V * 3, 0.0);
+	double mn[3] = {1e18, 1e18, 1e18};
+	for (int idx = 0; idx < U * V; idx++)
+	{
+		const double cnt = _shadeCount[idx] ? static_cast<double>(_shadeCount[idx]) : 1.0;
+		for (int c = 0; c < 3; c++)
+		{
+			const double v = _shadeSum[idx * 3 + c] / cnt;
+			m[idx * 3 + c] = v;
+			mn[c] = std::min(mn[c], v);
+		}
+	}
+
+	const std::string path = _cfg.outDir + "/shading.csv";
+	std::ofstream f(path);
+	f << "# ALSC shading map; gray " << _cfg.shadingLevel << ", grid " << U << "x" << V
+	  << "; gain = min/mean (<=1, darken-to-dimmest, never clips)\n";
+	f << "i,j,mean_r,mean_g,mean_b,gain_r,gain_g,gain_b\n";
+	for (int j = 0; j < V; j++)
+	{
+		for (int i = 0; i < U; i++)
+		{
+			const int idx = j * U + i;
+			f << i << "," << j;
+			for (int c = 0; c < 3; c++)
+				f << "," << m[idx * 3 + c];
+			for (int c = 0; c < 3; c++)
+				f << "," << (m[idx * 3 + c] > 1e-6 ? mn[c] / m[idx * 3 + c] : 1.0);
+			f << "\n";
+		}
+	}
+	std::cout << "Wrote " << path << " (" << (U * V) << " cells)" << std::endl;
+
+	// Magnitude report: luminance falloff + center->corner colour drift.
+	auto luma = [&](int idx)
+	{ return 0.299 * m[idx * 3] + 0.587 * m[idx * 3 + 1] + 0.114 * m[idx * 3 + 2]; };
+	const int cIdx = (V / 2) * U + (U / 2);
+	const double cl = std::max(1e-6, luma(cIdx));
+	if (cl < 16.0)
+		std::cout << "WARNING: TV-center reads near black (" << cl << "); is the --transform quad on the\n"
+					 "         TV and is it showing the gray field? The numbers below are unreliable." << std::endl;
+	const double crg = m[cIdx * 3] / std::max(1e-6, m[cIdx * 3 + 1]);
+	const double cbg = m[cIdx * 3 + 2] / std::max(1e-6, m[cIdx * 3 + 1]);
+	double lumaMin = 1e18, lumaMax = 0.0, colorMax = 0.0;
+	for (int idx = 0; idx < U * V; idx++)
+	{
+		lumaMin = std::min(lumaMin, luma(idx));
+		lumaMax = std::max(lumaMax, luma(idx));
+		const double rg = m[idx * 3] / std::max(1e-6, m[idx * 3 + 1]);
+		const double bg = m[idx * 3 + 2] / std::max(1e-6, m[idx * 3 + 1]);
+		colorMax = std::max(colorMax, std::max(std::fabs(rg / crg - 1.0), std::fabs(bg / cbg - 1.0)));
+	}
+	const int corners[4] = {0, U - 1, (V - 1) * U, V * U - 1};
+	std::cout << "Shading magnitude (gray " << _cfg.shadingLevel << ", center luma " << cl << "):\n"
+			  << "  luminance falloff: min " << (100.0 * lumaMin / cl - 100.0) << "% .. max +"
+			  << (100.0 * lumaMax / cl - 100.0) << "% vs center\n"
+			  << "  corners vs center luma:";
+	for (int k = 0; k < 4; k++)
+		std::cout << " " << (100.0 * luma(corners[k]) / cl - 100.0) << "%";
+	std::cout << "\n  max colour (R/G,B/G) drift center->edge: " << (100.0 * colorMax) << "%\n"
+			  << "  -> color drift is the number that matters for edge-LED accuracy; "
+				 "<~2% = skip, larger = worth applying." << std::endl;
 }
 
 void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs)

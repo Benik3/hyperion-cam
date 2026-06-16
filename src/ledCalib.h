@@ -54,6 +54,13 @@ struct LedCalibConfig
 	double patchPct = 10.0;
 	double patchX = -1.0;
 	double patchY = -1.0;
+	// Shading (ALSC) calibration (phase "shading"): full-screen safe-gray field,
+	// sample a grid across the TV quad to map lens + panel non-uniformity.
+	int shadingLevel = 180;	 // safe gray code value (avoid clip/ABL)
+	int shadingGridU = 24;	 // grid columns across the TV (output u)
+	int shadingGridV = 14;	 // grid rows down the TV (output v)
+	bool haveHomography = false;
+	double invHomography[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}; // unit-square (u,v in [0,1]) -> input px
 	// Gamma ramp probe (phase "gamma"): R/G/B/gray ramps, measure the camera's
 	// response to spot crush/clip. Always web-driven.
 	bool gammaRaw = false; // measure the raw Bayer stream instead of ISP RGB
@@ -105,6 +112,8 @@ private:
 		LedSweep,
 		GammaWait,
 		Gamma,
+		ShadingWait,
+		Shading,
 		Done
 	};
 
@@ -193,6 +202,10 @@ private:
 	void showGammaPatch(int64_t nowMs);
 	void runGamma(const RoiSample &meas, int64_t nowMs);
 	void writeGammaCsv();
+
+	// Shading (ALSC) calibration.
+	void runShading(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb, int64_t nowMs);
+	void writeShadingMap();
 	RoiSample sampleRoiBayer(const uint8_t *img, int width, int height, int strideBytes,
 							 uint32_t fourcc, const LedCalibRoi &roi) const;
 	void runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
@@ -277,6 +290,12 @@ private:
 	std::vector<GammaRecord> _gammaRecords;
 	size_t _gammaPos = 0;
 	LedCalibRoi _rawRoi; // tvRoi scaled into raw-stream coords (--gamma-raw)
+
+	// Shading calibration: per-cell RGB accumulators over the TV-quad grid.
+	std::vector<double> _shadeSum;	  // size gridU*gridV*3
+	std::vector<uint32_t> _shadeCount; // size gridU*gridV
+	int _shadeFrames = 0;
+	int64_t _shadeSettleUntilMs = -1;
 
 	// LED sweep
 	std::vector<std::array<uint8_t, 3>> _ledPlan;
