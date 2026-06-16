@@ -44,10 +44,15 @@ namespace
   /* Dim gray, low luminance, to limit OLED retention of the static label. */
   #st{position:fixed;left:1vh;bottom:1vh;color:#555;font-size:1.6vh;z-index:2;
       font-variant-numeric:tabular-nums}
+  /* keep-alive: tiny moving dim square in the corner -> per-frame motion so the
+     TV doesn't trigger its static-image screensaver. In the black surround for
+     windowed patches (the long sweeps); negligible elsewhere. */
+  #ka{position:fixed;left:0;top:0;width:8px;height:8px;z-index:4;pointer-events:none}
 </style></head>
 <body>
 <div id="fill"></div>
 <div id="patch"></div>
+<div id="ka"></div>
 <div id="ui">
   <h2>Make the LED glow match the TV white — tune HyperHDR white balance, or nudge:</h2>
   <div class="drv">R <span id="dr">0</span>&nbsp; G <span id="dg">0</span>&nbsp; B <span id="db">0</span></div>
@@ -75,10 +80,25 @@ let lastSeq=-1, last=null;
 const fill=document.getElementById('fill'), patch=document.getElementById('patch'),
       ui=document.getElementById('ui'), st=document.getElementById('st'),
       example=document.getElementById('example'), hint=document.getElementById('starthint');
+const ka=document.getElementById('ka');
 function k(c){fetch('/key?c='+encodeURIComponent(c),{method:'POST'}).catch(()=>{});}
+// Keep the PC display awake (Screen Wake Lock); re-acquire if it drops.
+let wakeLock=null;
+async function keepAwake(){ try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){} }
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') keepAwake(); });
+// Per-frame motion in a corner so the TV doesn't blank on a static image.
+function kaTick(t){
+  const x=Math.round(4+4*Math.sin(t/300)), y=Math.round(4+4*Math.cos(t/300));
+  const lvl=(Math.floor(t/16)&15);            // dim, changing
+  ka.style.transform='translate('+x+'px,'+y+'px)';
+  ka.style.background='rgb('+lvl+','+lvl+','+lvl+')';
+  requestAnimationFrame(kaTick);
+}
+requestAnimationFrame(kaTick);
 function go(){
   const s=document.getElementById('start'); s.style.display='none';
   const el=document.documentElement; if(el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+  keepAwake();
   k('start');
 }
 function layout(s){

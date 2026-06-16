@@ -18,8 +18,9 @@ A PC on the **same TV HDMI input/picture-mode you normally watch** runs a fullsc
 only role.
 
 ## Ground rules (read once)
-- **Dark room.** Disable the TV's **screensaver and eco/ambient auto-dimming** — they silently
-  corrupt long sweeps.
+- **Dark room.** The page keeps the PC awake (Screen Wake Lock) and shows a tiny moving corner
+  marker so most TVs won't screensaver. If your TV still blanks on a static image, disable its
+  screensaver. Also disable **eco/ambient auto-dimming** (corrupts sweeps).
 - HyperHDR running, grabber the only source, **HyperHDR color + smoothing settings final** — they
   bake into the LUT; change later → recalibrate.
 - Stop the service while calibrating, restart after:
