@@ -19,6 +19,8 @@
 #include <cmath>
 #include <mutex>
 #include <memory>
+#include <fstream>
+#include <vector>
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
 #include <opencv2/core/types.hpp>
@@ -1901,6 +1903,57 @@ static BuiltRequest buildNV12ImageRequestUninitialized(uint16_t width, uint16_t 
 
 	return BuiltRequest{builder.GetBufferPointer(), builder.GetSize()};
 }
+// --shading-map: ALSC gain map applied in the NV12 warp shader.
+static std::string _shadingMapPath;
+static std::vector<float> _shadeGains; // shadeU*shadeV*3, row-major, [0,1]
+static int _shadeU = 0, _shadeV = 0;
+
+static bool loadShadingMap(const std::string &path)
+{
+	std::ifstream f(path);
+	if (!f)
+	{
+		std::cout << "ERROR: cannot open shading map " << path << std::endl;
+		return false;
+	}
+	struct Cell
+	{
+		int i, j;
+		float g[3];
+	};
+	std::vector<Cell> cells;
+	int maxI = -1, maxJ = -1;
+	std::string line;
+	while (std::getline(f, line))
+	{
+		if (line.empty() || line[0] == '#' || line[0] == 'i')
+			continue; // comment / header
+		int i, j;
+		float mr, mg, mb, gr, gg, gb;
+		if (std::sscanf(line.c_str(), "%d,%d,%f,%f,%f,%f,%f,%f", &i, &j, &mr, &mg, &mb, &gr, &gg, &gb) == 8)
+		{
+			cells.push_back({i, j, {gr, gg, gb}});
+			maxI = std::max(maxI, i);
+			maxJ = std::max(maxJ, j);
+		}
+	}
+	if (maxI < 1 || maxJ < 1)
+	{
+		std::cout << "ERROR: shading map has too few cells" << std::endl;
+		return false;
+	}
+	_shadeU = maxI + 1;
+	_shadeV = maxJ + 1;
+	_shadeGains.assign(static_cast<std::size_t>(_shadeU) * _shadeV * 3u, 1.0f);
+	for (const Cell &c : cells)
+	{
+		const std::size_t idx = (static_cast<std::size_t>(c.j) * _shadeU + c.i) * 3u;
+		for (int k = 0; k < 3; k++)
+			_shadeGains[idx + k] = c.g[k];
+	}
+	return true;
+}
+
 void *transformLoop(void *arg)
 {
 	// Pin + RT before creating the EGL context so all GL work runs on this thread.
@@ -1916,7 +1969,11 @@ void *transformLoop(void *arg)
 
 #ifdef HAVE_GPU_TRANSFORM
 	if (_useNv12 && _useGpu)
-		_gpuNv12 = new GpuNv12Transform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend, _hyperhdrCalib);
+	{
+		const float *sg = _shadeGains.empty() ? nullptr : _shadeGains.data();
+		_gpuNv12 = new GpuNv12Transform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend,
+										_hyperhdrCalib, sg, _shadeU, _shadeV);
+	}
 	if (!_useNv12 && _useGpu)
 		_gpuRgb = new GpuRgbTransform(_imgWidth, _imgHeight, _imgQuad, _imgWidthToSend, _imgHeightToSend, _hyperhdrCalib);
 #endif
@@ -2650,6 +2707,7 @@ int main(int argc, char *argv[])
 		("no-realtime", po::bool_switch(&_noRealtime)->default_value(false), "Disable SCHED_FIFO real-time scheduling (still pins threads to cores)")																											  //
 		("rt-priority", po::value<int>(&_rtPriority)->default_value(10), "SCHED_FIFO priority for capture/worker threads (1-99, default 10)")																													  //
 		("latency-stats", po::bool_switch(&_latencyStats)->default_value(false), "Print per-second sensor->send latency percentiles (p50/p95/p99) to stderr")																									  //
+		("shading-map", po::value<std::string>(&_shadingMapPath), "Apply an ALSC shading-correction map (shading.csv from --ledcalib shading) in the NV12 warp shader")								  //
 		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread")														  //
 		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value("all"), "One-shot LED 3D-LUT calibration measurement and exit (optional phase: all|white|tv|led; see doc/led-lut-calibration.md)")									  //
 		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h in raw full-frame coords (pick from --imgout without --crop)")																	  //
@@ -3118,6 +3176,20 @@ int main(int argc, char *argv[])
 	{
 		std::cout << "ERROR: wrong white balance gains!" << std::endl;
 		return EXIT_FAILURE;
+	}
+
+	// Load the ALSC shading map (applied in the NV12 GPU warp shader only).
+	if (!_shadingMapPath.empty())
+	{
+		if (!loadShadingMap(_shadingMapPath))
+			return EXIT_FAILURE;
+		if (_useNv12 && _useGpu)
+			std::cout << "INFO: shading map " << _shadeU << "x" << _shadeV << " loaded from " << _shadingMapPath << std::endl;
+		else
+		{
+			std::cout << "WARNING: --shading-map is only applied on the NV12 GPU transform path; ignored here" << std::endl;
+			_shadeGains.clear();
+		}
 	}
 
 	// Create a Camera Manager.

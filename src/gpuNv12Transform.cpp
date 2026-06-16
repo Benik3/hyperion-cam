@@ -370,6 +370,13 @@ struct GpuNv12Transform::Impl
 	int lutN{17};
 	GLuint texLut{0};
 
+	// Shading / ALSC correction (--shading-map): per-output-position RGB gain
+	// applied in the warp shader. Independent of the LUT test above.
+	bool shadeEnabled{false};
+	int shadeU{0}, shadeV{0};
+	GLuint texShade{0};
+	std::vector<uint8_t> shadeData; // RGBA8 gain map (gain*255)
+
 	int srcW{0}, srcH{0};
 	int dstW{0}, dstH{0};
 
@@ -396,9 +403,28 @@ struct GpuNv12Transform::Impl
 
 	GLint texFilter{GL_NEAREST};
 
-	Impl(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality)
+	Impl(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality,
+		 const float *shadeGains, int shadeUin, int shadeVin)
 		: srcW(srcWidth), srcH(srcHeight), dstW(dstWidth), dstH(dstHeight)
 	{
+		// Shading gain map (packed-path only; needs the RGB round-trip shaders).
+		if (shadeGains && shadeUin >= 2 && shadeVin >= 2)
+		{
+			shadeU = shadeUin;
+			shadeV = shadeVin;
+			shadeData.resize(static_cast<std::size_t>(shadeU) * shadeV * 4u);
+			for (int k = 0; k < shadeU * shadeV; k++)
+			{
+				for (int c = 0; c < 3; c++)
+				{
+					float g = shadeGains[k * 3 + c];
+					g = g < 0.f ? 0.f : (g > 1.f ? 1.f : g);
+					shadeData[k * 4 + c] = static_cast<uint8_t>(g * 255.f + 0.5f);
+				}
+				shadeData[k * 4 + 3] = 255;
+			}
+			shadeEnabled = true;
+		}
 		texFilter = highQuality ? GL_LINEAR : GL_NEAREST;
 		profile = envEnabled("HYPERCAM_GL_PROFILE");
 		profileSync = envEnabled("HYPERCAM_GL_PROFILE_SYNC");
@@ -433,6 +459,15 @@ struct GpuNv12Transform::Impl
 		if (lutEnabled)
 			std::cerr << "[gpuNv12] LUT test enabled: " << lutN << "^3 "
 					  << (lutTrilinear ? "trilinear" : "tetrahedral") << std::endl;
+
+		if (shadeEnabled && !packed)
+		{
+			std::cerr << "[gpuNv12] WARN: shading map requires the packed readback path; disabled" << std::endl;
+			shadeEnabled = false;
+			shadeData.clear();
+		}
+		if (shadeEnabled)
+			std::cerr << "[gpuNv12] shading correction enabled: " << shadeU << "x" << shadeV << " gain map" << std::endl;
 
 		// EGL init (headless pbuffer). We try default display first, then fall back
 		// to Mesa surfaceless if the default display can't initialize.
@@ -670,11 +705,66 @@ void main(){
 }
 )";
 
+		// Shading variants: per-output-position RGB gain (2D map sampled by
+		// gl_FragCoord) applied via a limited-range YUV<->RGB round trip. The
+		// gain is sampled once per fragment (shading is smooth across 4 lanes).
+		const std::string fsYPackedShadeSrc = lutHeader +
+											  "uniform sampler2D uTexC;\nuniform sampler2D uShade;\nuniform vec2 uFboSize;\n" + R"(
+vec3 yuv2rgb(float y, vec2 c){
+  float yl=(y-16.0/255.0)*(255.0/219.0);
+  float u=(c.x-128.0/255.0)*(255.0/224.0), v=(c.y-128.0/255.0)*(255.0/224.0);
+  return vec3(yl+1.402*v, yl-0.344136*u-0.714136*v, yl+1.772*u);
+}
+float lumOf(vec2 t, vec3 g){
+  vec3 rgb=clamp(yuv2rgb(texture(uTex,t).r, texture(uTexC,t).rg)*g, 0.0, 1.0);
+  return dot(rgb, vec3(0.299,0.587,0.114))*(219.0/255.0)+16.0/255.0;
+}
+void main(){
+  vec3 g = texture(uShade, gl_FragCoord.xy/uFboSize).rgb;
+  vec3 s=vSrc;
+  vec2 t0=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
+  vec2 t1=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
+  vec2 t2=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
+  vec2 t3=(s.xy/s.z+vec2(0.5))*uInvTexSize;
+  outColor=vec4(lumOf(t0,g),lumOf(t1,g),lumOf(t2,g),lumOf(t3,g));
+}
+)";
+		const std::string fsUVPackedShadeSrc = lutHeader +
+											   "uniform sampler2D uTexY2;\nuniform sampler2D uShade;\nuniform vec2 uFboSize;\n" + R"(
+vec3 yuv2rgb(float y, vec2 c){
+  float yl=(y-16.0/255.0)*(255.0/219.0);
+  float u=(c.x-128.0/255.0)*(255.0/224.0), v=(c.y-128.0/255.0)*(255.0/224.0);
+  return vec3(yl+1.402*v, yl-0.344136*u-0.714136*v, yl+1.772*u);
+}
+vec2 chromaOf(vec2 t, vec3 g){
+  vec3 rgb=clamp(yuv2rgb(texture(uTexY2,t).r, texture(uTex,t).rg)*g, 0.0, 1.0);
+  return vec2(dot(rgb, vec3(-0.168736,-0.331264,0.5))*(224.0/255.0)+128.0/255.0,
+              dot(rgb, vec3(0.5,-0.418688,-0.081312))*(224.0/255.0)+128.0/255.0);
+}
+void main(){
+  vec3 g = texture(uShade, gl_FragCoord.xy/uFboSize).rgb;
+  vec3 s=vSrc;
+  vec2 t0=(s.xy/s.z+vec2(0.5))*uInvTexSize; s+=uDx;
+  vec2 t1=(s.xy/s.z+vec2(0.5))*uInvTexSize;
+  outColor=vec4(chromaOf(t0,g),chromaOf(t1,g));
+}
+)";
+
+		const char *ySrc = packed ? fsYPackedSrc : fsYSrc;
+		const char *uvSrc = packed ? fsUVPackedSrc : fsUVSrc;
+		if (lutEnabled)
+		{
+			ySrc = fsYPackedLutSrc.c_str();
+			uvSrc = fsUVPackedLutSrc.c_str();
+		}
+		else if (shadeEnabled)
+		{
+			ySrc = fsYPackedShadeSrc.c_str();
+			uvSrc = fsUVPackedShadeSrc.c_str();
+		}
 		GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-		GLuint fsY = compileShader(GL_FRAGMENT_SHADER,
-								   lutEnabled ? fsYPackedLutSrc.c_str() : (packed ? fsYPackedSrc : fsYSrc));
-		GLuint fsUV = compileShader(GL_FRAGMENT_SHADER,
-									lutEnabled ? fsUVPackedLutSrc.c_str() : (packed ? fsUVPackedSrc : fsUVSrc));
+		GLuint fsY = compileShader(GL_FRAGMENT_SHADER, ySrc);
+		GLuint fsUV = compileShader(GL_FRAGMENT_SHADER, uvSrc);
 
 		progY = linkProgram(vs, fsY);
 		uMatY = glGetUniformLocation(progY, "uInv");
@@ -717,7 +807,34 @@ void main(){
 			glUniform1i(glGetUniformLocation(progUV, "uTexY2"), 1);
 			glUniform1i(glGetUniformLocation(progUV, "uLut"), 2);
 		}
+		if (shadeEnabled)
+		{
+			glUseProgram(progY);
+			glUniform1i(glGetUniformLocation(progY, "uTexC"), 1);
+			glUniform1i(glGetUniformLocation(progY, "uShade"), 2);
+			glUniform2f(glGetUniformLocation(progY, "uFboSize"),
+						static_cast<float>(packedYW), static_cast<float>(dstH));
+			glUseProgram(progUV);
+			glUniform1i(glGetUniformLocation(progUV, "uTexY2"), 1);
+			glUniform1i(glGetUniformLocation(progUV, "uShade"), 2);
+			glUniform2f(glGetUniformLocation(progUV, "uFboSize"),
+						static_cast<float>(packedUVW), static_cast<float>(dstH / 2));
+		}
 		glUseProgram(0);
+
+		if (shadeEnabled)
+		{
+			// Bilinear RGBA8 gain map; cell (i,j) at data row j (v=0 = TV top,
+			// matching the warp output and the shading measurement).
+			glGenTextures(1, &texShade);
+			glBindTexture(GL_TEXTURE_2D, texShade);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, shadeU, shadeV, 0, GL_RGBA, GL_UNSIGNED_BYTE, shadeData.data());
+			glBindTexture(GL_TEXTURE_2D, 0);
+		}
 
 		if (lutEnabled)
 		{
@@ -884,6 +1001,8 @@ void main(){
 			glDeleteBuffers(1, &pboSyncUV);
 		if (texLut)
 			glDeleteTextures(1, &texLut);
+		if (texShade)
+			glDeleteTextures(1, &texShade);
 		if (texY)
 			glDeleteTextures(1, &texY);
 		if (texUV)
@@ -1118,6 +1237,13 @@ void main(){
 			glActiveTexture(GL_TEXTURE2);
 			glBindTexture(GL_TEXTURE_3D, texLut);
 		}
+		else if (shadeEnabled)
+		{
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, texUV);
+			glActiveTexture(GL_TEXTURE2);
+			glBindTexture(GL_TEXTURE_2D, texShade);
+		}
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texY);
 		glBindVertexArray(vao);
@@ -1150,6 +1276,13 @@ void main(){
 			glBindTexture(GL_TEXTURE_2D, texY);
 			glActiveTexture(GL_TEXTURE2);
 			glBindTexture(GL_TEXTURE_3D, texLut);
+		}
+		else if (shadeEnabled)
+		{
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, texY);
+			glActiveTexture(GL_TEXTURE2);
+			glBindTexture(GL_TEXTURE_2D, texShade);
 		}
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texUV);
@@ -1355,9 +1488,10 @@ void main(){
 	}
 };
 
-GpuNv12Transform::GpuNv12Transform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality)
+GpuNv12Transform::GpuNv12Transform(int srcWidth, int srcHeight, const cv::Point2f *srcQuad, int dstWidth, int dstHeight, bool highQuality,
+								   const float *shadeGains, int shadeU, int shadeV)
 {
-	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight, highQuality);
+	_impl = new Impl(srcWidth, srcHeight, srcQuad, dstWidth, dstHeight, highQuality, shadeGains, shadeU, shadeV);
 }
 
 GpuNv12Transform::~GpuNv12Transform()
@@ -1378,7 +1512,7 @@ bool GpuNv12Transform::transformDmabuf(int fdY, int offsetYBytes, int strideY, i
 
 #else
 
-GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int, bool)
+GpuNv12Transform::GpuNv12Transform(int, int, const cv::Point2f *, int, int, bool, const float *, int, int)
 {
 	throw std::runtime_error("GPU transform support not compiled in (missing EGL/GLES3 dev libs)");
 }

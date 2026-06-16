@@ -7,12 +7,18 @@
 class GpuNv12Transform
 {
 public:
+	// shadeGains (optional): per-output-position RGB gain map, shadeU*shadeV*3
+	// floats in [0,1], row-major (cell (i,j) at (j*shadeU+i)*3). Applied in the
+	// warp shader (--shading-map / ALSC correction). nullptr = disabled.
 	GpuNv12Transform(int srcWidth,
 					 int srcHeight,
 					 const cv::Point2f *srcQuad,
 					 int dstWidth,
 					 int dstHeight,
-					 bool highQuality = false);
+					 bool highQuality = false,
+					 const float *shadeGains = nullptr,
+					 int shadeU = 0,
+					 int shadeV = 0);
 	~GpuNv12Transform();
 
 	GpuNv12Transform(const GpuNv12Transform &) = delete;

@@ -238,6 +238,29 @@ Output: `gamma.csv` and/or `raw_gamma.csv` (`channel,level,meas RGB,temporal-std
 frames`). `tools/plot-gamma.py` (stdlib-only → SVG) overlays both runs, normalized, so crush/clip
 and ISP-vs-RAW divergence are visible in a browser on the Pi.
 
+## Shading / ALSC correction (`--ledcalib shading` + `--shading-map`, 2026-06-16)
+
+Position-dependent error (lens vignetting + TV-panel non-uniformity) that a single global LUT
+**cannot** fix — it miscolors edge-mapped LEDs. This is the *TV-side* calibration: it runs through
+the production `--crop` + `--transform`, unlike the LED sweep (which needs the full frame).
+
+- **Measure** `--ledcalib shading`: full-screen safe gray (`--shading-level`, default 180 — never
+  white, to dodge clipping/ABL on any TV), samples a `--shading-grid` (UxV, default 24×14) across
+  the TV quad (each cell mapped through the inverse homography of `--transform`, averaged), writes
+  `shading.csv` (per-cell RGB + gains) and prints the magnitude (luminance falloff + center→edge
+  R/G/B-ratio drift — the latter decides if it's worth applying). Bakes in *both* lens and panel
+  non-uniformity, which is wanted (correct THIS TV; especially LCDs).
+- **Apply** `--shading-map shading.csv`: bilinear RGBA8 gain texture, multiplied per output
+  position in the NV12 warp shader (YUV→RGB→×gain→YUV, limited-range BT.601). Gains are
+  **darken-to-dimmest** (≤1), so the correction can never push a region into clipping. Cost ~+0.7
+  ms render / +0.5 ms p50 (folds into the LUT's RGB round-trip if both are on); zero when not
+  passed. NV12 GPU path only.
+- The wall/LED-ROI is left uncorrected on purpose: its (constant) shading cancels between the white
+  anchor and the LED sweep, so it doesn't affect the LED calibration.
+- **Verify on the real TV** (can't be checked off-Pi): show uniform gray with the map applied — it
+  should get *flatter*, not worse. If a corner gets worse it's an axis flip in the gain texture
+  upload, a one-line fix.
+
 ### Phase 4 — verification (later milestone)
 
 Closed-loop spot check on ~20 colors through the built LUT; report residuals in anchored camera
