@@ -2806,7 +2806,8 @@ int main(int argc, char *argv[])
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
-		("lut-size", po::value<int>(&_ledCalibFitCfg.lutSize)->default_value(33), "LUT grid points per axis for --ledcalib-fit (2-65)");
+		("lut-size", po::value<int>(&_ledCalibFitCfg.lutSize)->default_value(33), "LUT grid points per axis for --ledcalib-fit (2-65)")									  //
+		("calib-clip-level", po::value<double>(&_ledCalibFitCfg.clipLevel)->default_value(250.0), "--ledcalib-fit: camera reading >= this (per channel) = clipped; the white anchor uses the brightest unclipped neutral level");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes
 

@@ -130,6 +130,13 @@ Reads `led_sweep.csv` + `baseline.json` + the **white point from `tv_sweep.csv`*
 `white_anchor.json` → derives von-Kries white from the sweeps = your HyperHDR WB). Writes
 `cal/lut.cube` + `cal/fit_report.json`.
 
+> **Clipping / white level.** If the LEDs are brighter than the TV (or vice-versa), true white
+> (255) can saturate the camera — and the camera maxes *below* 255 anyway (often ~252). The fit
+> auto-picks the **brightest neutral level where neither the TV nor LED reading clips**
+> (`--calib-clip-level`, default 250); it prints e.g. `White anchor from sweeps at neutral level
+> 204 (dimmer than 255 to avoid camera clipping)`. If it says *no unclipped neutral level found*,
+> lower the brighter side (TV backlight or LED max) so white isn't blown out, and re-measure.
+
 ---
 
 ## Step 5 — Apply

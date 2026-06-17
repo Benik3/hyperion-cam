@@ -187,10 +187,9 @@ namespace
 		return !out.empty();
 	}
 
-	// Camera reading of the white TV patch (255,255,255) from tv_sweep.csv,
-	// parsed by header name (robust to column additions). Returns false if the
-	// file or a near-white patch is absent.
-	bool loadTvWhite(const std::string &path, cv::Vec3d &tvWhite)
+	// All neutral (r==g==b) TV patches from tv_sweep.csv: (commanded level,
+	// cam_tv). Parsed by header name. Returns false if the file/columns absent.
+	bool loadTvNeutrals(const std::string &path, std::vector<std::pair<double, cv::Vec3d>> &out)
 	{
 		std::ifstream f(path);
 		if (!f)
@@ -198,7 +197,6 @@ namespace
 		std::string line;
 		if (!std::getline(f, line))
 			return false;
-		// header may be preceded by a comment line in some files
 		while (!line.empty() && line[0] == '#')
 			if (!std::getline(f, line))
 				return false;
@@ -214,9 +212,6 @@ namespace
 		for (const char *n : need)
 			if (!col.count(n))
 				return false;
-
-		double bestSum = -1.0;
-		bool found = false;
 		while (std::getline(f, line))
 		{
 			if (line.empty())
@@ -229,55 +224,78 @@ namespace
 			if (static_cast<int>(v.size()) <= col["tv_b"])
 				continue;
 			const double pr = v[col["patch_r"]], pg = v[col["patch_g"]], pb = v[col["patch_b"]];
-			// brightest neutral patch
 			if (std::fabs(pr - pg) > 1.0 || std::fabs(pg - pb) > 1.0)
-				continue;
-			if (pr > bestSum)
-			{
-				bestSum = pr;
-				tvWhite = {v[col["tv_r"]], v[col["tv_g"]], v[col["tv_b"]]};
-				found = true;
-			}
+				continue; // not neutral
+			out.push_back({pr, cv::Vec3d{v[col["tv_r"]], v[col["tv_g"]], v[col["tv_b"]]}});
 		}
-		return found && bestSum >= 200.0; // require a near-full-white patch
+		return !out.empty();
 	}
 
-	// HyperHDR-WB workflow: no dedicated eye-anchor phase. Derive the von-Kries
-	// white correction from the white points already in the two sweeps -
-	// cam_tv_white (TV showing white) and cam_led_white (LED at full drive),
-	// matched by the user's HyperHDR white balance. doc/led-lut-calibration.md.
-	bool deriveAnchorFromSweeps(const std::string &dir, CalibData &d)
+	// HyperHDR-WB workflow: derive the von-Kries white from the brightest neutral
+	// level where NEITHER the TV nor the LED camera reading clips. The camera
+	// maxes below 255, and the TV or the LEDs can be the brighter side, so the
+	// true-white (255) point is often saturated -> use a dimmer clean white.
+	// doc/led-lut-calibration.md.
+	bool deriveAnchorFromSweeps(const std::string &dir, CalibData &d, double clip)
 	{
-		cv::Vec3d tvWhite;
-		if (!loadTvWhite(dir + "/tv_sweep.csv", tvWhite))
+		std::vector<std::pair<double, cv::Vec3d>> tvN;
+		if (!loadTvNeutrals(dir + "/tv_sweep.csv", tvN))
 			return false;
-		// LED reading at full white drive.
-		cv::Vec3d ledWhite{0, 0, 0};
-		double best = -1.0;
+
+		// Neutral LED drives -> cam_led, sorted by level for interpolation.
+		std::vector<std::pair<double, cv::Vec3d>> ledN;
 		for (const auto &s : d.samples)
-		{
-			const double m = std::min({s.drive[0], s.drive[1], s.drive[2]});
-			if (std::fabs(s.drive[0] - s.drive[1]) < 1.0 && std::fabs(s.drive[1] - s.drive[2]) < 1.0 && m > best)
-			{
-				best = m;
-				ledWhite = s.led;
-			}
-		}
-		if (best < 200.0)
+			if (std::fabs(s.drive[0] - s.drive[1]) < 1.0 && std::fabs(s.drive[1] - s.drive[2]) < 1.0)
+				ledN.push_back({s.drive[0], s.led});
+		if (ledN.empty())
 			return false;
-		d.anchorDrive[0] = d.anchorDrive[1] = d.anchorDrive[2] = best;
-		d.anchorTv = tvWhite;
-		d.anchorLed = ledWhite;
-		for (int c = 0; c < 3; c++)
-			d.gains[c] = ledWhite[c] > 1.0 ? tvWhite[c] / ledWhite[c] : 1.0;
-		std::cout << "White anchor derived from sweep white points (HyperHDR-WB workflow): "
-				  << "TV " << tvWhite[0] << "," << tvWhite[1] << "," << tvWhite[2]
-				  << "  LED@" << best << " " << ledWhite[0] << "," << ledWhite[1] << "," << ledWhite[2]
-				  << "  gains " << d.gains[0] << "," << d.gains[1] << "," << d.gains[2] << std::endl;
-		return true;
+		std::sort(ledN.begin(), ledN.end(), [](auto &a, auto &b) { return a.first < b.first; });
+		auto ledAt = [&](double L) -> cv::Vec3d
+		{
+			if (L <= ledN.front().first)
+				return ledN.front().second;
+			if (L >= ledN.back().first)
+				return ledN.back().second;
+			for (std::size_t i = 1; i < ledN.size(); i++)
+				if (ledN[i].first >= L)
+				{
+					const double t = (L - ledN[i - 1].first) / std::max(1e-9, ledN[i].first - ledN[i - 1].first);
+					return ledN[i - 1].second + (ledN[i].second - ledN[i - 1].second) * t;
+				}
+			return ledN.back().second;
+		};
+
+		auto clipped = [&](const cv::Vec3d &v)
+		{ return v[0] >= clip || v[1] >= clip || v[2] >= clip; };
+
+		// Brightest neutral level (from the TV patches) with both sides clean.
+		std::sort(tvN.begin(), tvN.end(), [](auto &a, auto &b) { return a.first > b.first; });
+		for (const auto &[L, tv] : tvN)
+		{
+			if (L < 64.0)
+				break; // too dark to be a usable white reference
+			const cv::Vec3d led = ledAt(L);
+			if (clipped(tv) || clipped(led))
+				continue;
+			d.anchorDrive[0] = d.anchorDrive[1] = d.anchorDrive[2] = L;
+			d.anchorTv = tv;
+			d.anchorLed = led;
+			for (int c = 0; c < 3; c++)
+				d.gains[c] = led[c] > 1.0 ? tv[c] / led[c] : 1.0;
+			std::cout << "White anchor from sweeps at neutral level " << L
+					  << (L < 254.0 ? " (dimmer than 255 to avoid camera clipping)" : "") << ": "
+					  << "TV " << tv[0] << "," << tv[1] << "," << tv[2]
+					  << "  LED " << led[0] << "," << led[1] << "," << led[2]
+					  << "  gains " << d.gains[0] << "," << d.gains[1] << "," << d.gains[2] << std::endl;
+			return true;
+		}
+		std::cout << "ERROR: no unclipped neutral level found (every white patch saturates the camera "
+					 "at >= " << clip << "). Lower the TV and/or LED brightness, or raise --calib-clip-level."
+				  << std::endl;
+		return false;
 	}
 
-	bool loadCalibData(const std::string &dir, CalibData &d)
+	bool loadCalibData(const std::string &dir, CalibData &d, double clip = 250.0)
 	{
 		if (!loadLedSweepCsv(dir + "/led_sweep.csv", d.samples))
 			return false;
@@ -299,7 +317,7 @@ namespace
 		{
 			// No eye-anchor phase: try to derive the white correction from the
 			// sweep white points (requires HyperHDR WB to have eye-matched white).
-			if (deriveAnchorFromSweeps(dir, d))
+			if (deriveAnchorFromSweeps(dir, d, clip))
 				return true;
 			std::cout << "WARNING: no white_anchor.json and could not derive white from tv_sweep.csv; "
 						 "assuming neutral gains (no metameric correction - run --ledcalib white, "
@@ -832,7 +850,7 @@ namespace
 int runLedCalibFit(const LedCalibFitConfig &cfg)
 {
 	CalibData data;
-	if (!loadCalibData(cfg.calibDir, data))
+	if (!loadCalibData(cfg.calibDir, data, cfg.clipLevel))
 		return EXIT_FAILURE;
 	std::cout << "Loaded " << data.samples.size() << " LED sweep samples from " << cfg.calibDir << std::endl;
 

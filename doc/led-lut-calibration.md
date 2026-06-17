@@ -203,8 +203,10 @@ correction than the diagonal white (multiple TV/LED correspondences → a 3×3).
 
 There is **no `all` phase**: run `--ledcalib tv` (cropped+shaded) and `--ledcalib led` (full frame)
 separately into the same `--calib-out`. Neither writes `white_anchor.json`, so `--ledcalib-fit`
-**derives** the von-Kries white from the sweep white points — `cam_tv_white` (the TV sweep's
-(255,255,255) patch) / `cam_led_white` (the LED sweep's full-white drive). The eye-truth comes from
+**derives** the von-Kries white from the sweep white points — `cam_tv_white / cam_led_white` at the
+**brightest neutral level where neither side clips the camera** (`--calib-clip-level`, default 250;
+the camera maxes below 255 and the TV or LEDs may be the brighter side, so true-255 white often
+saturates → a dimmer clean neutral is used, with the LED side interpolated to that level). The eye-truth comes from
 **HyperHDR's white balance** (set it to match the LED white to the TV white before measuring —
 e.g. to pull down bluish LEDs). Identical result to a Phase-0 eye anchor, and the TV and LED can't
 share a frame anyway (cropped TV vs full-frame wall). **Timing rule:** HyperHDR WB (and all HyperHDR

@@ -13,6 +13,11 @@ struct LedCalibFitConfig
 	std::string calibDir = "ledcalib-out"; // input: led_sweep.csv, baseline.json, white_anchor.json
 	std::string lutOut;					   // output .cube path (default <calibDir>/lut.cube)
 	int lutSize = 33;					   // LUT grid per axis (trilinear runtime -> use dense grid)
+	// Camera-clipping threshold: a reading >= this (per channel) is treated as
+	// clipped/saturated. The white anchor uses the brightest neutral level where
+	// neither the TV nor the LED reading clips (the camera maxes below 255, and
+	// LEDs/TV may be brighter than each other). 0..255.
+	double clipLevel = 250.0;
 	bool verbose = false;
 };
 
