@@ -131,6 +131,9 @@ es.onmessage=ev=>{
   let s; try{s=JSON.parse(ev.data);}catch(_){return;}
   last=s;
   patch.style.background='rgb('+s.r+','+s.g+','+s.b+')';
+  // Hide the corner keep-alive + status during a clean full-frame measurement.
+  ka.style.display = s.clean ? 'none' : '';
+  st.style.display = s.clean ? 'none' : '';
   layout(s);
   if(s.controls){ui.classList.add('on');
     document.getElementById('dr').textContent=s.lr;
@@ -190,6 +193,7 @@ struct LedCalibWeb::Impl
 	uint32_t seq = 0;
 	bool dirty = true;
 	double wp = 100.0, wx = -1.0, wy = -1.0; // window-patch geometry (% / %pos)
+	bool clean = false;						 // hide keep-alive + status (shading)
 
 	std::atomic<uint32_t> acked{0};
 	std::atomic<bool> hasClient{false};
@@ -216,12 +220,12 @@ struct LedCalibWeb::Impl
 	std::string buildSseData()
 	{
 		std::lock_guard<std::mutex> lk(sm);
-		char buf[220];
+		char buf[256];
 		std::snprintf(buf, sizeof(buf),
 					  "data: {\"r\":%u,\"g\":%u,\"b\":%u,\"seq\":%u,\"controls\":%s,\"lr\":%u,\"lg\":%u,\"lb\":%u,"
-					  "\"wp\":%.3f,\"wx\":%.3f,\"wy\":%.3f}\n\n",
+					  "\"wp\":%.3f,\"wx\":%.3f,\"wy\":%.3f,\"clean\":%s}\n\n",
 					  color[0], color[1], color[2], seq, controls ? "true" : "false",
-					  led[0], led[1], led[2], wp, wx, wy);
+					  led[0], led[1], led[2], wp, wx, wy, clean ? "true" : "false");
 		return buf;
 	}
 };
@@ -388,6 +392,13 @@ bool LedCalibWeb::start()
 }
 
 int LedCalibWeb::port() const { return _d->port; }
+
+void LedCalibWeb::setCleanField(bool clean)
+{
+	std::lock_guard<std::mutex> lk(_d->sm);
+	_d->clean = clean;
+	_d->dirty = true;
+}
 
 void LedCalibWeb::setPatchGeometry(double pct, double x, double y)
 {

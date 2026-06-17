@@ -29,6 +29,10 @@ public:
 
 	int port() const;
 
+	/// Hide the corner keep-alive square + status text (they'd corrupt a
+	/// full-frame measurement like shading). Off by default.
+	void setCleanField(bool clean);
+
 	/// Window-patch geometry: pct = patch area as a percentage of the screen
 	/// (100 = fullscreen), x/y = top-left position in screen-percent (<0 =
 	/// centered). Constant for a run; call once before/after start().

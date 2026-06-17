@@ -535,6 +535,7 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		// Full-screen safe gray; sample the TV quad once it has settled.
 		if (_web)
 		{
+			_web->setCleanField(true); // hide keep-alive + status: full-frame sample
 			_web->setPatchGeometry(100.0, -1.0, -1.0);
 			_webSeq++;
 			const uint8_t g = static_cast<uint8_t>(_cfg.shadingLevel);
