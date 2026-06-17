@@ -2783,7 +2783,7 @@ int main(int argc, char *argv[])
 		("shading-map", po::value<std::string>(&_shadingMapPath), "Apply an ALSC shading-correction map (shading.csv from --ledcalib shading) in the NV12 warp shader")								  //
 		("lut", po::value<std::string>(&_lutPath), "Apply a 3D color LUT (.cube from --ledcalib-fit) in the NV12 warp shader; composes with --shading-map")									  //
 		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread")														  //
-		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value("all"), "One-shot LED 3D-LUT calibration measurement and exit (optional phase: all|white|tv|led; see doc/led-lut-calibration.md)")									  //
+		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value(""), "One-shot LED 3D-LUT calibration measurement and exit. Phase: tv | led | shading | gamma | white (run tv+led separately; see doc/calibration-guide.md)")									  //
 		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h in raw full-frame coords (pick from --imgout without --crop)")																	  //
 		("calib-led-roi", po::value<std::string>(&_calibLedRoiStr), "LED calib: ROI on the LED-lit wall, x,y,w,h in raw full-frame coords")																										  //
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
@@ -2794,7 +2794,6 @@ int main(int argc, char *argv[])
 		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page (PC on the TV's HDMI) instead of the calib video")								  //
 		("calib-tv-port", po::value<int>(&_ledCalibWebPort)->default_value(8080), "LED calib: TV web page port (--calib-tv-web)")																					  //
 		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-12)")											  //
-		("calib-no-anchor", po::bool_switch(&_ledCalibCfg.noAnchor)->default_value(false), "LED calib: skip the Phase 0 eye anchor (set white in HyperHDR instead; fit derives it from the sweep whites)") //
 		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
 		("shading-level", po::value<int>(&_ledCalibCfg.shadingLevel)->default_value(180), "LED calib (phase shading): safe gray code value for the full-TV field (avoid clip/ABL)")					  //
@@ -3075,10 +3074,11 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: --ledcalib must be run alone (no --autowb/--autogain/--autocalib/--autosat/--hyperhdr-calib/--imgout)" << std::endl;
 			return EXIT_FAILURE;
 		}
-		if (_ledCalibPhase != "all" && _ledCalibPhase != "white" && _ledCalibPhase != "tv" &&
+		if (_ledCalibPhase != "white" && _ledCalibPhase != "tv" &&
 			_ledCalibPhase != "led" && _ledCalibPhase != "gamma" && _ledCalibPhase != "shading")
 		{
-			std::cout << "ERROR: --ledcalib phase must be one of: all, white, tv, led, gamma, shading" << std::endl;
+			std::cout << "ERROR: --ledcalib needs a phase: tv | led | shading | gamma | white\n"
+						 "       (run tv and led separately; the fit derives white from their white points)" << std::endl;
 			return EXIT_FAILURE;
 		}
 		const bool gammaMode = (_ledCalibPhase == "gamma");

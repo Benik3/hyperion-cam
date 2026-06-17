@@ -34,7 +34,7 @@ struct LedCalibConfig
 	LedCalibRoi tvRoi;	// inside the TV picture, raw full-frame coords
 	LedCalibRoi ledRoi; // on the wall lit by the LEDs, raw full-frame coords
 	std::string outDir = "ledcalib-out";
-	std::string phase = "all"; // all | white | tv | led
+	std::string phase = "tv"; // tv | led | shading | gamma | white
 	int ledGrid = 8;		   // LED sweep cube grid points per axis
 	int ledGrayRamp = 17;	   // extra gray ramp steps in the LED sweep
 	int tvPatchCount = 216;	   // patches in the calib video TV sweep (max 216 = 3 base-6 digits)
@@ -46,9 +46,6 @@ struct LedCalibConfig
 	// Web TV-patch path (vs the calib-video index-code path).
 	bool tvWeb = false; // drive the TV via the browser page instead of a video
 	int tvGrid = 6;		// TV patch cube grid points per axis (web mode)
-	// Skip the Phase 0 eye anchor in phase "all" (HyperHDR-WB workflow): the
-	// white correction is derived from the sweep white points by --ledcalib-fit.
-	bool noAnchor = false;
 	// Configured window-patch geometry for the measurement sweeps. The Phase 0
 	// white field overrides this to fullscreen; the sweeps restore it.
 	double patchPct = 10.0;

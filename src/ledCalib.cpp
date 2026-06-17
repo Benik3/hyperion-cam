@@ -102,8 +102,8 @@ LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, 
 		_phase = Phase::GammaWait;
 	else if (_cfg.phase == "shading")
 		_phase = Phase::ShadingWait;
-	else // "all"
-		_phase = _cfg.noAnchor ? Phase::TvWait : Phase::WhiteWait;
+	else
+		_phase = Phase::Done; // validated upstream; never reached
 
 	_kbThread = std::thread(&LedCalib::keyboardLoop, this);
 }

@@ -120,7 +120,7 @@ the page (no terminal input). Video path: same, but white comes from the calib v
 over SSH/Pi tty. Output: anchor drive value, camera readings of both ROIs, von-Kries gains
 `g_c = tv_c / led_c`. All subsequent camera readings of LED light are multiplied by `g`. (If you
 tune in HyperHDR and leave the drive at full white, the measured anchor captures that — equivalent
-to `--calib-no-anchor` + sweep-derived white, but as a direct measurement.) The TV sweep then
+to the sweep-derived white, but as a direct measurement.) The TV sweep then
 restores the windowed patch geometry.
 
 TV shows the white section of the calib video. LEDs driven white. The user nudges the LED drive
@@ -199,16 +199,18 @@ absent, is **derived from the sweep white points** — `cam_tv_white` (the white
 still unused, kept for two later uses: (a) gamut/coverage weighting; (b) a richer metameric
 correction than the diagonal white (multiple TV/LED correspondences → a 3×3).
 
-### Skipping the anchor (HyperHDR-WB workflow)
+### White from the sweeps (the standard workflow)
 
-If you set white in **HyperHDR's white balance** instead of the Phase 0 eye-match (e.g. to pull
-down bluish LEDs), you can skip Phase 0 with `--calib-no-anchor` (phase `all` starts at the TV
-sweep). `--ledcalib-fit` then derives the von-Kries gains from `cam_tv_white / cam_led_white` in
-the sweeps — identical result, because both establish the same eye-truth at white and the gains
-are what the LUT needs. **Timing rule:** HyperHDR WB (and all HyperHDR colour settings) are frozen
-into the LED sweep, so set your white balance *before* measuring; a big WB change *after* a
-measurement invalidates the LUT (re-measure). The TV sweep must include a near-white patch
-(the default cube grid's (255,255,255) corner does).
+There is **no `all` phase**: run `--ledcalib tv` (cropped+shaded) and `--ledcalib led` (full frame)
+separately into the same `--calib-out`. Neither writes `white_anchor.json`, so `--ledcalib-fit`
+**derives** the von-Kries white from the sweep white points — `cam_tv_white` (the TV sweep's
+(255,255,255) patch) / `cam_led_white` (the LED sweep's full-white drive). The eye-truth comes from
+**HyperHDR's white balance** (set it to match the LED white to the TV white before measuring —
+e.g. to pull down bluish LEDs). Identical result to a Phase-0 eye anchor, and the TV and LED can't
+share a frame anyway (cropped TV vs full-frame wall). **Timing rule:** HyperHDR WB (and all HyperHDR
+colour settings) are frozen into the LED sweep, so set white *before* measuring; a big WB change
+*after* invalidates the LUT (re-measure). (`--ledcalib white` still exists as an explicit nudge
+anchor for the no-crop/full-frame case, writing `white_anchor.json`.)
 
 ## Gamma ramp probe (`--ledcalib gamma`, implemented 2026-06-15)
 
@@ -268,7 +270,7 @@ shading gain has to be reproduced. It also resolves the "wrong part of the TV" w
 shading every position reads the same flattened value, so the global LUT is valid everywhere and
 the exact ROI choice stops mattering. The LED wall ROI is left unshaded (see above); `all`/`led`
 ignore `--shading-map` (they need the full frame and can't keep the TV crop) — run `tv` and `led`
-as separate phases and derive white from the sweeps (`--calib-no-anchor`).
+as separate phases and derive white from the sweeps (the standard workflow).
 - **Verify on the real TV** (can't be checked off-Pi): show uniform gray with the map applied — it
   should get *flatter*, not worse. If a corner gets worse it's an axis flip in the gain texture
   upload, a one-line fix.
