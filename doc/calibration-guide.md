@@ -165,6 +165,10 @@ Production line:
 | LED | `--ledcalib led` | no | no | tv + led |
 | Fit | `--ledcalib-fit` | — | — | offline |
 
+**Grids are edge-dense:** the TV/LED cube levels are clustered near 0 and 255 (cosine/Chebyshev
+nodes — e.g. 6 → `0,24,88,167,231,255`), since crush/clip live at the ends, not the middle. The
+runtime LUT stays a uniform 33³ and interpolates the fitted model.
+
 **Tunables:** `--calib-tv-grid` (216=6³), `--ledcalib-led-grid` (8³ + gray ramp), `--lut-size`
 (33), `--patch-size`/`--patch-x`/`--patch-y`, `--shading-grid`, `--ledcalib-frames`,
 `--ledcalib-settle-ms`.

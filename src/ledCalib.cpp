@@ -26,6 +26,17 @@ namespace
 	constexpr int64_t kResendIntervalMs = 100;	  // keep HyperHDR fed while a color is held
 	constexpr int64_t kWebAckTimeoutMs = 8000;	  // page must ack a patch within this or we abort
 
+	// Edge-dense grid level: Chebyshev/cosine nodes -> samples clustered near 0
+	// and 255 (where crush/clip live), sparse in the middle. i in [0,n-1].
+	inline uint8_t edgeLevel(int i, int n)
+	{
+		if (n < 2)
+			return 0;
+		const double pi = std::acos(-1.0);
+		const double t = 0.5 * (1.0 - std::cos(pi * i / (n - 1)));
+		return static_cast<uint8_t>(std::lround(255.0 * t));
+	}
+
 	int64_t steadyMs()
 	{
 		return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -926,21 +937,13 @@ void LedCalib::buildLedPlan()
 	_ledPlan.clear();
 	const int g = std::max(2, _cfg.ledGrid);
 	for (int r = 0; r < g; r++)
-	{
 		for (int gg = 0; gg < g; gg++)
-		{
 			for (int b = 0; b < g; b++)
-			{
-				_ledPlan.push_back({static_cast<uint8_t>(r * 255 / (g - 1)),
-									static_cast<uint8_t>(gg * 255 / (g - 1)),
-									static_cast<uint8_t>(b * 255 / (g - 1))});
-			}
-		}
-	}
+				_ledPlan.push_back({edgeLevel(r, g), edgeLevel(gg, g), edgeLevel(b, g)});
 	const int n = std::max(0, _cfg.ledGrayRamp);
 	for (int i = 0; i < n; i++)
 	{
-		const uint8_t v = static_cast<uint8_t>(n > 1 ? i * 255 / (n - 1) : 255);
+		const uint8_t v = (n > 1) ? edgeLevel(i, n) : 255;
 		_ledPlan.push_back({v, v, v});
 	}
 }
@@ -952,9 +955,7 @@ void LedCalib::buildTvPlan()
 	for (int r = 0; r < g; r++)
 		for (int gg = 0; gg < g; gg++)
 			for (int b = 0; b < g; b++)
-				_tvPlan.push_back({static_cast<uint8_t>(r * 255 / (g - 1)),
-								   static_cast<uint8_t>(gg * 255 / (g - 1)),
-								   static_cast<uint8_t>(b * 255 / (g - 1))});
+				_tvPlan.push_back({edgeLevel(r, g), edgeLevel(gg, g), edgeLevel(b, g)});
 }
 
 void LedCalib::showTvPatch(int64_t nowMs)
