@@ -248,6 +248,13 @@ static std::atomic<int> _autoCalibIterCount{0};
 static std::atomic<int64_t> _autoCalibNextAllowedNs{0};
 static std::atomic<int> _autoCalibStage{0}; // 0=init, 1=wb, 2=gain
 static std::mutex _autoCalibMutex;
+// Web-driven autocalib (--calib-tv-web with --autocalib/--autowb/--autogain/--autosat):
+// the page shows the target patch on the TV; the convergence machine is untouched.
+static bool _autoCalibWebStarted = false;	   // user tapped 'begin'
+static int64_t _autoCalibWebSettleNs = 0;	   // settle deadline after start
+static bool _autoCalibRoiEn = false;		   // use a custom ROI instead of edge strips
+static LedCalibRoi _autoCalibRoi;
+static int64_t _autoCalibUrlPrintNs = 0;
 static float _autoLastR = 0.0f;
 static float _autoLastG = 0.0f;
 static float _autoLastB = 0.0f;
@@ -863,6 +870,67 @@ static bool imgOutWriteBgr(const uint8_t *bgr, int width, int height, int stride
 	}
 }
 
+// Web-driven autocalib: show the target patch on the TV. Gray 127 for WB/gain,
+// the saturation target colour for --autosat.
+static void showAutoCalibPatch()
+{
+	if (!_ledCalibWeb)
+		return;
+	static uint32_t seq = 0;
+	uint8_t r, g, b;
+	if (_autoSat)
+	{
+		r = static_cast<uint8_t>(_autoSatTargetR);
+		g = static_cast<uint8_t>(_autoSatTargetG);
+		b = static_cast<uint8_t>(_autoSatTargetB);
+	}
+	else
+		r = g = b = 127; // neutral grey for WB / gain
+	_ledCalibWeb->setState(r, g, b, false, 0, 0, 0, ++seq);
+}
+
+// Returns true if the web gate is blocking convergence this frame (not started
+// yet, or still settling). Releases the busy flag and shows the patch.
+static bool autoCalibWebGate()
+{
+	if (!_ledCalibWeb)
+		return false;
+	char c;
+	while (_ledCalibWeb->popKey(c))
+	{
+		if (c == 'q' || c == 'Q')
+		{
+			std::cout << "AutoCalib aborted by user." << std::endl;
+			imgOutExit(EXIT_FAILURE);
+			return true;
+		}
+		if ((c == '\n' || c == '\r') && !_autoCalibWebStarted)
+		{
+			_autoCalibWebStarted = true;
+			_autoCalibWebSettleNs = nowNs() + 1200000000LL; // 1.2 s settle
+			showAutoCalibPatch();
+			std::cout << "AutoCalib: patch shown, settling..." << std::endl;
+		}
+	}
+	if (!_autoCalibWebStarted)
+	{
+		if (nowNs() - _autoCalibUrlPrintNs > 5000000000LL)
+		{
+			_autoCalibUrlPrintNs = nowNs();
+			std::cout << "AutoCalib (web): open http://<this-pi>:" << _ledCalibWeb->port()
+					  << "/ fullscreen on the TV PC and tap 'begin'." << std::endl;
+		}
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return true;
+	}
+	if (nowNs() < _autoCalibWebSettleNs)
+	{
+		_autoCalibBusy.store(false, std::memory_order_release);
+		return true;
+	}
+	return false;
+}
+
 static void autoCalibProcessBgr(const cv::Mat &bgr)
 {
 	const int w = bgr.cols;
@@ -874,22 +942,30 @@ static void autoCalibProcessBgr(const cv::Mat &bgr)
 		return;
 	}
 
-	// Outline box ROI: edge strips (top/bottom/left/right), thickness = 1/8 of image.
-	// This focuses calibration on the picture edges rather than the center.
-	const int tX = std::max(1, w / 8);
-	const int tY = std::max(1, h / 8);
-	if (tX <= 0 || tY <= 0 || tX > w || tY > h)
-	{
-		std::cout << "ERROR: Invalid ROI thickness for auto calibration" << std::endl;
-		imgOutExit(EXIT_FAILURE);
+	if (autoCalibWebGate())
 		return;
-	}
 
 	cv::Mat mask(h, w, CV_8UC1, cv::Scalar(0));
-	mask(cv::Rect(0, 0, w, tY)).setTo(255);
-	mask(cv::Rect(0, h - tY, w, tY)).setTo(255);
-	mask(cv::Rect(0, 0, tX, h)).setTo(255);
-	mask(cv::Rect(w - tX, 0, tX, h)).setTo(255);
+	if (_autoCalibRoiEn)
+	{
+		// Custom ROI (like TV/LED calib), e.g. inside a windowed web patch.
+		const int x0 = std::clamp(_autoCalibRoi.x, 0, w - 1);
+		const int y0 = std::clamp(_autoCalibRoi.y, 0, h - 1);
+		const int rw = std::clamp(_autoCalibRoi.w, 1, w - x0);
+		const int rh = std::clamp(_autoCalibRoi.h, 1, h - y0);
+		mask(cv::Rect(x0, y0, rw, rh)).setTo(255);
+	}
+	else
+	{
+		// Default: edge strips (top/bottom/left/right), thickness = 1/8 of image,
+		// for full-screen patches.
+		const int tX = std::max(1, w / 8);
+		const int tY = std::max(1, h / 8);
+		mask(cv::Rect(0, 0, w, tY)).setTo(255);
+		mask(cv::Rect(0, h - tY, w, tY)).setTo(255);
+		mask(cv::Rect(0, 0, tX, h)).setTo(255);
+		mask(cv::Rect(w - tX, 0, tX, h)).setTo(255);
+	}
 
 	cv::Scalar meanBgr = cv::mean(bgr, mask);
 	const float b = static_cast<float>(meanBgr[0]);
@@ -3065,6 +3141,39 @@ int main(int argc, char *argv[])
 		_autoCalibIterCount.store(0, std::memory_order_release);
 		_autoCalibFrameCount.store(0, std::memory_order_release);
 		_autoCalibNextAllowedNs.store(0, std::memory_order_release);
+
+		// Web-driven autocalib: the page shows the target patch on the TV. The
+		// convergence machine is unchanged; run --autocalib then --autosat.
+		if (_ledCalibCfg.tvWeb)
+		{
+			// Optional custom ROI (default = edge strips of a full-screen patch).
+			if (!_calibTvRoiStr.empty())
+			{
+				if (sscanf(_calibTvRoiStr.c_str(), "%d,%d,%d,%d", &_autoCalibRoi.x, &_autoCalibRoi.y,
+						   &_autoCalibRoi.w, &_autoCalibRoi.h) != 4 ||
+					_autoCalibRoi.w <= 0 || _autoCalibRoi.h <= 0)
+				{
+					std::cout << "ERROR: --calib-tv-roi must be x,y,w,h" << std::endl;
+					return EXIT_FAILURE;
+				}
+				_autoCalibRoiEn = true;
+			}
+			// Default patch full-screen (edge-strip ROI); --patch-size to window it.
+			const double pct = (!vm["patch-size"].defaulted()) ? _patchSize : 100.0;
+			_ledCalibWeb = new LedCalibWeb(_ledCalibWebPort);
+			_ledCalibWeb->setPatchGeometry(pct, _patchX, _patchY);
+			// Hide the corner keep-alive + status: the edge-strip ROI samples the
+			// corners where they sit.
+			_ledCalibWeb->setCleanField(true);
+			if (!_ledCalibWeb->start())
+			{
+				std::cout << "ERROR: autocalib could not start the TV web server" << std::endl;
+				return EXIT_FAILURE;
+			}
+			std::cout << "INFO: web-driven autocalib on port " << _ledCalibWebPort
+					  << " (open http://<this-pi>:" << _ledCalibWebPort << "/ fullscreen on the TV PC, tap begin); patch "
+					  << pct << "%" << (_autoCalibRoiEn ? ", custom ROI" : ", edge-strip ROI") << std::endl;
+		}
 	}
 
 	_ledCalibMode = (vm.count("ledcalib") > 0);
