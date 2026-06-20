@@ -848,12 +848,15 @@ static bool imgOutWriteBgr(const uint8_t *bgr, int width, int height, int stride
 		// For --imgout-crophelp, draw red rectangle showing the auto-crop area
 		if (_imgOutCropHelpDrawRect)
 		{
+			// Scale line thickness with image size so it stays visible when the
+			// full-sensor PNG is viewed fit-to-screen (4px on a 4608px image vanishes).
+			int thickness = std::max(4, width / 300);
 			cv::rectangle(bgrMat,
 						  cv::Point(_imgOutCropHelpRectX, _imgOutCropHelpRectY),
 						  cv::Point(_imgOutCropHelpRectX + _imgOutCropHelpRectWidth,
 									_imgOutCropHelpRectY + _imgOutCropHelpRectHeight),
 						  cv::Scalar(0, 0, 255), // Red color in BGR
-						  4);					 // Thickness
+						  thickness);
 			if (_verbose)
 			{
 				std::cout << "INFO: Drew crop area rectangle at (" << _imgOutCropHelpRectX << "," << _imgOutCropHelpRectY
@@ -1632,7 +1635,9 @@ static void imgOutSaveRaw(uint8_t *img)
 		bgr = bgr(roi);
 	}
 
-	ok = cv::imwrite(_imgOutPath, bgr);
+	// Route through imgOutWriteBgr so --imgout-crophelp draws its red crop rectangle
+	// (this is the raw/untransformed path that crophelp uses).
+	ok = imgOutWriteBgr(bgr.data, bgr.cols, bgr.rows, static_cast<int>(bgr.step));
 
 	if (!ok)
 	{
