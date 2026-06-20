@@ -35,7 +35,7 @@ three unknown nonlinear devices (TV, camera, LEDs); we never characterize any of
 | Calibration target | LED glow matches TV, relative | absolute accuracy not the goal; cancels camera+TV unknowns |
 | LUT location | grabber GPU shader, per-pixel | lowest latency; per-LED (post-averaging) would be mathematically cleaner but needs a HyperHDR fork |
 | Interpolation | ~~tetrahedral~~ → **trilinear 33³** (measured 2026-06-12, see Runtime) | tetra costs +8 ms p50 on v3d; dense trilinear matches its accuracy at +1 ms |
-| TV patch display | generated calib video + on-screen index coding | survives pause/seek/frame-rate conversion; no controllable HDMI source needed |
+| TV patch display | web page on a PC on the TV's HDMI (`--calib-tv-web`) | grabber commands each patch directly, page acks after paint; no decoder/video |
 | Measurement loop | open-loop sweeps + closed-loop verification pass | sweeps are fast and clean; verification catches model errors |
 | Eye anchor | white mandatory, extra colors optional | white is what users can match reliably |
 | Luminance policy | proportional, anchored at matched white | eye adapts to dimmer glow; white anchor sets scale |
@@ -68,19 +68,17 @@ Requirements during the run: dark room, HyperHDR running with the grabber as the
 source, HyperHDR color/smoothing settings in their final state (the LUT bakes them in — change
 them later and the LUT is stale).
 
-### Getting patches onto the TV: web page (default-recommended) vs calib video
+### Getting patches onto the TV: the web page (`--calib-tv-web`)
 
-Two interchangeable ways to drive the TV. Both feed the same measurement loop; pick at the CLI.
-
-**Web path (`--calib-tv-web`, implemented 2026-06-12).** The grabber runs a tiny HTTP server
-(evhttp, on `--calib-tv-port`, default 8080) and you open `http://<pi>:8080/` in a **fullscreen**
-browser on a PC plugged into the TV. The grabber pushes the fullscreen color over SSE; the page
-paints it, double-`requestAnimationFrame`s to guarantee the frame is up, then `POST /ack?n=seq`.
-The grabber starts its settle timer **on the ack**, so timing covers only TV-internal latency, not
-network/paint lag — and a closed/frozen page is caught by an 8 s ack timeout (clean abort). Because
-the grabber *commands* each patch it never has to decode anything: the index-code state machine and
-the calib video are bypassed entirely. The page also hosts the Phase 0 nudge buttons (below) so the
-whole run is driven from the TV-side PC. `src/ledCalibWeb.cpp`.
+The grabber runs a tiny HTTP server (evhttp, on `--calib-tv-port`, default 8080) and you open
+`http://<pi>:8080/` in a **fullscreen** browser on a PC plugged into the TV. The grabber pushes the
+fullscreen color over SSE; the page paints it, double-`requestAnimationFrame`s to guarantee the
+frame is up, then `POST /ack?n=seq`. The grabber starts its settle timer **on the ack**, so timing
+covers only TV-internal latency, not network/paint lag — and a closed/frozen page is caught by an
+8 s ack timeout (clean abort). The grabber *commands* each patch directly (no decoding). The page
+also hosts the Phase 0 nudge buttons so the whole run is driven from the TV-side PC.
+`src/ledCalibWeb.cpp`. Required for `tv`/`gamma`/`shading`. (A calib-video + index-decoder fallback
+existed early on and was removed 2026-06-16 — web only.)
 
 **Window patches (`--patch-size`, `--patch-x`, `--patch-y`).** TVs (especially OLED) dim bright
 full-screen fields via ABL/ASBL, distorting the measurement. `--patch-size` shrinks the patch to
@@ -104,11 +102,6 @@ processing as runtime content. Browser color management is *not* the main risk (
 camera's reading of whatever the TV actually shows, not the commanded value) — the per-input TV
 processing difference is.
 
-**Video path (fallback, `tools/gen-calib-video.py`).** For users with no spare PC for the TV: play
-a generated video (USB stick / media app). Each patch is preceded by a base-6 index code the
-grabber decodes from the camera, so it survives pause/seek/frame-rate conversion. Kept working but
-secondary; see "Index coding" below.
-
 ### Phase 0 — eye anchor (interactive, ~2 min)
 
 Web path (needs `--calib-tv-web`): after you tap *begin*, the page shows a **full-screen white**
@@ -116,44 +109,23 @@ field (the anchor overrides the windowed sweep geometry) and the grabber sends a
 to HyperHDR, so the LEDs go white. Make the glow match the TV white **either** by tuning
 **HyperHDR's white balance** (recommended if your LEDs are off-white — e.g. bluish) **or** by
 nudging the LED drive with the page's R/G/B ± buttons (or 1/2 3/4 5/6 keys), then tap **Accept** on
-the page (no terminal input). Video path: same, but white comes from the calib video and you nudge
-over SSH/Pi tty. Output: anchor drive value, camera readings of both ROIs, von-Kries gains
-`g_c = tv_c / led_c`. All subsequent camera readings of LED light are multiplied by `g`. (If you
-tune in HyperHDR and leave the drive at full white, the measured anchor captures that — equivalent
-to the sweep-derived white, but as a direct measurement.) The TV sweep then
-restores the windowed patch geometry.
-
-TV shows the white section of the calib video. LEDs driven white. The user nudges the LED drive
-RGB from the keyboard until the wall glow looks like the same white as the TV picture, then
-accepts. Output: anchor drive value, camera readings of both ROIs, von-Kries gains
-`g_c = tv_c / led_c`. All subsequent camera readings of LED light are multiplied by `g`.
+the page (no terminal input). Output: anchor drive value, camera readings of both ROIs, von-Kries
+gains `g_c = tv_c / led_c`. All subsequent camera readings of LED light are multiplied by `g`. (If
+you tune in HyperHDR and leave the drive at full white, the measured anchor captures that —
+equivalent to the sweep-derived white, but as a direct measurement.) The TV sweep then restores the
+windowed patch geometry.
 
 ### Phase 1 — TV sweep (~15 min, unattended)
 
-LEDs forced black. A grid of full-screen patches (default 6³ = 216) is shown on the TV.
-Web path (`--calib-tv-web`, grid = `--calib-tv-grid`): the grabber commands each patch, waits for
-the page ack, settles, measures — and records the exact commanded patch RGB alongside the camera
-reading. Video path: the patches come from the calib video, each preceded by an index code so the
-grabber knows which patch it is measuring — robust against pausing, seeking, TV frame-rate
-conversion, and dropped camera frames.
-
-Index coding (video path only; defined by `tools/gen-calib-video.py`, decoded by the grabber):
-
-```
-WHITE .4s | BLACK .3s | D1 .4s | BLACK .2s | D2 .4s | BLACK .2s | D3 .4s
-| BLACK .3s | PATCH 1.5s | BLACK .3s | (next cycle)
-```
-
-Digits are full-screen colors, base 6: WHITE=0 RED=1 GREEN=2 BLUE=3 YELLOW=4 CYAN=5;
-`index = D1·36 + D2·6 + D3`. Classification uses normalized channel thresholds, tolerant of an
-uncalibrated camera. The patch itself is *not* classified (it can be any color including black):
-it is measured in a fixed time window after D3, derived from the nominal timings. Per patch the
-grabber records mean RGB, temporal std (across frames), spatial std (within ROI) — the variance
-stats that decide whether 8-bit averaging suffices or RAW is needed.
+LEDs forced black. A grid of patches (default 6³ = 216, grid = `--calib-tv-grid`, edge-dense
+levels) is shown on the TV via the web page: the grabber commands each patch, waits for the page
+ack, settles, measures — and records the exact commanded patch RGB alongside the camera reading
+(mean, temporal std, spatial std — the variance stats that decide whether 8-bit averaging suffices
+or RAW is needed).
 
 ### Phase 2 — LED sweep (~10–15 min, unattended)
 
-TV shows black (web path blacks it out automatically; video path: pause on black). Baseline first:
+TV shows black (the page blacks it out automatically). Baseline first:
 LEDs black, measure both
 ROIs (room ambient + TV black-level glow; subtracted later in the fit). Then for each drive
 value in an 8³ grid + 17-step gray ramp: send solid frame, wait settle (HyperHDR smoothing + LED

@@ -37,15 +37,12 @@ struct LedCalibConfig
 	std::string phase = "tv"; // tv | led | shading | gamma | white
 	int ledGrid = 8;		   // LED sweep cube grid points per axis
 	int ledGrayRamp = 17;	   // extra gray ramp steps in the LED sweep
-	int tvPatchCount = 216;	   // patches in the calib video TV sweep (max 216 = 3 base-6 digits)
+	int tvPatchCount = 216;	   // patches in the TV sweep (set to tvGrid^3)
 	int measureFrames = 20;	   // frames averaged per measurement
 	int settleMs = 700;		   // LED + HyperHDR smoothing settle before measuring
-	// Index-code symbol classification (tolerant of an uncalibrated camera).
-	float symbolBlackThresh = 60.0f;   // max channel below this -> BLACK
-	float symbolChannelThresh = 0.55f; // channel "on" when > thresh * max channel
-	// Web TV-patch path (vs the calib-video index-code path).
-	bool tvWeb = false; // drive the TV via the browser page instead of a video
-	int tvGrid = 6;		// TV patch cube grid points per axis (web mode)
+	// TV-patch display is web-only.
+	bool tvWeb = false; // drive the TV via the browser page
+	int tvGrid = 6;		// TV patch cube grid points per axis
 	// Configured window-patch geometry for the measurement sweeps. The Phase 0
 	// white field overrides this to fullscreen; the sweeps restore it.
 	double patchPct = 10.0;
@@ -118,19 +115,6 @@ private:
 		Done
 	};
 
-	// Full-screen index-code symbols (values must match tools/gen-calib-video.py).
-	enum class Sym
-	{
-		Black,
-		White,
-		Red,
-		Green,
-		Blue,
-		Yellow,
-		Cyan,
-		Other
-	};
-
 	struct RoiSample
 	{
 		double mean[3] = {0.0, 0.0, 0.0}; // R,G,B
@@ -156,41 +140,21 @@ private:
 
 	struct SweepRecord
 	{
-		int idx = -1;			   // TV sweep: decoded patch index
-		uint8_t drive[3] = {};	   // LED sweep: drive value sent
+		int idx = -1;			   // TV sweep: patch index
+		uint8_t drive[3] = {};	   // LED sweep: drive value sent (TV: commanded patch RGB)
 		double mean[2][3] = {};	   // [tv|led][R,G,B]
 		double tstd[2][3] = {};	   // temporal std of per-frame means
 		double sstd[2][3] = {};	   // average spatial std
 		int frames = 0;
 	};
 
-	enum class TvState
-	{
-		ScanSync,
-		SyncBlack,
-		ExpectD1,
-		Gap1,
-		ExpectD2,
-		Gap2,
-		ExpectD3,
-		PrePatch,
-		PatchWindow,
-		WaitSync
-	};
-
 	RoiSample sampleRoi(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb,
 						const LedCalibRoi &roi) const;
-	Sym classify(const double mean[3]) const;
-	static int digitValue(Sym s);
-	static const char *symName(Sym s);
 
 	void enterPhase(Phase p, int64_t nowMs);
 	void handleKeys(int64_t nowMs);
 	void whiteKey(char c, int64_t nowMs);
 	void runWhite(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
-	void runTv(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
-	void onStableSym(Sym s, int64_t nowMs);
-	void recordTvPatch(int64_t nowMs);
 	void finishTvPhase(int64_t nowMs);
 	// Web TV-patch path.
 	void buildTvPlan();
@@ -258,19 +222,9 @@ private:
 	double _anchorGain[3] = {1.0, 1.0, 1.0};
 	bool _haveAnchor = false;
 
-	// TV sweep decode
-	Sym _runClass = Sym::Other;
-	int _runLen = 0;
-	Sym _stable = Sym::Other;
-	TvState _tvState = TvState::ScanSync;
-	int _digits[3] = {0, 0, 0};
-	int64_t _patchWindowStartMs = 0;
-	int _pendingIdx = -1;
+	// TV sweep
 	std::vector<SweepRecord> _tvRecords;
-	std::vector<bool> _tvSeen;
 	int _tvDecoded = 0;
-
-	// TV sweep (web path)
 	std::vector<std::array<uint8_t, 3>> _tvPlan;
 	size_t _tvPlanPos = 0;
 	uint32_t _tvSeq = 0;		   // seq of the currently shown patch

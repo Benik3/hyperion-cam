@@ -14,15 +14,8 @@
 #include <termios.h>
 #include <unistd.h>
 
-// Index-code sequence nominal timings; must match tools/gen-calib-video.py:
-//   WHITE .4s | BLACK .3s | D1 .4s | BLACK .2s | D2 .4s | BLACK .2s | D3 .4s
-//   | BLACK .3s | PATCH 1.5s | BLACK .3s
 namespace
 {
-	constexpr int kMinRun = 3; // frames a class must hold to count as a stable token
-	// From detecting the post-D3 black (detection lags ~kMinRun frames) to the start
-	// of the patch measurement window: 300 ms nominal gap + 350 ms margin - ~100 ms lag.
-	constexpr int64_t kPatchWindowDelayMs = 550;
 	constexpr int64_t kResendIntervalMs = 100;	  // keep HyperHDR fed while a color is held
 	constexpr int64_t kWebAckTimeoutMs = 8000;	  // page must ack a patch within this or we abort
 
@@ -101,7 +94,6 @@ LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, 
 {
 	if (_cfg.tvWeb)
 		_cfg.tvPatchCount = _cfg.tvGrid * _cfg.tvGrid * _cfg.tvGrid;
-	_tvSeen.assign(static_cast<size_t>(std::max(1, _cfg.tvPatchCount)), false);
 
 	if (_cfg.phase == "white")
 		_phase = Phase::WhiteWait;
@@ -184,13 +176,12 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		{
 			return r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= width && r.y + r.h <= height;
 		};
-		// Gamma/shading need no LED ROI; shading needs no TV ROI either
-		// (it samples the whole TV quad via the homography).
+		// tv/gamma need no LED ROI; shading needs no TV ROI either (it samples
+		// the whole TV quad via the homography / full frame).
 		const bool gamma = (_cfg.phase == "gamma");
 		const bool shading = (_cfg.phase == "shading");
-		// Shading without --transform samples the full frame (camera captures
-		// only the clean TV); with --transform it samples the TV quad.
-		if (!shading && (!inFrame(_cfg.tvRoi) || (!gamma && !inFrame(_cfg.ledRoi))))
+		const bool tvOnly = gamma || _cfg.phase == "tv";
+		if (!shading && (!inFrame(_cfg.tvRoi) || (!tvOnly && !inFrame(_cfg.ledRoi))))
 		{
 			std::cout << "ERROR: LedCalib ROI outside the " << width << "x" << height
 					  << " frame (tv " << _cfg.tvRoi.x << "," << _cfg.tvRoi.y << "," << _cfg.tvRoi.w << "," << _cfg.tvRoi.h
@@ -222,8 +213,9 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		tv.mean[c] *= _cfg.tvShadeGain[c];
 		tv.sstd[c] *= _cfg.tvShadeGain[c];
 	}
-	const RoiSample led = (_cfg.phase == "gamma") ? RoiSample{}
-												  : sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.ledRoi);
+	const RoiSample led = (_cfg.phase == "gamma" || _cfg.phase == "tv")
+							  ? RoiSample{}
+							  : sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.ledRoi);
 
 	handleKeys(nowMs);
 	if (_finished)
@@ -241,10 +233,7 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		runGamma(tv, nowMs);
 		break;
 	case Phase::Tv:
-		if (_web)
-			runTvWeb(tv, led, nowMs);
-		else
-			runTv(tv, led, nowMs);
+		runTvWeb(tv, led, nowMs);
 		break;
 	case Phase::LedBaseline:
 	case Phase::LedSweep:
@@ -303,76 +292,6 @@ LedCalib::RoiSample LedCalib::sampleRoi(const uint8_t *img, int width, int heigh
 		out.sstd[c] = std::sqrt(std::max(0.0, var));
 	}
 	return out;
-}
-
-LedCalib::Sym LedCalib::classify(const double mean[3]) const
-{
-	const double maxc = std::max({mean[0], mean[1], mean[2]});
-	if (maxc < _cfg.symbolBlackThresh)
-		return Sym::Black;
-	const double th = _cfg.symbolChannelThresh * maxc;
-	const bool r = mean[0] > th;
-	const bool g = mean[1] > th;
-	const bool b = mean[2] > th;
-	if (r && g && b)
-		return Sym::White;
-	if (r && g)
-		return Sym::Yellow;
-	if (g && b)
-		return Sym::Cyan;
-	if (r && b)
-		return Sym::Other; // magenta: not used as a digit
-	if (r)
-		return Sym::Red;
-	if (g)
-		return Sym::Green;
-	if (b)
-		return Sym::Blue;
-	return Sym::Other;
-}
-
-int LedCalib::digitValue(Sym s)
-{
-	switch (s)
-	{
-	case Sym::White:
-		return 0;
-	case Sym::Red:
-		return 1;
-	case Sym::Green:
-		return 2;
-	case Sym::Blue:
-		return 3;
-	case Sym::Yellow:
-		return 4;
-	case Sym::Cyan:
-		return 5;
-	default:
-		return -1;
-	}
-}
-
-const char *LedCalib::symName(Sym s)
-{
-	switch (s)
-	{
-	case Sym::Black:
-		return "BLACK";
-	case Sym::White:
-		return "WHITE";
-	case Sym::Red:
-		return "RED";
-	case Sym::Green:
-		return "GREEN";
-	case Sym::Blue:
-		return "BLUE";
-	case Sym::Yellow:
-		return "YELLOW";
-	case Sym::Cyan:
-		return "CYAN";
-	default:
-		return "OTHER";
-	}
 }
 
 void LedCalib::setLed(uint8_t r, uint8_t g, uint8_t b, int64_t nowMs)
@@ -437,62 +356,36 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		break;
 	case Phase::TvWait:
 		setLed(0, 0, 0, nowMs);
-		if (_web)
+		if (_webStarted)
 		{
-			if (_webStarted)
-			{
-				enterPhase(Phase::Tv, nowMs);
-				return;
-			}
-			std::cout << "\nLedCalib phase 1 (TV sweep): open  http://<this-pi>:" << _web->port()
-					  << "/  fullscreen on the TV PC and tap 'begin'." << std::endl;
-			_lastUrlPrintMs = nowMs;
+			enterPhase(Phase::Tv, nowMs);
+			return;
 		}
-		else
-		{
-			std::cout << "\nLedCalib phase 1 (TV sweep): LEDs are now off. Start the calib video\n"
-						 "TV-sweep section, then press Enter. Do not pause/seek during the sweep\n"
-						 "('f' finishes the phase early with the patches decoded so far)." << std::endl;
-		}
+		std::cout << "\nLedCalib phase 1 (TV sweep): open  http://<this-pi>:" << _web->port()
+				  << "/  fullscreen on the TV PC and tap 'begin'." << std::endl;
+		_lastUrlPrintMs = nowMs;
 		break;
 	case Phase::Tv:
-		if (_web)
-		{
-			// Restore the windowed measurement geometry (Phase 0 forced fullscreen).
-			_web->setPatchGeometry(_cfg.patchPct, _cfg.patchX, _cfg.patchY);
-			buildTvPlan();
-			_tvPlanPos = 0;
-			std::cout << "TV sweep (web): " << _tvPlan.size() << " patches commanded directly." << std::endl;
-			showTvPatch(nowMs);
-			break;
-		}
-		_tvState = TvState::ScanSync;
-		_runClass = Sym::Other;
-		_runLen = 0;
-		_stable = Sym::Other;
-		std::cout << "TV sweep: decoding patch index codes (" << _cfg.tvPatchCount << " patches expected)..." << std::endl;
+		// Restore the windowed measurement geometry (Phase 0 forced fullscreen).
+		_web->setPatchGeometry(_cfg.patchPct, _cfg.patchX, _cfg.patchY);
+		buildTvPlan();
+		_tvPlanPos = 0;
+		std::cout << "TV sweep (web): " << _tvPlan.size() << " patches commanded directly." << std::endl;
+		showTvPatch(nowMs);
 		break;
 	case Phase::LedWait:
 		setLed(0, 0, 0, nowMs);
-		if (_web)
+		// Drive the TV black through the page; no manual step needed.
+		_webSeq++;
+		_web->setState(0, 0, 0, false, 0, 0, 0, _webSeq);
+		if (_webStarted)
 		{
-			// Drive the TV black through the page; no manual step needed.
-			_webSeq++;
-			_web->setState(0, 0, 0, false, 0, 0, 0, _webSeq);
-			if (_webStarted)
-			{
-				enterPhase(Phase::LedBaseline, nowMs);
-				return;
-			}
-			std::cout << "\nLedCalib phase 2 (LED sweep): open the page fullscreen on the TV PC\n"
-						 "and tap 'begin' (the page will black out the TV)." << std::endl;
-			_lastUrlPrintMs = nowMs;
+			enterPhase(Phase::LedBaseline, nowMs);
+			return;
 		}
-		else
-		{
-			std::cout << "\nLedCalib phase 2 (LED sweep): stop the video / leave the TV showing\n"
-						 "black, keep the room dark, then press Enter." << std::endl;
-		}
+		std::cout << "\nLedCalib phase 2 (LED sweep): open the page fullscreen on the TV PC\n"
+					 "and tap 'begin' (the page will black out the TV)." << std::endl;
+		_lastUrlPrintMs = nowMs;
 		break;
 	case Phase::LedBaseline:
 		setLed(0, 0, 0, nowMs);
@@ -621,14 +514,6 @@ void LedCalib::handleKeys(int64_t nowMs)
 		case Phase::White:
 			whiteKey(c, nowMs);
 			break;
-		case Phase::Tv:
-			if (c == 'f' || c == 'F')
-			{
-				std::cout << "TV sweep finished early by user (" << _tvDecoded << "/"
-						  << _cfg.tvPatchCount << " patches)." << std::endl;
-				finishTvPhase(nowMs);
-			}
-			break;
 		default:
 			break;
 		}
@@ -755,167 +640,11 @@ void LedCalib::runWhite(const RoiSample &tv, const RoiSample &led, int64_t nowMs
 		enterPhase(Phase::TvWait, nowMs);
 }
 
-void LedCalib::runTv(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
-{
-	// Stable-token tracking on the TV ROI classification.
-	const Sym s = classify(tv.mean);
-	if (s == _runClass)
-	{
-		_runLen++;
-	}
-	else
-	{
-		_runClass = s;
-		_runLen = 1;
-	}
-	if (_runLen == kMinRun && s != _stable)
-	{
-		_stable = s;
-		onStableSym(s, nowMs);
-	}
-
-	// The patch itself is measured in a timed window (it may be any color,
-	// including black, so it cannot be detected by classification).
-	if (_tvState == TvState::PatchWindow)
-	{
-		if (!_meas.active && nowMs >= _patchWindowStartMs)
-			_meas.start(_cfg.measureFrames);
-		if (_meas.active)
-		{
-			_meas.add(tv, led);
-			if (_meas.done())
-			{
-				recordTvPatch(nowMs);
-				_tvState = TvState::WaitSync;
-			}
-		}
-	}
-}
-
-void LedCalib::onStableSym(Sym s, int64_t nowMs)
-{
-	auto resync = [&](Sym sym)
-	{
-		if (_cfg.verbose)
-			std::cout << "TV sweep: unexpected " << symName(sym) << ", resyncing" << std::endl;
-		return (sym == Sym::White) ? TvState::SyncBlack : TvState::ScanSync;
-	};
-
-	switch (_tvState)
-	{
-	case TvState::ScanSync:
-		if (s == Sym::White)
-			_tvState = TvState::SyncBlack;
-		break;
-	case TvState::SyncBlack:
-		if (s == Sym::Black)
-			_tvState = TvState::ExpectD1;
-		else
-			_tvState = resync(s);
-		break;
-	case TvState::ExpectD1:
-	case TvState::ExpectD2:
-	case TvState::ExpectD3:
-	{
-		const int d = digitValue(s);
-		if (d < 0)
-		{
-			_tvState = resync(s);
-			break;
-		}
-		if (_tvState == TvState::ExpectD1)
-		{
-			_digits[0] = d;
-			_tvState = TvState::Gap1;
-		}
-		else if (_tvState == TvState::ExpectD2)
-		{
-			_digits[1] = d;
-			_tvState = TvState::Gap2;
-		}
-		else
-		{
-			_digits[2] = d;
-			_pendingIdx = _digits[0] * 36 + _digits[1] * 6 + _digits[2];
-			_tvState = TvState::PrePatch;
-		}
-		break;
-	}
-	case TvState::Gap1:
-		_tvState = (s == Sym::Black) ? TvState::ExpectD2 : resync(s);
-		break;
-	case TvState::Gap2:
-		_tvState = (s == Sym::Black) ? TvState::ExpectD3 : resync(s);
-		break;
-	case TvState::PrePatch:
-		if (s == Sym::Black)
-		{
-			_patchWindowStartMs = nowMs + kPatchWindowDelayMs;
-			_tvState = TvState::PatchWindow;
-		}
-		else
-		{
-			_tvState = resync(s);
-		}
-		break;
-	case TvState::PatchWindow:
-		// Patch (or trailing black) stabilizing: expected, the timed window handles it.
-		break;
-	case TvState::WaitSync:
-		if (s == Sym::White)
-			_tvState = TvState::SyncBlack;
-		break;
-	}
-}
-
-void LedCalib::recordTvPatch(int64_t nowMs)
-{
-	SweepRecord rec;
-	rec.idx = _pendingIdx;
-	rec.frames = _meas.target;
-	_meas.finish(rec.mean, rec.tstd, rec.sstd);
-
-	if (rec.idx < 0 || rec.idx >= _cfg.tvPatchCount)
-	{
-		std::cout << "WARNING: decoded out-of-range patch index " << rec.idx << "; dropped" << std::endl;
-		return;
-	}
-
-	// Commanded patch RGB from the base-6 index grid (matches gen-calib-video.py).
-	rec.drive[0] = static_cast<uint8_t>((rec.idx / 36) * 255 / 5);
-	rec.drive[1] = static_cast<uint8_t>(((rec.idx / 6) % 6) * 255 / 5);
-	rec.drive[2] = static_cast<uint8_t>((rec.idx % 6) * 255 / 5);
-
-	if (_tvSeen[static_cast<size_t>(rec.idx)])
-	{
-		std::cout << "TV sweep: patch " << rec.idx << " re-measured; keeping the new reading" << std::endl;
-		for (auto &r : _tvRecords)
-		{
-			if (r.idx == rec.idx)
-			{
-				r = rec;
-				break;
-			}
-		}
-	}
-	else
-	{
-		_tvSeen[static_cast<size_t>(rec.idx)] = true;
-		_tvRecords.push_back(rec);
-		_tvDecoded++;
-		if ((_tvDecoded % 10) == 0 || _tvDecoded == _cfg.tvPatchCount || _cfg.verbose)
-			std::cout << "TV sweep: " << _tvDecoded << "/" << _cfg.tvPatchCount << " patches" << std::endl;
-	}
-
-	if (_tvDecoded >= _cfg.tvPatchCount)
-		finishTvPhase(nowMs);
-}
-
 void LedCalib::finishTvPhase(int64_t nowMs)
 {
 	if (_tvRecords.empty())
 	{
-		std::cout << "ERROR: TV sweep decoded no patches" << std::endl;
+		std::cout << "ERROR: TV sweep measured no patches" << std::endl;
 		finishAll(EXIT_FAILURE);
 		return;
 	}

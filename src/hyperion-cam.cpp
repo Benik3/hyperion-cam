@@ -2864,10 +2864,9 @@ int main(int argc, char *argv[])
 		("calib-led-roi", po::value<std::string>(&_calibLedRoiStr), "LED calib: ROI on the LED-lit wall, x,y,w,h in raw full-frame coords")																										  //
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
 		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
-		("ledcalib-tv-patches", po::value<int>(&_ledCalibCfg.tvPatchCount)->default_value(216), "LED calib: patches in the calib video TV sweep (1-216, must match the generated video)")														  //
 		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(20), "LED calib: frames averaged per measurement")																										  //
 		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(700), "LED calib: settle time before each measurement (HyperHDR smoothing + LED response)")									  //
-		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page (PC on the TV's HDMI) instead of the calib video")								  //
+		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page on a PC on the TV's HDMI (required for tv/gamma/shading)")								  //
 		("calib-tv-port", po::value<int>(&_ledCalibWebPort)->default_value(8080), "LED calib: TV web page port (--calib-tv-web)")																					  //
 		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-12)")											  //
 		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
@@ -3198,16 +3197,17 @@ int main(int argc, char *argv[])
 		{
 			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
 		};
-		// Shading samples the whole TV quad (no ROIs); gamma needs only the TV
-		// ROI; the full calib needs both.
+		// Shading samples the whole TV quad (no ROIs); tv/gamma need only the TV
+		// ROI; led/white measure the wall too (both ROIs).
+		const bool tvOnlyRoi = gammaMode || tvMode;
 		bool roiOk = true;
 		if (!shadingMode)
-			roiOk = gammaMode ? parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi)
+			roiOk = tvOnlyRoi ? parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi)
 							  : (parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi) && parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi));
 		if (!roiOk)
 		{
 			std::cout << "ERROR: --ledcalib requires --calib-tv-roi"
-					  << (gammaMode ? "" : " and --calib-led-roi") << " as x,y,w,h" << std::endl;
+					  << (tvOnlyRoi ? "" : " and --calib-led-roi") << " as x,y,w,h" << std::endl;
 			return EXIT_FAILURE;
 		}
 		if (shadingMode)
@@ -3247,11 +3247,6 @@ int main(int argc, char *argv[])
 							 "(the camera must see only the clean TV screen)" << std::endl;
 			}
 		}
-		if (_ledCalibCfg.tvPatchCount < 1 || _ledCalibCfg.tvPatchCount > 216)
-		{
-			std::cout << "ERROR: --ledcalib-tv-patches must be 1-216 (3 base-6 index digits)" << std::endl;
-			return EXIT_FAILURE;
-		}
 		if (_ledCalibCfg.ledGrid < 2 || _ledCalibCfg.ledGrid > 16)
 		{
 			std::cout << "ERROR: --ledcalib-led-grid must be 2-16" << std::endl;
@@ -3274,7 +3269,7 @@ int main(int argc, char *argv[])
 			return EXIT_FAILURE;
 		}
 		// Gamma/shading are always web-driven (they show full-screen fields).
-		if ((gammaMode || shadingMode) && !_ledCalibCfg.tvWeb)
+		if ((gammaMode || shadingMode || tvMode) && !_ledCalibCfg.tvWeb)
 		{
 			std::cout << "ERROR: --ledcalib " << _ledCalibPhase << " requires --calib-tv-web" << std::endl;
 			return EXIT_FAILURE;
