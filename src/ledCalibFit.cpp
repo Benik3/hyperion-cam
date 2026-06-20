@@ -231,16 +231,29 @@ namespace
 		return !out.empty();
 	}
 
+	// Result of deriving the white anchor from the sweep neutrals.
+	//   Derived    - found a clean neutral level; gains set.
+	//   NoData     - no tv_sweep neutrals / no LED neutrals to derive from
+	//                (fall back to neutral gains, just no metameric correction).
+	//   AllClipped - neutrals exist but every usable level saturates the camera;
+	//                a hard error - the LUT would be built on blown-out white.
+	enum class AnchorResult
+	{
+		Derived,
+		NoData,
+		AllClipped
+	};
+
 	// HyperHDR-WB workflow: derive the von-Kries white from the brightest neutral
 	// level where NEITHER the TV nor the LED camera reading clips. The camera
 	// maxes below 255, and the TV or the LEDs can be the brighter side, so the
 	// true-white (255) point is often saturated -> use a dimmer clean white.
 	// doc/led-lut-calibration.md.
-	bool deriveAnchorFromSweeps(const std::string &dir, CalibData &d, double clip)
+	AnchorResult deriveAnchorFromSweeps(const std::string &dir, CalibData &d, double clip)
 	{
 		std::vector<std::pair<double, cv::Vec3d>> tvN;
 		if (!loadTvNeutrals(dir + "/tv_sweep.csv", tvN))
-			return false;
+			return AnchorResult::NoData;
 
 		// Neutral LED drives -> cam_led, sorted by level for interpolation.
 		std::vector<std::pair<double, cv::Vec3d>> ledN;
@@ -248,7 +261,7 @@ namespace
 			if (std::fabs(s.drive[0] - s.drive[1]) < 1.0 && std::fabs(s.drive[1] - s.drive[2]) < 1.0)
 				ledN.push_back({s.drive[0], s.led});
 		if (ledN.empty())
-			return false;
+			return AnchorResult::NoData;
 		std::sort(ledN.begin(), ledN.end(), [](auto &a, auto &b) { return a.first < b.first; });
 		auto ledAt = [&](double L) -> cv::Vec3d
 		{
@@ -287,12 +300,12 @@ namespace
 					  << "TV " << tv[0] << "," << tv[1] << "," << tv[2]
 					  << "  LED " << led[0] << "," << led[1] << "," << led[2]
 					  << "  gains " << d.gains[0] << "," << d.gains[1] << "," << d.gains[2] << std::endl;
-			return true;
+			return AnchorResult::Derived;
 		}
 		std::cout << "ERROR: no unclipped neutral level found (every white patch saturates the camera "
 					 "at >= " << clip << "). Lower the TV and/or LED brightness, or raise --calib-clip-level."
 				  << std::endl;
-		return false;
+		return AnchorResult::AllClipped;
 	}
 
 	bool loadCalibData(const std::string &dir, CalibData &d, double clip = 250.0)
@@ -317,11 +330,20 @@ namespace
 		{
 			// No eye-anchor phase: try to derive the white correction from the
 			// sweep white points (requires HyperHDR WB to have eye-matched white).
-			if (deriveAnchorFromSweeps(dir, d, clip))
+			switch (deriveAnchorFromSweeps(dir, d, clip))
+			{
+			case AnchorResult::Derived:
 				return true;
-			std::cout << "WARNING: no white_anchor.json and could not derive white from tv_sweep.csv; "
-						 "assuming neutral gains (no metameric correction - run --ledcalib white, "
-						 "or set HyperHDR white balance and include a white patch in the TV sweep)" << std::endl;
+			case AnchorResult::AllClipped:
+				// Error already printed; abort rather than silently ship a LUT
+				// built on a blown-out white point.
+				return false;
+			case AnchorResult::NoData:
+				std::cout << "WARNING: no white_anchor.json and could not derive white from tv_sweep.csv; "
+							 "assuming neutral gains (no metameric correction - run --ledcalib white, "
+							 "or set HyperHDR white balance and include a white patch in the TV sweep)" << std::endl;
+				return true;
+			}
 			return true;
 		}
 		cv::Vec3d drv;

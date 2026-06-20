@@ -1291,7 +1291,7 @@ void LedCalib::writeMeta()
 	f << "  \"led_grid\": " << _cfg.ledGrid << ",\n";
 	f << "  \"led_gray_ramp\": " << _cfg.ledGrayRamp << ",\n";
 	f << "  \"tv_patch_count\": " << _cfg.tvPatchCount << ",\n";
-	f << "  \"tv_patches_decoded\": " << _tvDecoded << ",\n";
+	f << "  \"tv_patches_measured\": " << _tvDecoded << ",\n";
 	f << "  \"measure_frames\": " << _cfg.measureFrames << ",\n";
 	f << "  \"settle_ms\": " << _cfg.settleMs << ",\n";
 	f << "  \"have_white_anchor\": " << (_haveAnchor ? "true" : "false") << ",\n";

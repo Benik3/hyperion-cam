@@ -2044,22 +2044,34 @@ static bool loadCubeLut(const std::string &path)
 		return false;
 	}
 	int N = 0;
+	float dMin[3] = {0.f, 0.f, 0.f}, dMax[3] = {1.f, 1.f, 1.f};
 	std::vector<float> vals;
 	std::string line;
 	while (std::getline(f, line))
 	{
 		int n;
+		float a, b, c;
 		if (std::sscanf(line.c_str(), " LUT_3D_SIZE %d", &n) == 1)
 		{
 			N = n;
 			continue;
 		}
-		float r, g, b;
-		if (std::sscanf(line.c_str(), "%f %f %f", &r, &g, &b) == 3)
+		if (std::sscanf(line.c_str(), " DOMAIN_MIN %f %f %f", &a, &b, &c) == 3)
+		{
+			dMin[0] = a; dMin[1] = b; dMin[2] = c;
+			continue;
+		}
+		if (std::sscanf(line.c_str(), " DOMAIN_MAX %f %f %f", &a, &b, &c) == 3)
+		{
+			dMax[0] = a; dMax[1] = b; dMax[2] = c;
+			continue;
+		}
+		float r, g, bl;
+		if (std::sscanf(line.c_str(), "%f %f %f", &r, &g, &bl) == 3)
 		{
 			vals.push_back(r);
 			vals.push_back(g);
-			vals.push_back(b);
+			vals.push_back(bl);
 		}
 	}
 	if (N < 2 || N > 65)
@@ -2067,6 +2079,15 @@ static bool loadCubeLut(const std::string &path)
 		std::cout << "ERROR: LUT missing/invalid LUT_3D_SIZE (" << N << ")" << std::endl;
 		return false;
 	}
+	// The warp shader feeds RGB in [0,1] straight to the LUT; a non-unit domain
+	// would be silently misread. Our fit always writes [0,1]; reject others.
+	for (int c = 0; c < 3; c++)
+		if (std::fabs(dMin[c]) > 1e-3f || std::fabs(dMax[c] - 1.f) > 1e-3f)
+		{
+			std::cout << "ERROR: LUT domain must be [0,1]; got ["
+					  << dMin[c] << "," << dMax[c] << "] on axis " << c << std::endl;
+			return false;
+		}
 	if (static_cast<int>(vals.size()) != N * N * N * 3)
 	{
 		std::cout << "ERROR: LUT has " << vals.size() / 3 << " entries, expected " << (N * N * N) << std::endl;
@@ -3261,17 +3282,18 @@ int main(int argc, char *argv[])
 			_ledCalibCfg.measureFrames = 1;
 		if (_ledCalibCfg.settleMs < 0)
 			_ledCalibCfg.settleMs = 0;
-		// The web page supplies the start/nudge keys, so a tty is only required
-		// for the calib-video path.
-		if (!_ledCalibCfg.tvWeb && !isatty(STDIN_FILENO))
-		{
-			std::cout << "ERROR: --ledcalib is interactive and needs a terminal on stdin" << std::endl;
-			return EXIT_FAILURE;
-		}
-		// Gamma/shading are always web-driven (they show full-screen fields).
+		// tv/gamma/shading show full-screen TV fields and are always web-driven.
+		// Check this first so the missing-web error wins over the tty error below.
 		if ((gammaMode || shadingMode || tvMode) && !_ledCalibCfg.tvWeb)
 		{
 			std::cout << "ERROR: --ledcalib " << _ledCalibPhase << " requires --calib-tv-web" << std::endl;
+			return EXIT_FAILURE;
+		}
+		// led/white without the web page read start/nudge keys from stdin, so
+		// they need a real terminal.
+		if (!_ledCalibCfg.tvWeb && !isatty(STDIN_FILENO))
+		{
+			std::cout << "ERROR: --ledcalib is interactive and needs a terminal on stdin" << std::endl;
 			return EXIT_FAILURE;
 		}
 		_ledCalibCfg.phase = _ledCalibPhase;
