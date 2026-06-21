@@ -90,6 +90,12 @@ sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain --nv12 \
 ```
 Corner worse → axis flip, one-line fix.
 
+> Texture orientation (the `j=0 → v=0` row order) was confirmed correct on a real TV
+> (2026-06-21): a 4-corner colour probe map — red TL / green TR / blue BL / white BR
+> on a uniform **white** screen — showed the right corners in HyperHDR's live view, so
+> there is no GL y-origin / `glReadPixels` row flip. Colour probes read cleaner than a
+> gray "flatter/worse" check because TV residual non-uniformity is brightness, not hue.
+
 ---
 
 ## Step 2 — TV calibration (cropped + shaded)

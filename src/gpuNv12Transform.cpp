@@ -819,7 +819,11 @@ vec3 yuv2rgb(float y, vec2 c){
 		if (shadeEnabled)
 		{
 			// Bilinear RGBA8 gain map; cell (i,j) at data row j (v=0 = TV top,
-			// matching the warp output and the shading measurement).
+			// matching the warp output and the shading measurement). Orientation
+			// VERIFIED on a real TV 2026-06-21: a 4-corner colour probe map
+			// (red TL / green TR / blue BL / white BR) on a uniform white screen
+			// showed correct corners in HyperHDR's live view — no row flip from
+			// the GL y-origin / glReadPixels order.
 			glGenTextures(1, &texShade);
 			glBindTexture(GL_TEXTURE_2D, texShade);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
