@@ -910,7 +910,11 @@ static bool autoCalibWebGate()
 		if ((c == '\n' || c == '\r') && !_autoCalibWebStarted)
 		{
 			_autoCalibWebStarted = true;
-			_autoCalibWebSettleNs = nowNs() + 1200000000LL; // 1.2 s settle
+			// First patch after 'begin': wait at least the configured start delay
+			// (lets the browser's fullscreen prompt clear) and never less than the
+			// 1.2 s convergence settle.
+			_autoCalibWebSettleNs =
+				nowNs() + std::max<int64_t>(_ledCalibCfg.startDelayMs * 1000000LL, 1200000000LL);
 			showAutoCalibPatch();
 			std::cout << "AutoCalib: patch shown, settling..." << std::endl;
 		}
@@ -2892,6 +2896,7 @@ int main(int argc, char *argv[])
 		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
 		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(20), "LED calib: frames averaged per measurement")																										  //
 		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(700), "LED calib: settle time before each measurement (HyperHDR smoothing + LED response)")									  //
+		("calib-start-delay-ms", po::value<int>(&_ledCalibCfg.startDelayMs)->default_value(5000), "Calib (web): hold the first patch this long after 'begin' so the browser's fullscreen prompt clears (0=off; --ledcalib + web autocalib)")									  //
 		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page on a PC on the TV's HDMI (required for tv/gamma/shading)")								  //
 		("calib-tv-port", po::value<int>(&_ledCalibWebPort)->default_value(8080), "LED calib: TV web page port (--calib-tv-web)")																					  //
 		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-12)")											  //

@@ -193,6 +193,10 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		enterPhase(_phase, nowMs);
 	}
 
+	// Release a first-patch start delay once its grace has elapsed (set by the
+	// 'begin' tap in handleKeys on an earlier frame).
+	tickStartDelay(nowMs);
+
 	// Shading samples the whole TV quad from the raw frame; the fixed TV/LED
 	// ROIs are not used.
 	if (_phase == Phase::Shading || _phase == Phase::ShadingWait)
@@ -312,6 +316,33 @@ void LedCalib::webRefreshWhite()
 {
 	if (_web)
 		_web->setState(255, 255, 255, true, _drive[0], _drive[1], _drive[2], _webSeq);
+}
+
+void LedCalib::beginActivePhase(Phase active, int64_t nowMs)
+{
+	// The 'begin' tap just put the page fullscreen; some browsers then flash a
+	// "press Esc to exit fullscreen" toast that can sit over the patch. Hold the
+	// first patch back by startDelayMs (once per run) so it clears first. The TV
+	// shows the wait-phase field (black/last) during the grace, then the patch.
+	if (_web && _cfg.startDelayMs > 0 && !_startDelayDone)
+	{
+		_startDelayDone = true;
+		_pendingPhase = active;
+		_startDelayUntilMs = nowMs + _cfg.startDelayMs;
+		std::cout << "Holding the first patch " << (_cfg.startDelayMs / 1000.0)
+				  << "s for the browser's fullscreen prompt to clear..." << std::endl;
+		return;
+	}
+	enterPhase(active, nowMs);
+}
+
+void LedCalib::tickStartDelay(int64_t nowMs)
+{
+	if (_pendingPhase == Phase::Done || nowMs < _startDelayUntilMs)
+		return;
+	const Phase active = _pendingPhase;
+	_pendingPhase = Phase::Done;
+	enterPhase(active, nowMs);
 }
 
 void LedCalib::enterPhase(Phase p, int64_t nowMs)
@@ -493,23 +524,23 @@ void LedCalib::handleKeys(int64_t nowMs)
 		{
 		case Phase::WhiteWait:
 			if (enter)
-				enterPhase(Phase::White, nowMs);
+				beginActivePhase(Phase::White, nowMs);
 			break;
 		case Phase::ShadingWait:
 			if (enter)
-				enterPhase(Phase::Shading, nowMs);
+				beginActivePhase(Phase::Shading, nowMs);
 			break;
 		case Phase::TvWait:
 			if (enter)
-				enterPhase(Phase::Tv, nowMs);
+				beginActivePhase(Phase::Tv, nowMs);
 			break;
 		case Phase::LedWait:
 			if (enter)
-				enterPhase(Phase::LedBaseline, nowMs);
+				beginActivePhase(Phase::LedBaseline, nowMs);
 			break;
 		case Phase::GammaWait:
 			if (enter)
-				enterPhase(Phase::Gamma, nowMs);
+				beginActivePhase(Phase::Gamma, nowMs);
 			break;
 		case Phase::White:
 			whiteKey(c, nowMs);

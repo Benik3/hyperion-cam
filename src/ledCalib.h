@@ -40,6 +40,10 @@ struct LedCalibConfig
 	int tvPatchCount = 216;	   // patches in the TV sweep (set to tvGrid^3)
 	int measureFrames = 20;	   // frames averaged per measurement
 	int settleMs = 700;		   // LED + HyperHDR smoothing settle before measuring
+	// Web only: after the user taps 'begin' (which puts the page fullscreen),
+	// hold the first patch back this long so the browser's transient "press Esc
+	// to exit fullscreen" prompt clears before it can cover the patch. 0 = off.
+	int startDelayMs = 5000;
 	// TV-patch display is web-only.
 	bool tvWeb = false; // drive the TV via the browser page
 	int tvGrid = 6;		// TV patch cube grid points per axis
@@ -152,6 +156,10 @@ private:
 						const LedCalibRoi &roi) const;
 
 	void enterPhase(Phase p, int64_t nowMs);
+	// Enter an active sweep phase after the 'begin' tap, deferred by
+	// _cfg.startDelayMs the first time so the fullscreen prompt clears.
+	void beginActivePhase(Phase active, int64_t nowMs);
+	void tickStartDelay(int64_t nowMs);
 	void handleKeys(int64_t nowMs);
 	void whiteKey(char c, int64_t nowMs);
 	void runWhite(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
@@ -200,6 +208,11 @@ private:
 	bool _webStarted = false;	// page connected + user pressed start
 	uint32_t _webSeq = 0;		// monotonic display sequence for SSE/ack
 	int64_t _lastUrlPrintMs = 0; // throttle the "open this URL" prompt
+	// Deferred first-patch start (browser fullscreen-prompt grace). _pendingPhase
+	// is the active phase to enter once _startDelayUntilMs passes; applied once.
+	Phase _pendingPhase = Phase::Done;
+	int64_t _startDelayUntilMs = -1;
+	bool _startDelayDone = false;
 
 	// keyboard reader
 	std::thread _kbThread;

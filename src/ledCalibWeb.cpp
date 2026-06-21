@@ -17,7 +17,10 @@
 namespace
 {
 	// Fullscreen color display + Phase 0 nudge UI. Connects SSE immediately;
-	// fullscreen is requested on the first click (browsers require a gesture).
+	// fullscreen is attempted at load (works when the browser was launched
+	// fullscreen/kiosk or has the permission) and re-attempted on the first
+	// gesture / the begin tap as a fallback (most browsers reject the
+	// Fullscreen API without a user gesture).
 	// After each painted frame it double-rAFs, then acks the seq so the grabber
 	// knows the TV actually shows the patch before it starts the settle timer.
 	const char *kPageHtml = R"HTML(<!doctype html>
@@ -82,6 +85,14 @@ const fill=document.getElementById('fill'), patch=document.getElementById('patch
       example=document.getElementById('example'), hint=document.getElementById('starthint');
 const ka=document.getElementById('ka');
 function k(c){fetch('/key?c='+encodeURIComponent(c),{method:'POST'}).catch(()=>{});}
+// Enter fullscreen. Browsers reject this without a user gesture, so we try at
+// load (succeeds in a fullscreen/kiosk-launched browser) and again on the first
+// gesture and the begin tap. Harmless when already fullscreen or rejected.
+function tryFs(){ const el=document.documentElement;
+  if(!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen().catch(()=>{}); }
+tryFs();
+window.addEventListener('pointerdown', tryFs, {once:true});
+window.addEventListener('keydown', tryFs, {once:true});
 // Keep the PC display awake (Screen Wake Lock); re-acquire if it drops.
 let wakeLock=null;
 async function keepAwake(){ try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){} }
@@ -97,7 +108,7 @@ function kaTick(t){
 requestAnimationFrame(kaTick);
 function go(){
   const s=document.getElementById('start'); s.style.display='none';
-  const el=document.documentElement; if(el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+  tryFs();
   keepAwake();
   k('start');
 }
