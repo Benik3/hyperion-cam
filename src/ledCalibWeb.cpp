@@ -47,15 +47,22 @@ namespace
   /* Dim gray, low luminance, to limit OLED retention of the static label. */
   #st{position:fixed;left:1vh;bottom:1vh;color:#555;font-size:1.6vh;z-index:2;
       font-variant-numeric:tabular-nums}
-  /* keep-alive: tiny moving dim square in the corner -> per-frame motion so the
-     TV doesn't trigger its static-image screensaver. In the black surround for
-     windowed patches (the long sweeps); negligible elsewhere. */
-  #ka{position:fixed;left:0;top:0;width:8px;height:8px;z-index:4;pointer-events:none}
+  /* keep-alive: a muted <video> playing a tiny canvas-capture MediaStream. A
+     playing video makes the browser/OS treat the page like a media player (as
+     YouTube does) and inhibit the screensaver/display sleep over plain HTTP,
+     where the Screen Wake Lock API (HTTPS-only) is unavailable. opacity:0 keeps
+     it out of the camera's view of the TV (and harmless even if fullscreen
+     stretches it), so it can never cover or corrupt a patch. Firefox grants the
+     blocker to an invisible *MediaStream* video (a file would have to be
+     visible); the stream is driven at a low frame rate so it can't bog down a
+     weak TV browser the way a per-frame canvas loop did. */
+  #keep{position:fixed;left:0;top:0;width:32px;height:32px;z-index:0;
+        pointer-events:none;opacity:0}
 </style></head>
 <body>
 <div id="fill"></div>
 <div id="patch"></div>
-<div id="ka"></div>
+<video id="keep" muted playsinline></video>
 <div id="ui">
   <h2>Make the LED glow match the TV white — tune HyperHDR white balance, or nudge:</h2>
   <div class="drv">R <span id="dr">0</span>&nbsp; G <span id="dg">0</span>&nbsp; B <span id="db">0</span></div>
@@ -83,29 +90,49 @@ let lastSeq=-1, last=null;
 const fill=document.getElementById('fill'), patch=document.getElementById('patch'),
       ui=document.getElementById('ui'), st=document.getElementById('st'),
       example=document.getElementById('example'), hint=document.getElementById('starthint');
-const ka=document.getElementById('ka');
+const keep=document.getElementById('keep');
 function k(c){fetch('/key?c='+encodeURIComponent(c),{method:'POST'}).catch(()=>{});}
-// Enter fullscreen. Browsers reject this without a user gesture, so we try at
-// load (succeeds in a fullscreen/kiosk-launched browser) and again on the first
-// gesture and the begin tap. Harmless when already fullscreen or rejected.
+// Enter fullscreen from the begin tap only. Browsers (Firefox especially)
+// reject requestFullscreen() unless it is called directly from a single user
+// gesture, and even a caught rejection logs a console warning — so we must NOT
+// call it on load or from extra listeners (those just error and, worse, a
+// duplicate request racing the tap makes the real one fail). To have the page
+// already fullscreen on the first screen, launch the browser fullscreen/kiosk
+// (F11 / --kiosk): it is then fullscreen at the browser level, no API needed.
 function tryFs(){ const el=document.documentElement;
   if(!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen().catch(()=>{}); }
-tryFs();
-window.addEventListener('pointerdown', tryFs, {once:true});
-window.addEventListener('keydown', tryFs, {once:true});
-// Keep the PC display awake (Screen Wake Lock); re-acquire if it drops.
-let wakeLock=null;
-async function keepAwake(){ try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){} }
-document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') keepAwake(); });
-// Per-frame motion in a corner so the TV doesn't blank on a static image.
-function kaTick(t){
-  const x=Math.round(4+4*Math.sin(t/300)), y=Math.round(4+4*Math.cos(t/300));
-  const lvl=(Math.floor(t/16)&15);            // dim, changing
-  ka.style.transform='translate('+x+'px,'+y+'px)';
-  ka.style.background='rgb('+lvl+','+lvl+','+lvl+')';
-  requestAnimationFrame(kaTick);
+// Keep the display awake by actually PLAYING video: a muted, looping <video>
+// fed by a canvas-capture MediaStream. Browsers grant a media power-save
+// blocker (no display sleep / screensaver) to playing video, the same way a
+// YouTube tab does — and unlike the Screen Wake Lock API it works over plain
+// HTTP. The drawn frames are dim and slowly moving so the corner stays dark and
+// the TV's own static-image screensaver never trips either.
+// Keep the display awake by playing a tiny canvas-capture MediaStream. A live
+// video stream earns the browser/OS media power-save blocker over plain HTTP
+// even while invisible (Firefox grants it to a MediaStream regardless of
+// visibility, unlike a file). Kept deliberately cheap — a 16x16 canvas redrawn
+// a few times a second via setInterval, NOT a 60fps requestAnimationFrame loop
+// — so it can't bog down / hang a weak TV browser over a long sweep. Started
+// from the begin tap (browsers block play() before a gesture); retried on
+// refocus in case the browser paused background media.
+let keepWanted=false, keepInit=false;
+function keepAwake(){
+  keepWanted=true;
+  try{
+    if(!keepInit){ keepInit=true;
+      const c=document.createElement('canvas'); c.width=c.height=16;
+      const g=c.getContext('2d'); let n=0;
+      const draw=()=>{ const v=8+(n++&3); g.fillStyle='rgb('+v+','+v+','+v+')'; g.fillRect(0,0,16,16); };
+      draw();
+      keep.srcObject=c.captureStream(4);   // ~4 fps: live enough to hold the lock, cheap
+      keep.muted=true; keep.playsInline=true;
+      setInterval(draw, 250);              // tiny periodic change keeps the stream live
+    }
+    keep.play().catch(()=>{});
+  }catch(e){}
 }
-requestAnimationFrame(kaTick);
+document.addEventListener('visibilitychange',()=>{
+  if(keepWanted && document.visibilityState==='visible') keep.play().catch(()=>{}); });
 function go(){
   const s=document.getElementById('start'); s.style.display='none';
   tryFs();
@@ -142,8 +169,9 @@ es.onmessage=ev=>{
   let s; try{s=JSON.parse(ev.data);}catch(_){return;}
   last=s;
   patch.style.background='rgb('+s.r+','+s.g+','+s.b+')';
-  // Hide the corner keep-alive + status during a clean full-frame measurement.
-  ka.style.display = s.clean ? 'none' : '';
+  // Hide the status text during a clean full-frame measurement. The keep-awake
+  // video is transparent (opacity:0) so it never corrupts a sample and keeps
+  // playing through every phase.
   st.style.display = s.clean ? 'none' : '';
   layout(s);
   if(s.controls){ui.classList.add('on');
