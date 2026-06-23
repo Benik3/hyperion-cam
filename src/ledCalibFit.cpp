@@ -692,6 +692,22 @@ namespace
 		for (int c = 0; c < 3; c++)
 			m.corr[c] = (totalW[c] > 1e-12) ? tW[c] / totalW[c] : corrLin[c];
 
+		// A channel whose modelled LED white reads near the camera floor (a
+		// severely WB-attenuated channel) makes corr = tW/totalW explode and
+		// crushes that channel across the LUT (colour cast). The fit can't repair
+		// it - no anchor in the data reproduces that channel - so flag it loudly
+		// instead of shipping a silent cast. Deferred "real" fix: clamp corr (see
+		// CLAUDE.md, "Deferred fix - corr clamp").
+		const double maxTotalW = std::max({totalW[0], totalW[1], totalW[2]});
+		for (int c = 0; c < 3; c++)
+			if (maxTotalW > 1e-9 && totalW[c] < 0.02 * maxTotalW)
+				std::cout << "WARNING: LED white channel " << "rgb"[c]
+						  << " reads near the camera floor (modelled white " << totalW[c]
+						  << " vs brightest " << maxTotalW << ", corr=" << m.corr[c]
+						  << "); the noise-dominated white correction will crush it across the LUT."
+						  << " Reduce its HyperHDR WB attenuation or raise LED brightness, then recalibrate."
+						  << std::endl;
+
 		if (verbose)
 		{
 			std::cout << "Fit: p=" << m.p << " additivityResid=" << m.additivityResid
