@@ -450,7 +450,65 @@ namespace
 		}
 	}
 
-	bool fitModel(const CalibData &d, FitModel &m, bool verbose)
+	// Dark-end regularization. The camera cannot measure dim LED glow at the
+	// locked exposure - a white-balance-attenuated channel (e.g. HyperHDR green at
+	// 0.25) floors out first - so the bottom of a measured drive curve is noise
+	// that monotonize() flattens into a plateau. Inverting a plateau makes that
+	// channel switch on abruptly at a drive level unrelated to its neighbours,
+	// producing dark-grey crush + colour cast (e.g. a green jump). Replace every
+	// curve point below relFloor*full-output with a smooth power law
+	// e = e(s*) * (s/s*)^gamma, anchored at the first reliable level s* and with
+	// gamma fit log-log from the low reliable region. The result rises
+	// monotonically from 0 with no plateau, so all channels turn on consistently.
+	// Returns the (level, gamma) actually used for diagnostics; gamma<0 == no-op.
+	std::pair<double, double> regularizeCurveBottom(Curve &c, double relFloor)
+	{
+		if (relFloor <= 0.0 || c.value.size() < 3)
+			return {0.0, -1.0};
+		const double vmax = c.value.back();
+		if (vmax <= 0.0)
+			return {0.0, -1.0};
+		const double thr = relFloor * vmax;
+
+		// First reliable level: lowest strictly-positive drive with value >= thr.
+		std::size_t kstar = 0;
+		while (kstar < c.value.size() && (c.level[kstar] <= 0.0 || c.value[kstar] < thr))
+			kstar++;
+		if (kstar == 0 || kstar >= c.value.size())
+			return {0.0, -1.0}; // nothing below threshold, or no reliable point
+
+		const double sStar = c.level[kstar], vStar = c.value[kstar];
+
+		// Fit gamma over the low reliable region via log-log LS; keep it local to
+		// the dark end (cap at half full output) but always take at least a few
+		// points so a sparse low grid doesn't pin gamma on two noisy samples.
+		double sx = 0, sy = 0, sxx = 0, sxy = 0;
+		int n = 0;
+		for (std::size_t k = kstar; k < c.value.size(); k++)
+		{
+			if ((c.value[k] > 6.0 * thr && n >= 3) || c.value[k] > 0.5 * vmax)
+				break;
+			if (c.level[k] <= 0.0 || c.value[k] <= 0.0)
+				continue;
+			const double x = std::log(c.level[k]), y = std::log(c.value[k]);
+			sx += x; sy += y; sxx += x * x; sxy += x * y; n++;
+		}
+		double gamma = 1.0; // fallback: linear in drive (LED ~ linear hypothesis)
+		if (n >= 2)
+		{
+			const double denom = n * sxx - sx * sx;
+			if (std::fabs(denom) > 1e-9)
+				gamma = (n * sxy - sx * sy) / denom;
+		}
+		gamma = std::clamp(gamma, 0.5, 4.0); // physical guard
+
+		for (std::size_t k = 0; k < kstar; k++)
+			c.value[k] = (c.level[k] <= 0.0) ? 0.0 : vStar * std::pow(c.level[k] / sStar, gamma);
+		monotonize(c);
+		return {sStar, gamma};
+	}
+
+	bool fitModel(const CalibData &d, FitModel &m, bool verbose, double curveFloor)
 	{
 		m.p = estimateExponent(d, m.additivityResid);
 		m.baselineLin = linv3(d.baselineLed, m.p);
@@ -549,6 +607,19 @@ namespace
 			if (cv::invert(EE, EEinv, cv::DECOMP_LU) == 0)
 				break; // degenerate curves; keep previous A
 			A = YE * EEinv;
+		}
+
+		// Regularize the unreliable dark end of each curve (camera floor noise)
+		// with a smooth power law before normalization - removes the plateau-driven
+		// crush + colour cast. Runs after the ALS so it reshapes only the bottom of
+		// the converged curves; e(255) is untouched so the normalization scale below
+		// (and A's columns) are unaffected.
+		for (int c = 0; c < 3; c++)
+		{
+			const auto [sStar, gamma] = regularizeCurveBottom(m.e[c], curveFloor);
+			if (verbose && gamma >= 0.0)
+				std::cout << "Curve " << "rgb"[c] << ": regularized below drive " << sStar
+						  << " (power-law gamma=" << gamma << ")" << std::endl;
 		}
 
 		// Normalize curves to e(255)=1 and fold the scale into A's columns.
@@ -761,7 +832,7 @@ namespace
 
 	bool runFitCore(const LedCalibFitConfig &cfg, const CalibData &data, FitResult &res)
 	{
-		if (!fitModel(data, res.model, cfg.verbose))
+		if (!fitModel(data, res.model, cfg.verbose, cfg.curveFloor))
 			return false;
 		res.n = std::clamp(cfg.lutSize, 2, 65);
 		buildLut(res.model, res);

@@ -18,6 +18,13 @@ struct LedCalibFitConfig
 	// neither the TV nor the LED reading clips (the camera maxes below 255, and
 	// LEDs/TV may be brighter than each other). 0..255.
 	double clipLevel = 250.0;
+	// Dark-end curve regularization: per channel, drive-curve points below this
+	// fraction of the channel's full output are unreliable (the camera floors out
+	// on dim LED glow, worst on a heavily white-balance-attenuated channel) and
+	// get replaced by a smooth power law extrapolated from the reliable region
+	// above. Removes the monotonize() plateaus that cause dark-grey crush + colour
+	// cast. 0 disables (use the raw measured bottom). doc/led-lut-calibration.md.
+	double curveFloor = 0.05;
 	bool verbose = false;
 };
 

@@ -142,6 +142,19 @@ reads the sweep files, writes `lut.cube` + `fit_report.json`, exits. Math (`src/
   linear space) — no gamma assumption, no TV data needed.
 - **Fit**: alternating least squares — `z = A⁻¹·Y` bucketed by drive level rebuilds the curves,
   then `A` refit by normal equations; 6 iterations, curves monotonized, `e(255)=1` normalized.
+- **Dark-end curve regularization** (`--calib-curve-floor`, default 0.05): the camera can't
+  measure dim LED glow at the locked exposure — a heavily white-balance-attenuated channel (e.g.
+  HyperHDR green at 0.25× floors out first), so the bottom of each measured curve is noise that
+  `monotonize()` flattens into a plateau. Inverting a plateau makes that channel switch on abruptly
+  at a drive level unrelated to its neighbours → dark-grey **crush** (everything maps to ~0 drive)
+  + **colour cast** (one channel — typically green — slams on first). Fix: per channel, replace
+  every curve point below `floor × full-output` with a smooth power law `e = e(s*)·(s/s*)^γ`
+  anchored at the first reliable level `s*`, with `γ` fit log-log from the low reliable region
+  (≥3 points, ≤½ output; falls back to γ=1, "LED ~ linear"). The bottom then rises monotonically
+  from 0 with no plateau and all channels turn on consistently. `--calib-curve-floor 0` disables
+  (raw measured bottom). This only reshapes the unreliable bottom — `e(255)` and the mid/top are
+  untouched. It does **not** fix the underlying measurement limit (see "RAW for the LED dark end"
+  in caveats); for that the LED sweep would have to be measured on the 10-bit RAW stream.
 - **Anchor**: encoded von-Kries gains act as `g^p` in linear light. Gains were measured against
   *total* light (glow + ambient floor) and the viewer sees total light too, so the white pin and
   every inversion target include the ambient term: solve `corr·(A·e(S) + ambient) = lin(v)`.
@@ -303,6 +316,14 @@ accuracy at ~1/7 the cost. Net feature cost ~+1 ms p50, accepted. Test hooks (id
   acceptable for glow.
 - Saturated colors keep residual hue error after a white-only anchor (metamerism); optional
   extra anchors can reduce it.
+- **RAW for the LED dark end (open).** The locked exposure that keeps the bright LED glow from
+  clipping leaves the dim low-drive glow below the 8-bit ISP noise floor, worst on a
+  white-balance-attenuated channel — so the dark end of the drive curves is unmeasurable and is
+  reconstructed by `--calib-curve-floor` regularization, not measured. Measuring the LED sweep on
+  the 10-bit RAW Bayer stream (the machinery exists for `--gamma-raw`) would recover real low-end
+  data; the cost is mapping RAW back into the ISP-RGB LUT-input domain. Note the *gamma probe*
+  (`--ledcalib gamma`) characterizes the TV→camera transfer (the LUT **input**), not these
+  LED→camera curves (the **output** mapping), so it does not address this directly.
 - LED heat drift over long runs and OLED burn-in risk are why the run is 30–45 min, not hours.
 - HyperHDR settings and camera color controls are baked into the LUT; changing either means
   recalibrating.
