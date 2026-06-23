@@ -1039,6 +1039,7 @@ void LedCalib::writeShadingMap()
 	const int U = _cfg.shadingGridU, V = _cfg.shadingGridV;
 	std::vector<double> m(static_cast<std::size_t>(U) * V * 3, 0.0);
 	double mn[3] = {1e18, 1e18, 1e18};
+	double mx[3] = {0, 0, 0};
 	for (int idx = 0; idx < U * V; idx++)
 	{
 		const double cnt = _shadeCount[idx] ? static_cast<double>(_shadeCount[idx]) : 1.0;
@@ -1047,8 +1048,21 @@ void LedCalib::writeShadingMap()
 			const double v = _shadeSum[idx * 3 + c] / cnt;
 			m[idx * 3 + c] = v;
 			mn[c] = std::min(mn[c], v);
+			mx[c] = std::max(mx[c], v);
 		}
 	}
+
+	// A single near-black cell - e.g. the --transform quad overhanging the lit TV
+	// onto the bezel/letterbox - becomes mn[c] and collapses every gain_c (=
+	// mn/mean) toward 0, blacking that channel out across the whole frame. The
+	// strict-min "darken-to-dimmest" target is only valid if every cell sits on
+	// the lit TV. Deferred robust-target fix: see CLAUDE.md ("shading min").
+	for (int c = 0; c < 3; c++)
+		if (mx[c] > 1e-6 && mn[c] < 0.33 * mx[c])
+			std::cout << "WARNING: shading channel " << "rgb"[c] << " has a near-black cell (min "
+					  << mn[c] << " vs brightest " << mx[c] << "): darken-to-dimmest would drive gain_"
+					  << "rgb"[c] << " to ~" << (mn[c] / mx[c]) << " across the frame (channel blackout). "
+					  << "Check the --transform quad sits inside the lit TV, then re-probe." << std::endl;
 
 	const std::string path = _cfg.outDir + "/shading.csv";
 	std::ofstream f(path);
