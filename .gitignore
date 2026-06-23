@@ -11,5 +11,6 @@ CTestTestfile.cmake
 _deps
 build/*
 Release/*
-.vscode/*ledcalib-out/
+.vscode/*
+ledcalib-out/
 imgout/

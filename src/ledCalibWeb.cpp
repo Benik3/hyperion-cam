@@ -101,12 +101,6 @@ function k(c){fetch('/key?c='+encodeURIComponent(c),{method:'POST'}).catch(()=>{
 // (F11 / --kiosk): it is then fullscreen at the browser level, no API needed.
 function tryFs(){ const el=document.documentElement;
   if(!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen().catch(()=>{}); }
-// Keep the display awake by actually PLAYING video: a muted, looping <video>
-// fed by a canvas-capture MediaStream. Browsers grant a media power-save
-// blocker (no display sleep / screensaver) to playing video, the same way a
-// YouTube tab does — and unlike the Screen Wake Lock API it works over plain
-// HTTP. The drawn frames are dim and slowly moving so the corner stays dark and
-// the TV's own static-image screensaver never trips either.
 // Keep the display awake by playing a tiny canvas-capture MediaStream. A live
 // video stream earns the browser/OS media power-save blocker over plain HTTP
 // even while invisible (Firefox grants it to a MediaStream regardless of
@@ -284,8 +278,13 @@ namespace
 
 	void cbClose(evhttp_connection *conn, void *arg)
 	{
-		(void)conn;
 		auto *d = static_cast<LedCalibWeb::Impl *>(arg);
+		// "Last connection wins": a newer /events stream may have replaced this
+		// one while this (older) connection's closecb is still registered. Only
+		// clear the shared pointer when the closing connection still owns it, so
+		// an old connection closing late can't kill the live client's stream.
+		if (d->sse && evhttp_request_get_connection(d->sse) != conn)
+			return;
 		d->sse = nullptr;
 		d->hasClient.store(false, std::memory_order_release);
 	}

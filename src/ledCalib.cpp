@@ -171,7 +171,6 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 	if (!_roiChecked)
 	{
 		_roiChecked = true;
-		_t0Ms = nowMs;
 		auto inFrame = [&](const LedCalibRoi &r)
 		{
 			return r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= width && r.y + r.h <= height;
@@ -372,8 +371,8 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		}
 		else
 		{
-			std::cout << "\nLedCalib white (manual white balance): put the calib video on its WHITE\n"
-						 "section (or any full-screen white) and press Enter. 'q' quits." << std::endl;
+			std::cout << "\nLedCalib white (manual white balance): show a full-screen white image on\n"
+						 "the TV and press Enter. 'q' quits." << std::endl;
 		}
 		break;
 	case Phase::White:
@@ -612,7 +611,7 @@ void LedCalib::whiteKey(char c, int64_t nowMs)
 			  << "," << static_cast<int>(d[2]) << " (step " << _whiteStep << ")" << std::endl;
 }
 
-void LedCalib::finishTvPhase(int64_t nowMs)
+void LedCalib::finishTvPhase()
 {
 	if (_tvRecords.empty())
 	{
@@ -627,10 +626,7 @@ void LedCalib::finishTvPhase(int64_t nowMs)
 	}
 	writeTvSweep();
 
-	if (_cfg.phase == "tv")
-		finishAll(EXIT_SUCCESS);
-	else
-		enterPhase(Phase::LedWait, nowMs);
+	finishAll(EXIT_SUCCESS);
 }
 
 void LedCalib::buildLedPlan()
@@ -709,7 +705,7 @@ void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs
 	_tvPlanPos++;
 	if (_tvPlanPos >= _tvPlan.size())
 	{
-		finishTvPhase(nowMs);
+		finishTvPhase();
 		return;
 	}
 	showTvPatch(nowMs);
@@ -907,7 +903,6 @@ void LedCalib::processRawFrame(const uint8_t *img, int width, int height, int st
 	if (!_roiChecked)
 	{
 		_roiChecked = true;
-		_t0Ms = nowMs;
 		// Scale the (processed-resolution) TV ROI into raw-stream coords. The TV
 		// patch is uniform, so landing inside the TV region is all that matters.
 		const int refW = _cfg.gammaRefW > 0 ? _cfg.gammaRefW : width;

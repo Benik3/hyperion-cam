@@ -162,7 +162,7 @@ private:
 	void tickStartDelay(int64_t nowMs);
 	void handleKeys(int64_t nowMs);
 	void whiteKey(char c, int64_t nowMs);
-	void finishTvPhase(int64_t nowMs);
+	void finishTvPhase();
 	// Web TV-patch path.
 	void buildTvPlan();
 	void showTvPatch(int64_t nowMs);
@@ -200,7 +200,6 @@ private:
 	LedCalibWeb *_web = nullptr;
 
 	Phase _phase = Phase::Done;
-	int64_t _t0Ms = -1;
 	bool _finished = false;
 	bool _roiChecked = false;
 	bool _webStarted = false;	// page connected + user pressed start

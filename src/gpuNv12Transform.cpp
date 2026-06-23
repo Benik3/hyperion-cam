@@ -484,7 +484,7 @@ struct GpuNv12Transform::Impl
 		}
 		if (lutEnabled && !lutData.empty())
 			std::cerr << "[gpuNv12] LUT enabled: " << lutN << "^3 trilinear (from file)" << std::endl;
-		if (lutEnabled)
+		if (lutEnabled && lutData.empty())
 			std::cerr << "[gpuNv12] LUT test enabled: " << lutN << "^3 "
 					  << (lutTrilinear ? "trilinear" : "tetrahedral") << std::endl;
 

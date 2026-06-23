@@ -3339,8 +3339,8 @@ int main(int argc, char *argv[])
 			std::cout << "INFO: --ledcalib forces RGB output; ignoring --nv12" << std::endl;
 		_useNv12 = false;
 		// TV-side phases (tv/gamma/shading) keep the production --crop so their
-		// geometry matches runtime; phases that measure the LED wall (all/led/
-		// white) need the full frame.
+		// geometry matches runtime; phases that measure the LED wall (led/white)
+		// need the full frame.
 		const bool keepCrop = shadingMode || gammaMode || tvMode;
 		_transformEn = false; // we sample the frame directly; no GPU warp
 		if (!keepCrop && _cropEn)
@@ -3385,7 +3385,7 @@ int main(int argc, char *argv[])
 			}
 			else
 				std::cout << "WARNING: --shading-map ignored for --ledcalib " << _ledCalibPhase
-						  << " (only tv/gamma measure the shaded TV; all/led use the full frame)" << std::endl;
+						  << " (only tv/gamma measure the shaded TV; the LED-wall phases use the full frame)" << std::endl;
 		}
 		if (_outputCropEn)
 		{

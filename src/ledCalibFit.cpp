@@ -415,20 +415,32 @@ namespace
 
 	double estimateExponent(const CalibData &d, double &residOut)
 	{
+		// additivityResidual returns this sentinel when there are no usable
+		// multi-channel samples to measure additivity against. Never let it win
+		// the scan: bestR starts above it, so the first p (~1.2) would otherwise
+		// be "best" and pin the exponent at 1.2 instead of the documented 2.2.
+		constexpr double kNoData = 1e9;
 		double bestP = 2.2, bestR = 1e18;
+		bool measured = false;
 		for (double p = 1.2; p <= 3.2 + 1e-9; p += 0.05)
 		{
 			const double r = additivityResidual(d, p);
-			if (r < bestR)
+			if (r < kNoData && r < bestR)
 			{
 				bestR = r;
 				bestP = p;
+				measured = true;
 			}
+		}
+		if (!measured)
+		{
+			residOut = bestR; // sentinel; signals additivity was unmeasurable
+			return 2.2;        // keep the neutral default rather than 1.2
 		}
 		for (double p = bestP - 0.05; p <= bestP + 0.05 + 1e-9; p += 0.005)
 		{
 			const double r = additivityResidual(d, p);
-			if (r < bestR)
+			if (r < kNoData && r < bestR)
 			{
 				bestR = r;
 				bestP = p;
@@ -801,6 +813,11 @@ namespace
 	void writeReport(const std::string &dir, const FitResult &res)
 	{
 		std::ofstream f(dir + "/fit_report.json");
+		if (!f)
+		{
+			std::cout << "WARNING: cannot write " << dir << "/fit_report.json" << std::endl;
+			return;
+		}
 		const FitModel &m = res.model;
 		f << "{\n";
 		f << "  \"p\": " << m.p << ",\n";
