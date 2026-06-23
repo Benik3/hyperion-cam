@@ -3224,21 +3224,35 @@ int main(int argc, char *argv[])
 		const bool gammaMode = (_ledCalibPhase == "gamma");
 		const bool shadingMode = (_ledCalibPhase == "shading");
 		const bool tvMode = (_ledCalibPhase == "tv");
+		const bool ledMode = (_ledCalibPhase == "led");
 		auto parseRoi = [](const std::string &s, LedCalibRoi &roi)
 		{
 			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
 		};
-		// Shading samples the whole TV quad (no ROIs); tv/gamma need only the TV
-		// ROI; led/white measure the wall too (both ROIs).
-		const bool tvOnlyRoi = gammaMode || tvMode;
+		// ROI requirements per phase: tv/gamma sample only the TV picture (TV ROI);
+		// led samples the LED wall (LED ROI; the TV ROI is an optional sanity
+		// column, unused by the fit); shading samples the whole TV quad and white is
+		// a manual eye-match (HyperHDR white balance) — neither needs a fixed ROI.
 		bool roiOk = true;
-		if (!shadingMode)
-			roiOk = tvOnlyRoi ? parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi)
-							  : (parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi) && parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi));
+		const char *roiNeed = nullptr;
+		if (tvMode || gammaMode)
+		{
+			roiNeed = "--calib-tv-roi";
+			roiOk = parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi);
+		}
+		else if (ledMode)
+		{
+			roiNeed = "--calib-led-roi";
+			roiOk = parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi);
+			// TV ROI optional: keep it if supplied (written as a sanity column).
+			if (!_calibTvRoiStr.empty())
+				parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi);
+		}
+		// shading/white need no ROI.
 		if (!roiOk)
 		{
-			std::cout << "ERROR: --ledcalib requires --calib-tv-roi"
-					  << (tvOnlyRoi ? "" : " and --calib-led-roi") << " as x,y,w,h" << std::endl;
+			std::cout << "ERROR: --ledcalib " << _ledCalibPhase << " requires " << roiNeed
+					  << " as x,y,w,h" << std::endl;
 			return EXIT_FAILURE;
 		}
 		if (shadingMode)

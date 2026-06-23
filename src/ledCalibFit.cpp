@@ -326,39 +326,23 @@ namespace
 					d.baselineLed = s.led;
 		}
 
-		if (!readFile(dir + "/white_anchor.json", txt))
+		// Derive the von-Kries white from the sweep white points: cam_tv_white from
+		// tv_sweep.csv vs cam_led_white from led_sweep.csv, at the brightest neutral
+		// level where neither clips. Requires HyperHDR's white balance to have
+		// eye-matched white before measuring (run --ledcalib white for that).
+		switch (deriveAnchorFromSweeps(dir, d, clip))
 		{
-			// No eye-anchor phase: try to derive the white correction from the
-			// sweep white points (requires HyperHDR WB to have eye-matched white).
-			switch (deriveAnchorFromSweeps(dir, d, clip))
-			{
-			case AnchorResult::Derived:
-				return true;
-			case AnchorResult::AllClipped:
-				// Error already printed; abort rather than silently ship a LUT
-				// built on a blown-out white point.
-				return false;
-			case AnchorResult::NoData:
-				std::cout << "WARNING: no white_anchor.json and could not derive white from tv_sweep.csv; "
-							 "assuming neutral gains (no metameric correction - run --ledcalib white, "
-							 "or set HyperHDR white balance and include a white patch in the TV sweep)" << std::endl;
-				return true;
-			}
+		case AnchorResult::Derived:
 			return true;
-		}
-		cv::Vec3d drv;
-		if (jsonTriple(txt, "drive", drv))
-		{
-			d.anchorDrive[0] = drv[0];
-			d.anchorDrive[1] = drv[1];
-			d.anchorDrive[2] = drv[2];
-		}
-		jsonTriple(txt, "tv_mean", d.anchorTv);
-		jsonTriple(txt, "led_mean", d.anchorLed);
-		if (!jsonTriple(txt, "gains", d.gains))
-		{
-			for (int c = 0; c < 3; c++)
-				d.gains[c] = d.anchorLed[c] > 1.0 ? d.anchorTv[c] / d.anchorLed[c] : 1.0;
+		case AnchorResult::AllClipped:
+			// Error already printed; abort rather than silently ship a LUT built on
+			// a blown-out white point.
+			return false;
+		case AnchorResult::NoData:
+			std::cout << "WARNING: could not derive white from tv_sweep.csv; assuming neutral gains "
+						 "(no metameric correction - set HyperHDR white balance and include neutral "
+						 "patches in the TV sweep)" << std::endl;
+			return true;
 		}
 		return true;
 	}
@@ -930,23 +914,28 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 		}
 	}
 
-	// Baseline + anchor. The anchor models the user's eye-match: TV white read
-	// by the camera vs the glow reading at the matched drive.
-	const cv::Vec3d anchorDrive{235, 240, 228};
-	const cv::Vec3d anchorLed = truth.reading(anchorDrive);
-	const cv::Vec3d anchorTv{224.0, 217.0, 209.0};
+	// Baseline (LEDs off / TV black).
 	{
 		std::ofstream f(dir + "/baseline.json");
 		const cv::Vec3d b = truth.reading({0, 0, 0});
 		f << "{\n  \"led_mean\": [" << b[0] << ", " << b[1] << ", " << b[2] << "]\n}\n";
 	}
+
+	// TV neutral sweep: the camera's reading of the TV showing each gray. The
+	// white correction is derived from these vs the LED grays (von-Kries), so the
+	// fit needs no white_anchor.json. cam_tv is modelled as a per-channel-scaled
+	// LED-white reading - the metameric mismatch the derived gains undo.
+	const cv::Vec3d tvGain{0.95, 0.90, 0.85};
 	{
-		std::ofstream f(dir + "/white_anchor.json");
-		f << "{\n  \"drive\": [" << anchorDrive[0] << ", " << anchorDrive[1] << ", " << anchorDrive[2] << "],\n";
-		f << "  \"tv_mean\": [" << anchorTv[0] << ", " << anchorTv[1] << ", " << anchorTv[2] << "],\n";
-		f << "  \"led_mean\": [" << anchorLed[0] << ", " << anchorLed[1] << ", " << anchorLed[2] << "],\n";
-		f << "  \"gains\": [" << anchorTv[0] / anchorLed[0] << ", " << anchorTv[1] / anchorLed[1]
-		  << ", " << anchorTv[2] / anchorLed[2] << "]\n}\n";
+		std::ofstream f(dir + "/tv_sweep.csv");
+		f << "index,patch_r,patch_g,patch_b,tv_r,tv_g,tv_b\n";
+		for (int i = 0; i < 17; i++)
+		{
+			const int L = i * 255 / 16;
+			const cv::Vec3d ledW = truth.reading({static_cast<double>(L), static_cast<double>(L), static_cast<double>(L)});
+			f << i << "," << L << "," << L << "," << L << ","
+			  << tvGain[0] * ledW[0] << "," << tvGain[1] * ledW[1] << "," << tvGain[2] * ledW[2] << "\n";
+		}
 	}
 
 	LedCalibFitConfig cfg = cfgIn;
@@ -954,8 +943,15 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 	cfg.lutOut = dir + "/lut.cube";
 
 	CalibData data;
-	if (!loadCalibData(cfg.calibDir, data))
+	// Lower clip so the brightest clean neutral (the derived white anchor) lands
+	// interior to the gamut, not on the corner - a cleaner round-trip target.
+	if (!loadCalibData(cfg.calibDir, data, 200.0))
 		return EXIT_FAILURE;
+	// White anchor now comes from the sweeps (deriveAnchorFromSweeps), exactly as
+	// production does without white_anchor.json.
+	const cv::Vec3d gains = data.gains;
+	const cv::Vec3d anchorTv = data.anchorTv;
+	const cv::Vec3d anchorDrive{data.anchorDrive[0], data.anchorDrive[1], data.anchorDrive[2]};
 	FitResult res;
 	if (!runFitCore(cfg, data, res))
 		return EXIT_FAILURE;
@@ -969,7 +965,6 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 
 	// Closed loop: target v -> LUT -> drive -> truth chain -> anchor-corrected
 	// encoded reading; must reproduce v on in-gamut points.
-	const cv::Vec3d gains{anchorTv[0] / anchorLed[0], anchorTv[1] / anchorLed[1], anchorTv[2] / anchorLed[2]};
 	std::uniform_real_distribution<double> uni(0.0, 255.0);
 	std::vector<double> errs;
 	int tested = 0, skipped = 0;

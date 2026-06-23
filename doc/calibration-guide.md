@@ -38,8 +38,10 @@ only role.
 
 ### 0a. White balance (first; don't change after)
 Set white in **HyperHDR's white balance** so the LED glow matches the TV white by eye (this is
-where you fix bluish LEDs). It freezes into the LED sweep, so set it **before** measuring. This
-replaces the Phase-0 eye anchor — the fit derives the white correction from the sweeps.
+where you fix bluish LEDs). It freezes into the LED sweep, so set it **before** measuring; the fit
+derives the white correction from the sweeps. `--ledcalib white` is an optional aid for this step —
+it drives the LEDs full white and sends a white frame to HyperHDR so you can eye-match in HyperHDR's
+white-balance settings; it takes no ROI, measures nothing, and writes no file (Enter/Accept exits).
 
 ### 0b. ROIs and aim
 The page shows a 10%-of-screen **window patch** (dodges TV auto-dimming). Find where it lands and
@@ -118,11 +120,12 @@ Drives the LEDs through a sweep, measures wall glow. The page blacks the TV auto
 
 ```bash
 sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain --ledcalib led --calib-tv-web \
-  --calib-tv-roi 320,360,80,60 --calib-led-roi 900,400,120,80 \
+  --calib-led-roi 900,400,120,80 \
   --calib-out cal --ledcalib-led-grid 8
 ```
-Open page → **tap begin**. No `--crop`/`--shading-map` (wall is outside the TV; full frame). ~10–15
-min, dark room. Writes `cal/led_sweep.csv`, `cal/baseline.json`, `cal/meta.json`.
+Open page → **tap begin**. Only `--calib-led-roi` is required (`--calib-tv-roi` is optional here — if
+given it's written as an unused sanity column). No `--crop`/`--shading-map` (wall is outside the TV;
+full frame). ~10–15 min, dark room. Writes `cal/led_sweep.csv`, `cal/baseline.json`, `cal/meta.json`.
 
 ---
 
@@ -132,9 +135,8 @@ min, dark room. Writes `cal/led_sweep.csv`, `cal/baseline.json`, `cal/meta.json`
 sudo systemctl start hypercam        # camera free again
 cat cal/fit_report.json              # rel_resid_p95 small (<0.10); note gamut %
 ```
-Reads `led_sweep.csv` + `baseline.json` + the **white point from `tv_sweep.csv`** (no
-`white_anchor.json` → derives von-Kries white from the sweeps = your HyperHDR WB). Writes
-`cal/lut.cube` + `cal/fit_report.json`.
+Reads `led_sweep.csv` + `baseline.json` + the **white point from `tv_sweep.csv`** (derives the
+von-Kries white from the sweeps = your HyperHDR WB). Writes `cal/lut.cube` + `cal/fit_report.json`.
 
 > **Clipping / white level.** If the LEDs are brighter than the TV (or vice-versa), true white
 > (255) can saturate the camera — and the camera maxes *below* 255 anyway (often ~252). The fit

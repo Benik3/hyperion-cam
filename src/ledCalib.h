@@ -162,7 +162,6 @@ private:
 	void tickStartDelay(int64_t nowMs);
 	void handleKeys(int64_t nowMs);
 	void whiteKey(char c, int64_t nowMs);
-	void runWhite(const RoiSample &tv, const RoiSample &led, int64_t nowMs);
 	void finishTvPhase(int64_t nowMs);
 	// Web TV-patch path.
 	void buildTvPlan();
@@ -187,7 +186,6 @@ private:
 	void setLed(uint8_t r, uint8_t g, uint8_t b, int64_t nowMs);
 
 	bool ensureOutDir();
-	void writeWhiteAnchor();
 	void writeTvSweep();
 	void writeLedSweep();
 	void writeBaseline();
@@ -226,14 +224,8 @@ private:
 
 	Measurement _meas;
 
-	// white anchor phase
+	// white phase (manual eye-match): LED-drive nudge step only
 	int _whiteStep = 8;
-	bool _whiteAccepted = false;
-	int64_t _whiteSettleUntilMs = -1;
-	int64_t _lastWhitePrintMs = 0;
-	SweepRecord _anchor{};
-	double _anchorGain[3] = {1.0, 1.0, 1.0};
-	bool _haveAnchor = false;
 
 	// TV sweep
 	std::vector<SweepRecord> _tvRecords;

@@ -10,7 +10,7 @@
 
 struct LedCalibFitConfig
 {
-	std::string calibDir = "ledcalib-out"; // input: led_sweep.csv, baseline.json, white_anchor.json
+	std::string calibDir = "ledcalib-out"; // input: led_sweep.csv, tv_sweep.csv, baseline.json
 	std::string lutOut;					   // output .cube path (default <calibDir>/lut.cube)
 	int lutSize = 33;					   // LUT grid per axis (trilinear runtime -> use dense grid)
 	// Camera-clipping threshold: a reading >= this (per channel) is treated as

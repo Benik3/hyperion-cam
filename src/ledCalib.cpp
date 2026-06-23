@@ -176,12 +176,18 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		{
 			return r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= width && r.y + r.h <= height;
 		};
-		// tv/gamma need no LED ROI; shading needs no TV ROI either (it samples
-		// the whole TV quad via the homography / full frame).
+		// tv/gamma need the TV ROI; led needs the LED ROI (the TV ROI is an
+		// optional sanity column); shading samples the whole TV quad and white is a
+		// manual eye-match — neither uses a fixed ROI.
 		const bool gamma = (_cfg.phase == "gamma");
-		const bool shading = (_cfg.phase == "shading");
 		const bool tvOnly = gamma || _cfg.phase == "tv";
-		if (!shading && (!inFrame(_cfg.tvRoi) || (!tvOnly && !inFrame(_cfg.ledRoi))))
+		const bool ledPhase = (_cfg.phase == "led");
+		bool roiBad = false;
+		if (tvOnly)
+			roiBad = !inFrame(_cfg.tvRoi);
+		else if (ledPhase)
+			roiBad = !inFrame(_cfg.ledRoi) || (_cfg.tvRoi.w > 0 && !inFrame(_cfg.tvRoi));
+		if (roiBad)
 		{
 			std::cout << "ERROR: LedCalib ROI outside the " << width << "x" << height
 					  << " frame (tv " << _cfg.tvRoi.x << "," << _cfg.tvRoi.y << "," << _cfg.tvRoi.w << "," << _cfg.tvRoi.h
@@ -231,7 +237,8 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 	switch (_phase)
 	{
 	case Phase::White:
-		runWhite(tv, led, nowMs);
+		// Manual eye-match: nothing to measure. The LED stays full white (re-sent
+		// above) while the user tunes HyperHDR's white balance or nudges.
 		break;
 	case Phase::Gamma:
 		runGamma(tv, nowMs);
@@ -358,32 +365,31 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 				enterPhase(Phase::White, nowMs);
 				return;
 			}
-			std::cout << "\nLedCalib phase 0 (eye anchor): open  http://<this-pi>:" << _web->port()
+			std::cout << "\nLedCalib white (manual white balance): open  http://<this-pi>:" << _web->port()
 					  << "/  in a FULLSCREEN browser on the PC connected to the TV (same HDMI input\n"
 						 "you normally watch), then tap 'begin'. 'q' quits." << std::endl;
 			_lastUrlPrintMs = nowMs;
 		}
 		else
 		{
-			std::cout << "\nLedCalib phase 0 (eye anchor): put the calib video on its WHITE section\n"
-						 "(or any full-screen white) and press Enter. 'q' quits." << std::endl;
+			std::cout << "\nLedCalib white (manual white balance): put the calib video on its WHITE\n"
+						 "section (or any full-screen white) and press Enter. 'q' quits." << std::endl;
 		}
 		break;
 	case Phase::White:
 		setLed(255, 255, 255, nowMs); // also sends a solid white frame to HyperHDR (LEDs go white)
-		_whiteAccepted = false;
 		if (_web)
 		{
-			// The eye anchor uses a FULL-SCREEN white field (overrides the
-			// windowed sweep geometry) so the whole TV is the white reference.
+			// Full-screen white field so the whole TV is the white reference.
 			_web->setPatchGeometry(100.0, -1.0, -1.0);
 			_webSeq++;
 			webRefreshWhite();
 		}
-		std::cout << "\nMake the LED glow match the TV white: adjust HyperHDR's white balance\n"
-					 "(LEDs are now driven full white), or nudge here/on the page —\n"
+		std::cout << "\nManual white balance: the LEDs are driven full white. Adjust HyperHDR's\n"
+					 "white balance until the LED glow matches the TV white (or nudge here/on the\n"
+					 "page to preview) —\n"
 					 "  1/2 = red -/+   3/4 = green -/+   5/6 = blue -/+\n"
-					 "  0 = toggle step (1/8)   Enter/Accept = confirm   q = quit" << std::endl;
+					 "  0 = toggle step (1/8)   Enter/Accept = done   q = quit" << std::endl;
 		break;
 	case Phase::TvWait:
 		setLed(0, 0, 0, nowMs);
@@ -555,9 +561,6 @@ void LedCalib::handleKeys(int64_t nowMs)
 
 void LedCalib::whiteKey(char c, int64_t nowMs)
 {
-	if (_whiteAccepted)
-		return;
-
 	int chan = -1;
 	int dir = 0;
 	switch (c)
@@ -592,11 +595,10 @@ void LedCalib::whiteKey(char c, int64_t nowMs)
 		return;
 	case '\n':
 	case '\r':
-		_whiteAccepted = true;
-		_whiteSettleUntilMs = nowMs + _cfg.settleMs;
-		std::cout << "White anchor accepted at drive " << static_cast<int>(_drive[0]) << ","
+		std::cout << "White balance confirmed at LED drive " << static_cast<int>(_drive[0]) << ","
 				  << static_cast<int>(_drive[1]) << "," << static_cast<int>(_drive[2])
-				  << "; measuring..." << std::endl;
+				  << "; exiting." << std::endl;
+		finishAll(EXIT_SUCCESS);
 		return;
 	default:
 		return;
@@ -608,67 +610,6 @@ void LedCalib::whiteKey(char c, int64_t nowMs)
 	setLed(d[0], d[1], d[2], nowMs);
 	std::cout << "LED white drive " << static_cast<int>(d[0]) << "," << static_cast<int>(d[1])
 			  << "," << static_cast<int>(d[2]) << " (step " << _whiteStep << ")" << std::endl;
-}
-
-void LedCalib::runWhite(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
-{
-	if (!_whiteAccepted)
-	{
-		// 1 Hz feedback so the user sees what the camera sees while matching.
-		if (nowMs - _lastWhitePrintMs >= 1000)
-		{
-			_lastWhitePrintMs = nowMs;
-			std::cout << "  cam: TV " << tv.mean[0] << "," << tv.mean[1] << "," << tv.mean[2]
-					  << "  LED-wall " << led.mean[0] << "," << led.mean[1] << "," << led.mean[2] << std::endl;
-		}
-		return;
-	}
-
-	if (nowMs < _whiteSettleUntilMs)
-		return;
-	if (!_meas.active)
-		_meas.start(_cfg.measureFrames);
-	_meas.add(tv, led);
-	if (!_meas.done())
-		return;
-
-	_meas.finish(_anchor.mean, _anchor.tstd, _anchor.sstd);
-	_anchor.frames = _meas.target;
-	_anchor.drive[0] = _drive[0];
-	_anchor.drive[1] = _drive[1];
-	_anchor.drive[2] = _drive[2];
-
-	for (int c = 0; c < 3; c++)
-	{
-		const double ledMean = _anchor.mean[1][c];
-		if (ledMean < 1.0)
-		{
-			std::cout << "WARNING: LED ROI channel " << c << " too dark (" << ledMean
-					  << ") for a white anchor gain; using 1.0" << std::endl;
-			_anchorGain[c] = 1.0;
-		}
-		else
-		{
-			_anchorGain[c] = _anchor.mean[0][c] / ledMean;
-		}
-	}
-	_haveAnchor = true;
-
-	std::cout << "White anchor: TV " << _anchor.mean[0][0] << "," << _anchor.mean[0][1] << "," << _anchor.mean[0][2]
-			  << "  LED-wall " << _anchor.mean[1][0] << "," << _anchor.mean[1][1] << "," << _anchor.mean[1][2]
-			  << "  gains " << _anchorGain[0] << "," << _anchorGain[1] << "," << _anchorGain[2] << std::endl;
-
-	if (!ensureOutDir())
-	{
-		finishAll(EXIT_FAILURE);
-		return;
-	}
-	writeWhiteAnchor();
-
-	if (_cfg.phase == "white")
-		finishAll(EXIT_SUCCESS);
-	else
-		enterPhase(Phase::TvWait, nowMs);
 }
 
 void LedCalib::finishTvPhase(int64_t nowMs)
@@ -1229,23 +1170,6 @@ bool LedCalib::ensureOutDir()
 	return true;
 }
 
-void LedCalib::writeWhiteAnchor()
-{
-	std::ofstream f(_cfg.outDir + "/white_anchor.json");
-	f << "{\n";
-	f << "  \"drive\": [" << static_cast<int>(_anchor.drive[0]) << ", " << static_cast<int>(_anchor.drive[1])
-	  << ", " << static_cast<int>(_anchor.drive[2]) << "],\n";
-	jsonTriple(f, "tv_mean", _anchor.mean[0]);
-	jsonTriple(f, "tv_tstd", _anchor.tstd[0]);
-	jsonTriple(f, "tv_sstd", _anchor.sstd[0]);
-	jsonTriple(f, "led_mean", _anchor.mean[1]);
-	jsonTriple(f, "led_tstd", _anchor.tstd[1]);
-	jsonTriple(f, "led_sstd", _anchor.sstd[1]);
-	jsonTriple(f, "gains", _anchorGain, false);
-	f << "}\n";
-	std::cout << "Wrote " << _cfg.outDir << "/white_anchor.json" << std::endl;
-}
-
 void LedCalib::writeTvSweep()
 {
 	const std::string path = _cfg.outDir + "/tv_sweep.csv";
@@ -1325,7 +1249,6 @@ void LedCalib::writeMeta()
 	f << "  \"tv_patches_measured\": " << _tvDecoded << ",\n";
 	f << "  \"measure_frames\": " << _cfg.measureFrames << ",\n";
 	f << "  \"settle_ms\": " << _cfg.settleMs << ",\n";
-	f << "  \"have_white_anchor\": " << (_haveAnchor ? "true" : "false") << ",\n";
 	f << "  \"timestamp\": " << static_cast<long long>(::time(nullptr)) << "\n";
 	f << "}\n";
 	std::cout << "Wrote " << _cfg.outDir << "/meta.json" << std::endl;

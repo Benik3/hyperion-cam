@@ -76,7 +76,7 @@ fullscreen color over SSE; the page paints it, double-`requestAnimationFrame`s t
 frame is up, then `POST /ack?n=seq`. The grabber starts its settle timer **on the ack**, so timing
 covers only TV-internal latency, not network/paint lag — and a closed/frozen page is caught by an
 8 s ack timeout (clean abort). The grabber *commands* each patch directly (no decoding). The page
-also hosts the Phase 0 nudge buttons so the whole run is driven from the TV-side PC.
+also hosts the white-phase nudge buttons so the whole run is driven from the TV-side PC.
 `src/ledCalibWeb.cpp`. Required for `tv`/`gamma`/`shading`. (A calib-video + index-decoder fallback
 existed early on and was removed 2026-06-16 — web only.)
 
@@ -91,7 +91,7 @@ retention of the static text.
 
 **Dry run:** `--ledcalib-web-dryrun --calib-tv-port 8080 [--patch-size 10 --patch-x .. --patch-y ..]`
 starts only the page (no camera, no HyperHDR, no service stop needed) and cycles demo patches —
-WHITE with the Phase 0 nudge UI, then R/G/B/gray/white/black. Open it fullscreen on the TV PC to
+WHITE with the white-phase nudge UI, then R/G/B/gray/white/black. Open it fullscreen on the TV PC to
 check the patch size/position, colors, the nudge buttons (they move the numbers), and the SSE/ack
 connection before committing to a real run.
 
@@ -102,18 +102,16 @@ processing as runtime content. Browser color management is *not* the main risk (
 camera's reading of whatever the TV actually shows, not the commanded value) — the per-input TV
 processing difference is.
 
-### Phase 0 — eye anchor (interactive, ~2 min)
+### White — manual white balance (`--ledcalib white`, interactive, ~2 min)
 
-Web path (needs `--calib-tv-web`): after you tap *begin*, the page shows a **full-screen white**
-field (the anchor overrides the windowed sweep geometry) and the grabber sends a solid white frame
-to HyperHDR, so the LEDs go white. Make the glow match the TV white **either** by tuning
-**HyperHDR's white balance** (recommended if your LEDs are off-white — e.g. bluish) **or** by
-nudging the LED drive with the page's R/G/B ± buttons (or 1/2 3/4 5/6 keys), then tap **Accept** on
-the page (no terminal input). Output: anchor drive value, camera readings of both ROIs, von-Kries
-gains `g_c = tv_c / led_c`. All subsequent camera readings of LED light are multiplied by `g`. (If
-you tune in HyperHDR and leave the drive at full white, the measured anchor captures that —
-equivalent to the sweep-derived white, but as a direct measurement.) The TV sweep then restores the
-windowed patch geometry.
+A **purely manual** aid for setting HyperHDR's white balance; it makes no measurement and writes no
+file. After you tap *begin* (web path, `--calib-tv-web`) — or press Enter on a tty — the page shows a
+**full-screen white** field and the grabber sends a solid white frame to HyperHDR, so the LEDs go
+white. Make the glow match the TV white **either** by tuning **HyperHDR's white balance**
+(recommended if your LEDs are off-white — e.g. bluish) **or** by nudging the LED drive with the
+page's R/G/B ± buttons (or 1/2 3/4 5/6 keys) to preview. Enter/**Accept** just exits. The actual
+white correction is derived later, from the sweep white points ("White from the sweeps" below) — this
+phase only helps you dial in the HyperHDR WB that those sweeps then freeze in. Takes no ROI.
 
 ### Phase 1 — TV sweep (~15 min, unattended)
 
@@ -165,26 +163,27 @@ curve tables, residuals, and gamut percentages — check it before trusting a re
 **The fit consumes `tv_sweep.csv` only for the white point (so far).** The LUT is built from the
 LED sweep + the von-Kries white correction: the runtime LUT input is the camera's reading of the
 TV (`v`), and the fit maps `v` → eye-corrected target glow → drive without needing the TV's full
-transfer. The white correction comes either from `white_anchor.json` (Phase 0) or, when that's
-absent, is **derived from the sweep white points** — `cam_tv_white` (the white TV patch) and
-`cam_led_white` (LED at full drive), see "Skipping the anchor" below. The rest of the TV sweep is
+transfer. The white correction is **derived from the sweep white points** — `cam_tv_white` (the
+white TV patch) and `cam_led_white` (LED at full drive), see "White from the sweeps" below. The rest of the TV sweep is
 still unused, kept for two later uses: (a) gamut/coverage weighting; (b) a richer metameric
 correction than the diagonal white (multiple TV/LED correspondences → a 3×3).
 
 ### White from the sweeps (the standard workflow)
 
 There is **no `all` phase**: run `--ledcalib tv` (cropped+shaded) and `--ledcalib led` (full frame)
-separately into the same `--calib-out`. Neither writes `white_anchor.json`, so `--ledcalib-fit`
-**derives** the von-Kries white from the sweep white points — `cam_tv_white / cam_led_white` at the
+separately into the same `--calib-out`. `--ledcalib-fit` **derives** the von-Kries white from the
+sweep white points — `cam_tv_white / cam_led_white` at the
 **brightest neutral level where neither side clips the camera** (`--calib-clip-level`, default 250;
 the camera maxes below 255 and the TV or LEDs may be the brighter side, so true-255 white often
 saturates → a dimmer clean neutral is used, with the LED side interpolated to that level). The eye-truth comes from
 **HyperHDR's white balance** (set it to match the LED white to the TV white before measuring —
-e.g. to pull down bluish LEDs). Identical result to a Phase-0 eye anchor, and the TV and LED can't
+e.g. to pull down bluish LEDs). The TV and LED can't
 share a frame anyway (cropped TV vs full-frame wall). **Timing rule:** HyperHDR WB (and all HyperHDR
 colour settings) are frozen into the LED sweep, so set white *before* measuring; a big WB change
-*after* invalidates the LUT (re-measure). (`--ledcalib white` still exists as an explicit nudge
-anchor for the no-crop/full-frame case, writing `white_anchor.json`.)
+*after* invalidates the LUT (re-measure). `--ledcalib white` is a **purely manual** aid for setting
+that HyperHDR white balance: it drives the LEDs full white and sends a white frame to HyperHDR so you
+can eye-match in HyperHDR's settings. It takes no ROI, measures nothing, and writes no file — the
+white correction always comes from the sweeps, never from this phase.
 
 ## Gamma ramp probe (`--ledcalib gamma`, implemented 2026-06-15)
 
@@ -257,7 +256,6 @@ space.
 ## Outputs (`--calib-out` dir, default `ledcalib-out/`)
 
 - `meta.json` — config echo, camera settings, timestamps
-- `white_anchor.json` — drive RGB, both ROI stats, von-Kries gains
 - `tv_sweep.csv` — `index, commanded patch RGB, TV-ROI stats, LED-ROI stats, frames`
 - `led_sweep.csv` — `drive RGB, led-ROI stats, tv-ROI mean (sanity), frames`
 - `baseline.json` — LEDs-off / TV-black readings
