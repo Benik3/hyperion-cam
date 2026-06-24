@@ -168,24 +168,14 @@ namespace
 		}
 	}
 
-	// 3D-LUT GLSL chunk (test mode, see HYPERCAM_LUT_TEST). Full-range BT.601
-	// YUV<->RGB conversion must be LIMITED-range BT.601: the ISP emits
-	// SMPTE170M NV12, and the calibration measures in the ISP's RGB-capture
-	// space. Limited-range here puts the shader's LUT input domain on that
-	// same full-range RGB scale; a full-range matrix would compress LUT
-	// inputs by ~14% vs the calibrated domain.
+	// 3D-LUT GLSL chunk: the uLut sampler + applyLut(). yuv2rgb is NOT defined
+	// here - it lives once in the shared yuvGlsl string (below), included by
+	// buildColor for both the LUT and shading-only paths. Used for both a real
+	// --lut and the HYPERCAM_LUT_TEST identity LUT.
 	static std::string lutGlslChunk(bool trilinear, int n)
 	{
 		std::string s = "uniform highp sampler3D uLut;\n";
 		s += "const float LUTN = " + std::to_string(n) + ".0;\n";
-		s += R"(
-vec3 yuv2rgb(float y, vec2 c){
-  float yl = (y - 16.0/255.0) * (255.0/219.0);
-  float u = (c.x - 128.0/255.0) * (255.0/224.0);
-  float v = (c.y - 128.0/255.0) * (255.0/224.0);
-  return clamp(vec3(yl + 1.402*v, yl - 0.344136*u - 0.714136*v, yl + 1.772*u), 0.0, 1.0);
-}
-)";
 		if (trilinear)
 		{
 			s += R"(
@@ -704,6 +694,13 @@ out vec4 outColor;
 		// trip, optionally x shading gain (2D map by output pos) then 3D LUT.
 		// Composes both; either may be absent. Sampled per lane (gain once per
 		// fragment, smooth). uTex=0, other plane=1, uLut=2, uShade=3.
+		//
+		// yuv2rgb is the SINGLE definition for both the LUT and shading-only
+		// paths. It must be LIMITED-range BT.601: the ISP emits SMPTE170M NV12
+		// and the calibration measures in the ISP's RGB-capture space, so a
+		// full-range matrix would compress the LUT input domain by ~14% vs the
+		// calibrated scale. The [0,1] clamp is applied once in colorOf (after the
+		// shading gain, before the LUT), not inside yuv2rgb.
 		const std::string yuvGlsl = R"(
 vec3 yuv2rgb(float y, vec2 c){
   float yl=(y-16.0/255.0)*(255.0/219.0);
@@ -719,10 +716,9 @@ vec3 yuv2rgb(float y, vec2 c){
 			s += isY ? "uniform sampler2D uTexC;\n" : "uniform sampler2D uTexY2;\n";
 			if (shadeEnabled)
 				s += "uniform sampler2D uShade;\nuniform vec2 uFboSize;\n";
+			s += yuvGlsl; // single yuv2rgb (unclamped; colorOf does the clamp)
 			if (lutEnabled)
-				s += lutGlslChunk(lutTrilinear, lutN); // uLut + yuv2rgb + applyLut
-			else
-				s += yuvGlsl;
+				s += lutGlslChunk(lutTrilinear, lutN); // adds uLut + applyLut
 			s += isY ? "float colorOf(vec2 t, vec3 g){\n" : "vec2 colorOf(vec2 t, vec3 g){\n";
 			s += std::string("  vec3 rgb = yuv2rgb(texture(") + primary + ", t).r, texture(" + other + ", t).rg);\n";
 			if (shadeEnabled)
