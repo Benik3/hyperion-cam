@@ -506,7 +506,7 @@ namespace
 			sx += x; sy += y; sxx += x * x; sxy += x * y; n++;
 		}
 		double gamma = 1.0; // fallback: linear in drive (LED ~ linear hypothesis)
-		if (n >= 2)
+		if (n >= 3) // need >=3 points (matches the loop guard); 2 noisy samples -> fall back to linear
 		{
 			const double denom = n * sxx - sx * sx;
 			if (std::fabs(denom) > 1e-9)
@@ -1053,7 +1053,6 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 		return EXIT_FAILURE;
 	// White anchor now comes from the sweeps (deriveAnchorFromSweeps), exactly as
 	// production does without white_anchor.json.
-	const cv::Vec3d gains = data.gains;
 	const cv::Vec3d anchorTv = data.anchorTv;
 	const cv::Vec3d anchorDrive{data.anchorDrive[0], data.anchorDrive[1], data.anchorDrive[2]};
 	FitResult res;
@@ -1067,8 +1066,8 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 			  << " resid median=" << res.model.residMedian << " p95=" << res.model.residP95
 			  << " gamut desat=" << res.pctDesat << "% clip=" << res.pctClip << "%" << std::endl;
 
-	// Closed loop: target v -> LUT -> drive -> truth chain -> anchor-corrected
-	// encoded reading; must reproduce v on in-gamut points.
+	// Closed loop: target v -> LUT -> drive -> truth chain -> production white
+	// correction (corr, linear space) -> encoded; must reproduce v in-gamut.
 	std::uniform_real_distribution<double> uni(0.0, 255.0);
 	std::vector<double> errs;
 	int tested = 0, skipped = 0;
@@ -1082,8 +1081,18 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 		}
 		const cv::Vec3d drive = sampleLutTrilinear(res, v);
 		const cv::Vec3d enc = truth.reading(drive);
+		// Apply EXACTLY what production bakes into the LUT: linearize the camera
+		// reading with the model's p and scale by the linear-space white
+		// correction corr (invertNode solves corr*(A*e+baseline)=lin(v)), then
+		// re-encode to compare against the encoded target v. The old check used
+		// the encoded-space gains, which only equals corr when the fit is exact.
+		const cv::Vec3d encLin = linv3(enc, res.model.p);
 		for (int c = 0; c < 3; c++)
-			errs.push_back(std::fabs(gains[c] * enc[c] - v[c]));
+		{
+			const double corrected = res.model.corr[c] * encLin[c];
+			const double correctedEnc = 255.0 * std::pow(std::clamp(corrected, 0.0, 1.0), 1.0 / res.model.p);
+			errs.push_back(std::fabs(correctedEnc - v[c]));
+		}
 		tested++;
 	}
 	if (tested < 100)
