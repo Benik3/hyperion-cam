@@ -797,6 +797,7 @@ void LedCalib::runGamma(const RoiSample &meas, int64_t nowMs)
 			finishAll(EXIT_FAILURE);
 			return;
 		}
+		reportGammaLimits();
 		writeGammaCsv();
 		finishAll(EXIT_SUCCESS);
 		return;
@@ -824,6 +825,70 @@ void LedCalib::writeGammaCsv()
 		f << "," << r.frames << "\n";
 	}
 	std::cout << "Wrote " << path << " (" << _gammaRecords.size() << " patches)" << std::endl;
+}
+
+void LedCalib::reportGammaLimits()
+{
+	// Pre-flight: from the just-measured R/G/B/gray ramps, flag per channel where
+	// the camera clips (pins near full scale) or crushes (sits in the dark floor),
+	// so a bad exposure / TV-brightness is caught HERE, before the long sweep.
+	const char *names[4] = {"R", "G", "B", "gray"};
+	const double full = _cfg.gammaRaw ? 1023.0 : 255.0;
+	const double ceilNear = 0.96 * full; // a reading this high is almost certainly sensor clip
+	bool anyWarn = false;
+	for (int chan = 0; chan < 4; chan++)
+	{
+		std::vector<const GammaRecord *> rs;
+		for (const auto &r : _gammaRecords)
+			if (r.chan == chan)
+				rs.push_back(&r);
+		if (rs.size() < 3)
+			continue;
+		std::sort(rs.begin(), rs.end(),
+				  [](const GammaRecord *a, const GammaRecord *b) { return a->level < b->level; });
+		const int cLo = (chan < 3) ? chan : 0; // single-channel ramp probes its own channel; gray probes all
+		const int cHi = (chan < 3) ? chan : 2;
+		for (int c = cLo; c <= cHi; c++)
+		{
+			const double lo = rs.front()->mean[c];
+			double mx = 0.0;
+			for (const auto *r : rs)
+				mx = std::max(mx, r->mean[c]);
+			const double noise = std::max(2.0 / 255.0 * full, 3.0 * rs.back()->tstd[c]);
+			int crushLvl = rs.front()->level; // first command whose reading lifts clear of the floor
+			for (const auto *r : rs)
+				if (r->level > 0 && r->mean[c] > lo + noise)
+				{
+					crushLvl = r->level;
+					break;
+				}
+			const bool clipping = mx >= ceilNear;
+			int clipLvl = rs.back()->level; // highest command still below the saturated plateau
+			if (clipping)
+			{
+				clipLvl = rs.front()->level;
+				for (const auto *r : rs)
+					if (r->mean[c] < mx - noise)
+						clipLvl = r->level;
+			}
+			const bool crushBad = crushLvl > std::max(8, rs.front()->level + 1);
+			if (clipping || crushBad)
+			{
+				anyWarn = true;
+				std::cout << "WARNING: gamma " << names[chan] << " (camera " << "rgb"[c]
+						  << ") responds only over command [" << crushLvl << ".." << clipLvl
+						  << "] (reads " << lo << ".." << mx << ")";
+				if (clipping)
+					std::cout << "; CLIPS above " << clipLvl << " - lower exposure/brightness";
+				if (crushBad)
+					std::cout << "; CRUSHES below " << crushLvl;
+				std::cout << std::endl;
+			}
+		}
+	}
+	if (!anyWarn)
+		std::cout << "Gamma limits: all channels respond across the full command range (no clip/crush)."
+				  << std::endl;
 }
 
 // RAW10 CSI2P Bayer-plane ROI averaging. fourcc selects the 2x2 phase.

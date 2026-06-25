@@ -174,6 +174,7 @@ private:
 	void showGammaPatch(int64_t nowMs);
 	void runGamma(const RoiSample &meas, int64_t nowMs);
 	void writeGammaCsv();
+	void reportGammaLimits(); // pre-flight: warn on per-channel camera clip/crush in the ramps
 
 	// Shading (ALSC) calibration.
 	void runShading(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb, int64_t nowMs);
