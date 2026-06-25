@@ -100,6 +100,9 @@ namespace
 		double additivityResid = 0.0;
 		double residMedian = 0.0;
 		double residP95 = 0.0;
+		cv::Vec3d clipCeil{0, 0, 0};      // per-channel sensor-clip ceiling (0 = none)
+		int clipExcluded[3] = {0, 0, 0};  // samples dropped as sensor-clipped, per channel
+		cv::Vec3d sweepFloor{0, 0, 0};    // per-channel dark-floor reading (drive 0)
 	};
 
 	enum NodeFlag : uint8_t
@@ -520,6 +523,45 @@ namespace
 		return {sStar, gamma};
 	}
 
+	// Detect per-channel SENSOR clipping in the LED sweep. A channel whose reading
+	// pins near the camera's full-scale ceiling across several samples is saturated:
+	// the true light is brighter than measured, so those readings must not bias the
+	// curve fit or the e(255)=1 normalization. A plateau well BELOW full scale is the
+	// LED's real maximum (e.g. a WB-attenuated green) and is kept. Sets ceilOut[c] (a
+	// reading >= this is clipped; 0 == no clip) and marks the clipped samples.
+	// Verified on real-rig data (R/B pin ~251/254, G maxes ~200 and is kept).
+	void detectClipCeilings(const std::vector<SweepSample> &samples, cv::Vec3d &ceilOut,
+							std::vector<char> &clipped)
+	{
+		ceilOut = cv::Vec3d{0, 0, 0};
+		clipped.assign(samples.size(), 0);
+		double maxR[3] = {0, 0, 0};
+		for (const auto &s : samples)
+			for (int c = 0; c < 3; c++)
+				maxR[c] = std::max(maxR[c], s.led[c]);
+		const double globalMax = std::max({maxR[0], maxR[1], maxR[2]});
+		if (globalMax < 245.0)
+			return; // nothing reached the sensor ceiling -> no clipping anywhere
+		constexpr double kGap = 12.0; // a channel maxing this far below full scale is at its real max
+		constexpr double kEps = 2.0;  // a reading within this of the ceiling counts as pinned
+		constexpr int kPlateauMin = 5;
+		for (int c = 0; c < 3; c++)
+		{
+			if (maxR[c] < globalMax - kGap)
+				continue; // real max well below full scale (e.g. WB-attenuated channel)
+			int nearMax = 0;
+			for (const auto &s : samples)
+				if (s.led[c] >= maxR[c] - kEps)
+					nearMax++;
+			if (nearMax >= kPlateauMin)
+				ceilOut[c] = maxR[c] - kEps;
+		}
+		for (std::size_t i = 0; i < samples.size(); i++)
+			for (int c = 0; c < 3; c++)
+				if (ceilOut[c] > 0 && samples[i].led[c] >= ceilOut[c])
+					clipped[i] = 1;
+	}
+
 	bool fitModel(const CalibData &d, FitModel &m, bool verbose, double curveFloor)
 	{
 		m.p = estimateExponent(d, m.additivityResid);
@@ -529,6 +571,26 @@ namespace
 		for (std::size_t i = 0; i < d.samples.size(); i++)
 			Y[i] = linv3(d.samples[i].led, m.p) - m.baselineLin;
 
+		// Sensor-clip detection: a channel saturating the camera at high drive reads
+		// lower than the true light, biasing the curve top and the e(255)=1
+		// normalization. Drop those samples from the fit; the curve then holds flat
+		// above the last responsive drive (conservative). Per channel, since WB makes
+		// R/G/B saturate at different encoded values.
+		std::vector<char> clipped;
+		detectClipCeilings(d.samples, m.clipCeil, clipped);
+		m.sweepFloor = d.baselineLed;
+		for (std::size_t i = 0; i < d.samples.size(); i++)
+			if (clipped[i])
+				for (int c = 0; c < 3; c++)
+					if (m.clipCeil[c] > 0 && d.samples[i].led[c] >= m.clipCeil[c])
+						m.clipExcluded[c]++;
+		for (int c = 0; c < 3; c++)
+			if (m.clipCeil[c] > 0)
+				std::cout << "WARNING: LED channel " << "rgb"[c] << " saturates the camera (reading >= "
+						  << m.clipCeil[c] << ") in " << m.clipExcluded[c] << " sweep samples; excluded from "
+						  << "the fit (curve holds flat above the last responsive drive). Lower exposure or "
+						  << "LED brightness on this channel to calibrate its full range." << std::endl;
+
 		// Initial A: columns from the strongest single-channel samples.
 		cv::Matx33d A = cv::Matx33d::zeros();
 		for (int c = 0; c < 3; c++)
@@ -537,6 +599,8 @@ namespace
 			cv::Vec3d bestY{0, 0, 0};
 			for (std::size_t i = 0; i < d.samples.size(); i++)
 			{
+				if (clipped[i])
+					continue;
 				const auto &s = d.samples[i];
 				const int onOther = (s.drive[(c + 1) % 3] > 0) + (s.drive[(c + 2) % 3] > 0);
 				if (onOther == 0 && s.drive[c] > bestLvl)
@@ -584,6 +648,8 @@ namespace
 				std::vector<int> cnt(m.e[c].level.size(), 0);
 				for (std::size_t i = 0; i < d.samples.size(); i++)
 				{
+					if (clipped[i])
+						continue;
 					const cv::Vec3d z = Ainv * Y[i];
 					const auto &lv = m.e[c].level;
 					const auto it = std::lower_bound(lv.begin(), lv.end(), d.samples[i].drive[c]);
@@ -605,6 +671,8 @@ namespace
 			cv::Matx33d YE = cv::Matx33d::zeros(), EE = cv::Matx33d::zeros();
 			for (std::size_t i = 0; i < d.samples.size(); i++)
 			{
+				if (clipped[i])
+					continue;
 				cv::Vec3d e;
 				for (int c = 0; c < 3; c++)
 					e[c] = m.e[c].eval(d.samples[i].drive[c]);
@@ -660,6 +728,8 @@ namespace
 		std::vector<double> rel;
 		for (std::size_t i = 0; i < d.samples.size(); i++)
 		{
+			if (clipped[i])
+				continue;
 			cv::Vec3d e;
 			for (int c = 0; c < 3; c++)
 				e[c] = m.e[c].eval(d.samples[i].drive[c]);
@@ -814,6 +884,8 @@ namespace
 		f << "# fit: p=" << res.model.p << " relResidMedian=" << res.model.residMedian
 		  << " relResidP95=" << res.model.residP95 << "\n";
 		f << "# gamut: desaturated=" << res.pctDesat << "% lumClipped=" << res.pctClip << "%\n";
+		f << "# sensor-clip ceilings (reading, 0=none): R=" << res.model.clipCeil[0]
+		  << " G=" << res.model.clipCeil[1] << " B=" << res.model.clipCeil[2] << "\n";
 		f << "LUT_3D_SIZE " << res.n << "\n";
 		f << "DOMAIN_MIN 0.0 0.0 0.0\n";
 		f << "DOMAIN_MAX 1.0 1.0 1.0\n";
@@ -849,6 +921,9 @@ namespace
 		}
 		f << "],\n";
 		f << "  \"corr\": [" << m.corr[0] << ", " << m.corr[1] << ", " << m.corr[2] << "],\n";
+		f << "  \"clip_ceiling\": [" << m.clipCeil[0] << ", " << m.clipCeil[1] << ", " << m.clipCeil[2] << "],\n";
+		f << "  \"clip_excluded\": [" << m.clipExcluded[0] << ", " << m.clipExcluded[1] << ", " << m.clipExcluded[2] << "],\n";
+		f << "  \"sweep_floor\": [" << m.sweepFloor[0] << ", " << m.sweepFloor[1] << ", " << m.sweepFloor[2] << "],\n";
 		for (int c = 0; c < 3; c++)
 		{
 			f << "  \"curve_" << "rgb"[c] << "\": {\"level\": [";
@@ -1115,7 +1190,25 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 			  << "err median=" << med << " p95=" << p95 << " max=" << mx
 			  << " (encoded 0-255 units); anchor drive err=" << anchorErr << std::endl;
 
-	const bool pass = (p95 <= 2.0) && (mx <= 6.0) && (anchorErr <= 3.0);
+	// Clip-detection unit check: channels pinned near full scale across many
+	// samples are flagged; one maxing well below (WB-attenuated) is kept.
+	bool clipOk;
+	{
+		std::vector<SweepSample> cs(40);
+		for (int i = 0; i < 40; i++)
+		{
+			cs[i].drive[0] = cs[i].drive[1] = cs[i].drive[2] = i * 255.0 / 39;
+			cs[i].led = cv::Vec3d(std::min(250.0, i * 8.5), std::min(200.0, i * 6.0), std::min(254.0, i * 9.0));
+		}
+		cv::Vec3d ceil;
+		std::vector<char> clp;
+		detectClipCeilings(cs, ceil, clp);
+		clipOk = (ceil[0] > 0 && ceil[2] > 0 && ceil[1] == 0); // R/B clip; G (maxes 200) kept
+		std::cout << "Clip-detect selftest: ceilings R=" << ceil[0] << " G=" << ceil[1]
+				  << " B=" << ceil[2] << " -> " << (clipOk ? "PASS" : "FAIL") << std::endl;
+	}
+
+	const bool pass = (p95 <= 2.0) && (mx <= 6.0) && (anchorErr <= 3.0) && clipOk;
 	std::cout << (pass ? "SELFTEST PASS" : "SELFTEST FAIL") << std::endl;
 	return pass ? EXIT_SUCCESS : EXIT_FAILURE;
 }
