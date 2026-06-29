@@ -2911,6 +2911,7 @@ int main(int argc, char *argv[])
 		("calib-led-roi", po::value<std::string>(&_calibLedRoiStr), "LED calib: ROI on the LED-lit wall, x,y,w,h in raw full-frame coords")																										  //
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
 		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
+		("ledcalib-led-axis-steps", po::value<int>(&_ledCalibCfg.ledAxisSteps)->default_value(24), "LED calib: extra per-channel axis ramp, edge-dense near 0/255 for clip/crush resolution (0=off, else 4-64)")									  //
 		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(20), "LED calib: frames averaged per measurement")																										  //
 		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(700), "LED calib: settle time before each measurement (HyperHDR smoothing + LED response)")									  //
 		("calib-start-delay-ms", po::value<int>(&_ledCalibCfg.startDelayMs)->default_value(5000), "Calib (web): hold the first patch this long after 'begin' so the browser's fullscreen prompt clears (0=off; --ledcalib + web autocalib)")									  //
@@ -3307,6 +3308,11 @@ int main(int argc, char *argv[])
 		if (_ledCalibCfg.ledGrid < 2 || _ledCalibCfg.ledGrid > 16)
 		{
 			std::cout << "ERROR: --ledcalib-led-grid must be 2-16" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (_ledCalibCfg.ledAxisSteps != 0 && (_ledCalibCfg.ledAxisSteps < 4 || _ledCalibCfg.ledAxisSteps > 64))
+		{
+			std::cout << "ERROR: --ledcalib-led-axis-steps must be 0 or 4-64" << std::endl;
 			return EXIT_FAILURE;
 		}
 		if (_ledCalibCfg.tvWeb && (_ledCalibCfg.tvGrid < 2 || _ledCalibCfg.tvGrid > 12))

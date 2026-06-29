@@ -37,6 +37,7 @@ struct LedCalibConfig
 	std::string phase = "tv"; // tv | led | shading | gamma | white
 	int ledGrid = 8;		   // LED sweep cube grid points per axis
 	int ledGrayRamp = 17;	   // extra gray ramp steps in the LED sweep
+	int ledAxisSteps = 24;	   // extra per-channel axis ramp, edge-dense near 0/255 (0 = off)
 	int measureFrames = 20;	   // frames averaged per measurement
 	int settleMs = 700;		   // LED + HyperHDR smoothing settle before measuring
 	// Web only: after the user taps 'begin' (which puts the page fullscreen),

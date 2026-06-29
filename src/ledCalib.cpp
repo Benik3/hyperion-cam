@@ -640,6 +640,18 @@ void LedCalib::buildLedPlan()
 		const uint8_t v = (n > 1) ? edgeLevel(i, n) : 255;
 		_ledPlan.push_back({v, v, v});
 	}
+	// Dedicated fine per-channel axis ramp, edge-clustered near 0 and 255, to
+	// resolve the dark (crush) and bright (clip) transitions better than the
+	// coarse cube edges. Cheap because it is 1D (3*ledAxisSteps), not the cube.
+	const int a = _cfg.ledAxisSteps;
+	if (a >= 2)
+		for (int i = 1; i < a; i++) // skip i=0 (level 0 is the baseline, already covered)
+			for (int c = 0; c < 3; c++)
+			{
+				std::array<uint8_t, 3> d = {0, 0, 0};
+				d[c] = edgeLevel(i, a);
+				_ledPlan.push_back(d);
+			}
 }
 
 void LedCalib::buildTvPlan()
