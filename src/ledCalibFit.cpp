@@ -523,38 +523,38 @@ namespace
 		return {sStar, gamma};
 	}
 
-	// Detect per-channel SENSOR clipping in the LED sweep. A channel whose reading
-	// pins near the camera's full-scale ceiling across several samples is saturated:
-	// the true light is brighter than measured, so those readings must not bias the
-	// curve fit or the e(255)=1 normalization. A plateau well BELOW full scale is the
-	// LED's real maximum (e.g. a WB-attenuated green) and is kept. Sets ceilOut[c] (a
-	// reading >= this is clipped; 0 == no clip) and marks the clipped samples.
-	// Verified on real-rig data (R/B pin ~251/254, G maxes ~200 and is kept).
+	// Detect SENSOR clipping in the LED sweep. The camera's ADC clamps at a single
+	// near-full-scale value (~254 for 8-bit), so a channel is saturated only where
+	// its reading PINS at that one ceiling - its true light is then brighter than
+	// measured, and those samples must not bias the curve fit or the e(255)=1
+	// normalization. A channel that maxes BELOW the ceiling - soft LED compression
+	// (still rising) or a WB-attenuated channel - is NOT clipped and is kept. Keying
+	// off each channel's own max instead would wrongly exclude a soft-compressed
+	// channel. Sets ceilOut[c] (a reading >= this is clipped; 0 == no clip) and marks
+	// the clipped samples. Verified on real-rig data: blue pins at ~254 (clipped),
+	// red maxes ~250 still rising (kept), green maxes ~200 (kept).
 	void detectClipCeilings(const std::vector<SweepSample> &samples, cv::Vec3d &ceilOut,
 							std::vector<char> &clipped)
 	{
 		ceilOut = cv::Vec3d{0, 0, 0};
 		clipped.assign(samples.size(), 0);
-		double maxR[3] = {0, 0, 0};
+		double maxAll = 0.0;
 		for (const auto &s : samples)
 			for (int c = 0; c < 3; c++)
-				maxR[c] = std::max(maxR[c], s.led[c]);
-		const double globalMax = std::max({maxR[0], maxR[1], maxR[2]});
-		if (globalMax < 245.0)
+				maxAll = std::max(maxAll, s.led[c]);
+		if (maxAll < 245.0)
 			return; // nothing reached the sensor ceiling -> no clipping anywhere
-		constexpr double kGap = 12.0; // a channel maxing this far below full scale is at its real max
-		constexpr double kEps = 2.0;  // a reading within this of the ceiling counts as pinned
-		constexpr int kPlateauMin = 5;
+		constexpr double kEps = 2.5;   // readings within this of the ADC ceiling are pinned
+		constexpr int kPlateauMin = 5; // need a cluster at the ceiling, not a lone peak
+		const double ceiling = maxAll - kEps;
 		for (int c = 0; c < 3; c++)
 		{
-			if (maxR[c] < globalMax - kGap)
-				continue; // real max well below full scale (e.g. WB-attenuated channel)
-			int nearMax = 0;
+			int nearCeil = 0;
 			for (const auto &s : samples)
-				if (s.led[c] >= maxR[c] - kEps)
-					nearMax++;
-			if (nearMax >= kPlateauMin)
-				ceilOut[c] = maxR[c] - kEps;
+				if (s.led[c] >= ceiling)
+					nearCeil++;
+			if (nearCeil >= kPlateauMin)
+				ceilOut[c] = ceiling; // this channel pins at the sensor ceiling
 		}
 		for (std::size_t i = 0; i < samples.size(); i++)
 			for (int c = 0; c < 3; c++)
@@ -1198,12 +1198,14 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 		for (int i = 0; i < 40; i++)
 		{
 			cs[i].drive[0] = cs[i].drive[1] = cs[i].drive[2] = i * 255.0 / 39;
-			cs[i].led = cv::Vec3d(std::min(250.0, i * 8.5), std::min(200.0, i * 6.0), std::min(254.0, i * 9.0));
+			// blue pins at the ADC ceiling (clipped); red maxes ~250, still below it
+			// (soft compression -> kept); green maxes ~200 (kept).
+			cs[i].led = cv::Vec3d(std::min(250.0, i * 7.2), std::min(200.0, i * 6.0), std::min(254.0, i * 9.0));
 		}
 		cv::Vec3d ceil;
 		std::vector<char> clp;
 		detectClipCeilings(cs, ceil, clp);
-		clipOk = (ceil[0] > 0 && ceil[2] > 0 && ceil[1] == 0); // R/B clip; G (maxes 200) kept
+		clipOk = (ceil[2] > 0 && ceil[0] == 0 && ceil[1] == 0); // only blue pins at the sensor ceiling
 		std::cout << "Clip-detect selftest: ceilings R=" << ceil[0] << " G=" << ceil[1]
 				  << " B=" << ceil[2] << " -> " << (clipOk ? "PASS" : "FAIL") << std::endl;
 	}
