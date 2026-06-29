@@ -36,7 +36,6 @@ namespace
 	{
 		double drive[3];
 		cv::Vec3d led; // encoded LED-ROI mean
-		cv::Vec3d tv;  // encoded TV-ROI mean (darkness sanity, unused by fit)
 	};
 
 	struct CalibData
@@ -176,15 +175,16 @@ namespace
 			std::string cell;
 			while (std::getline(ss, cell, ','))
 				col.push_back(std::atof(cell.c_str()));
-			// drive(3), led mean(3), led tstd(3), led sstd(3), tv mean(3), frames
-			if (col.size() < 16)
+			// drive(3) + led mean(3) are all the fit uses; led tstd/sstd + frames
+			// follow (diagnostic) and are not read. Tolerant of the old layout that
+			// also had tv mean columns - they are simply ignored.
+			if (col.size() < 6)
 				continue;
 			SweepSample s;
 			s.drive[0] = col[0];
 			s.drive[1] = col[1];
 			s.drive[2] = col[2];
 			s.led = {col[3], col[4], col[5]};
-			s.tv = {col[12], col[13], col[14]};
 			out.push_back(s);
 		}
 		return !out.empty();
@@ -1073,14 +1073,14 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 	{
 		std::ofstream f(dir + "/led_sweep.csv");
 		f << "drive_r,drive_g,drive_b,led_r,led_g,led_b,led_r_tstd,led_g_tstd,led_b_tstd,"
-			 "led_r_sstd,led_g_sstd,led_b_sstd,tv_r,tv_g,tv_b,frames\n";
+			 "led_r_sstd,led_g_sstd,led_b_sstd,frames\n";
 		auto emit = [&](int r, int g, int b)
 		{
 			cv::Vec3d m = truth.reading({static_cast<double>(r), static_cast<double>(g), static_cast<double>(b)});
 			for (int c = 0; c < 3; c++)
 				m[c] = std::clamp(m[c] + noise(rng) / std::sqrt(20.0), 0.0, 255.0);
 			f << r << "," << g << "," << b << "," << m[0] << "," << m[1] << "," << m[2]
-			  << ",0.3,0.3,0.3,1,1,1,2,2,2,20\n";
+			  << ",0.3,0.3,0.3,1,1,1,20\n";
 		};
 		for (int r = 0; r < 8; r++)
 			for (int g = 0; g < 8; g++)

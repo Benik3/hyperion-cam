@@ -1285,7 +1285,7 @@ void LedCalib::writeLedSweep()
 	const std::string path = _cfg.outDir + "/led_sweep.csv";
 	std::ofstream f(path);
 	f << "drive_r,drive_g,drive_b,led_r,led_g,led_b,led_r_tstd,led_g_tstd,led_b_tstd,"
-		 "led_r_sstd,led_g_sstd,led_b_sstd,tv_r,tv_g,tv_b,frames\n";
+		 "led_r_sstd,led_g_sstd,led_b_sstd,frames\n";
 	for (const auto &r : _ledRecords)
 	{
 		f << static_cast<int>(r.drive[0]) << "," << static_cast<int>(r.drive[1]) << ","
@@ -1296,8 +1296,6 @@ void LedCalib::writeLedSweep()
 			f << "," << r.tstd[1][c];
 		for (int c = 0; c < 3; c++)
 			f << "," << r.sstd[1][c];
-		for (int c = 0; c < 3; c++)
-			f << "," << r.mean[0][c];
 		f << "," << r.frames << "\n";
 	}
 	std::cout << "Wrote " << path << " (" << _ledRecords.size() << " drive values)" << std::endl;
