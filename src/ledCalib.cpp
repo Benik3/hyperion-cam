@@ -92,9 +92,6 @@ void LedCalib::Measurement::finish(double mean[2][3], double tstd[2][3], double 
 LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, LedCalibWeb *web)
 	: _cfg(cfg), _sendLed(std::move(sendLed)), _exit(std::move(exitFn)), _web(web)
 {
-	if (_cfg.tvWeb)
-		_cfg.tvPatchCount = _cfg.tvGrid * _cfg.tvGrid * _cfg.tvGrid;
-
 	if (_cfg.phase == "white")
 		_phase = Phase::WhiteWait;
 	else if (_cfg.phase == "tv")
@@ -698,9 +695,9 @@ void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs
 	rec.drive[2] = _tvPlan[_tvPlanPos][2];
 	_meas.finish(rec.mean, rec.tstd, rec.sstd);
 	_tvRecords.push_back(rec);
-	_tvDecoded++;
-	if ((_tvDecoded % 10) == 0 || _tvDecoded == static_cast<int>(_tvPlan.size()) || _cfg.verbose)
-		std::cout << "TV sweep: " << _tvDecoded << "/" << _tvPlan.size() << " patches" << std::endl;
+	const int done = static_cast<int>(_tvRecords.size());
+	if ((done % 10) == 0 || done == static_cast<int>(_tvPlan.size()) || _cfg.verbose)
+		std::cout << "TV sweep: " << done << "/" << _tvPlan.size() << " patches" << std::endl;
 
 	_tvPlanPos++;
 	if (_tvPlanPos >= _tvPlan.size())
@@ -930,9 +927,13 @@ LedCalib::RoiSample LedCalib::sampleRoiBayer(const uint8_t *img, int width, int 
 											 uint32_t fourcc, const LedCalibRoi &roi) const
 {
 	RoiSample out;
-	const int x0 = std::clamp(roi.x, 0, width - 1);
+	// raw10p reads up to byte (x>>2)*5+4; cap x at the last pixel whose 5-byte
+	// group fits the row stride, so a width that is not a multiple of 4 with a
+	// tight (unpadded) stride can't over-read past the row.
+	const int safeW = std::min(width, (strideBytes / 5) * 4);
+	const int x0 = std::clamp(roi.x, 0, std::max(0, safeW - 1));
 	const int y0 = std::clamp(roi.y, 0, height - 1);
-	const int x1 = std::clamp(roi.x + roi.w, x0 + 1, width);
+	const int x1 = std::clamp(roi.x + roi.w, x0 + 1, std::max(x0 + 1, safeW));
 	const int y1 = std::clamp(roi.y + roi.h, y0 + 1, height);
 
 	double sum[3] = {0, 0, 0}, sumSq[3] = {0, 0, 0};
@@ -1000,37 +1001,46 @@ void LedCalib::processRawFrame(const uint8_t *img, int width, int height, int st
 
 bool LedCalib::gammaRawSelftest()
 {
-	// Synthesize a RGGB RAW10 CSI2P frame with known per-plane values, pack it,
-	// then verify sampleRoiBayer recovers the plane means.
+	// Synthesize a RAW10 CSI2P frame with known per-plane values for a given Bayer
+	// layout, pack it, then verify sampleRoiBayer recovers the plane means. Covers
+	// RGGB and the production BGGR ('BG10', this sensor) so an R/B swap in either
+	// mapping is caught.
 	const int w = 64, h = 48;
 	const int stride = (w / 4) * 5; // packed, no extra padding
-	std::vector<uint8_t> buf(static_cast<size_t>(stride) * h, 0);
 	const uint16_t valR = 900, valG = 500, valB = 120; // 10-bit
-	auto colorAt = [](int y, int x)
-	{ return (y & 1) == 0 ? ((x & 1) == 0 ? 0 : 1) : ((x & 1) == 0 ? 1 : 2); };
-	for (int y = 0; y < h; y++)
+	auto run = [&](const char *name, uint32_t fourcc, auto colorAt) -> bool
 	{
-		uint8_t *row = buf.data() + static_cast<size_t>(y) * stride;
-		for (int x = 0; x < w; x++)
+		std::vector<uint8_t> buf(static_cast<size_t>(stride) * h, 0);
+		for (int y = 0; y < h; y++)
 		{
-			const int c = colorAt(y, x);
-			const uint16_t v = (c == 0) ? valR : (c == 1) ? valG : valB;
-			const int grp = (x >> 2) * 5, within = x & 3;
-			row[grp + within] = static_cast<uint8_t>(v >> 2);
-			row[grp + 4] |= static_cast<uint8_t>((v & 0x3) << (within * 2));
+			uint8_t *row = buf.data() + static_cast<size_t>(y) * stride;
+			for (int x = 0; x < w; x++)
+			{
+				const int c = colorAt(y, x);
+				const uint16_t v = (c == 0) ? valR : (c == 1) ? valG : valB;
+				const int grp = (x >> 2) * 5, within = x & 3;
+				row[grp + within] = static_cast<uint8_t>(v >> 2);
+				row[grp + 4] |= static_cast<uint8_t>((v & 0x3) << (within * 2));
+			}
 		}
-	}
-
-	LedCalibConfig cfg;
-	LedCalib probe(cfg, nullptr, nullptr, nullptr);
-	LedCalibRoi roi{4, 4, 40, 32};
-	const RoiSample s = probe.sampleRoiBayer(buf.data(), w, h, stride, 0x30314752 /*'RG10' RGGB*/, roi);
-	const bool ok = std::fabs(s.mean[0] - valR) < 0.5 && std::fabs(s.mean[1] - valG) < 0.5 &&
-					std::fabs(s.mean[2] - valB) < 0.5;
-	std::cout << "gammaRawSelftest: R=" << s.mean[0] << " G=" << s.mean[1] << " B=" << s.mean[2]
-			  << " (expect " << valR << "," << valG << "," << valB << ") -> " << (ok ? "PASS" : "FAIL")
-			  << std::endl;
-	return ok;
+		LedCalibConfig cfg;
+		LedCalib probe(cfg, nullptr, nullptr, nullptr);
+		LedCalibRoi roi{4, 4, 40, 32};
+		const RoiSample s = probe.sampleRoiBayer(buf.data(), w, h, stride, fourcc, roi);
+		const bool ok = std::fabs(s.mean[0] - valR) < 0.5 && std::fabs(s.mean[1] - valG) < 0.5 &&
+						std::fabs(s.mean[2] - valB) < 0.5;
+		std::cout << "gammaRawSelftest " << name << ": R=" << s.mean[0] << " G=" << s.mean[1]
+				  << " B=" << s.mean[2] << " (expect " << valR << "," << valG << "," << valB << ") -> "
+				  << (ok ? "PASS" : "FAIL") << std::endl;
+		return ok;
+	};
+	// RGGB: row0 = R G, row1 = G B
+	const bool okRggb = run("RGGB", 0x30314752, [](int y, int x)
+							{ return (y & 1) == 0 ? ((x & 1) == 0 ? 0 : 1) : ((x & 1) == 0 ? 1 : 2); });
+	// BGGR ('BG10', this sensor): row0 = B G, row1 = G R
+	const bool okBggr = run("BGGR", 0x30314742, [](int y, int x)
+							{ return (y & 1) == 0 ? ((x & 1) == 0 ? 2 : 1) : ((x & 1) == 0 ? 1 : 0); });
+	return okRggb && okBggr;
 }
 
 // ---- Shading (ALSC) calibration ----
@@ -1248,8 +1258,8 @@ void LedCalib::writeTvSweep()
 {
 	const std::string path = _cfg.outDir + "/tv_sweep.csv";
 	std::ofstream f(path);
-	f << "index,patch_r,patch_g,patch_b,tv_r,tv_g,tv_b,tv_r_tstd,tv_g_tstd,tv_b_tstd,tv_r_sstd,tv_g_sstd,tv_b_sstd,"
-		 "led_r,led_g,led_b,led_r_tstd,led_g_tstd,led_b_tstd,led_r_sstd,led_g_sstd,led_b_sstd,frames\n";
+	f << "index,patch_r,patch_g,patch_b,tv_r,tv_g,tv_b,tv_r_tstd,tv_g_tstd,tv_b_tstd,"
+		 "tv_r_sstd,tv_g_sstd,tv_b_sstd,frames\n";
 	std::vector<SweepRecord> sorted = _tvRecords;
 	std::sort(sorted.begin(), sorted.end(), [](const SweepRecord &a, const SweepRecord &b)
 			  { return a.idx < b.idx; });
@@ -1257,15 +1267,14 @@ void LedCalib::writeTvSweep()
 	{
 		f << r.idx << "," << static_cast<int>(r.drive[0]) << "," << static_cast<int>(r.drive[1])
 		  << "," << static_cast<int>(r.drive[2]);
-		for (int roi = 0; roi < 2; roi++)
-		{
-			for (int c = 0; c < 3; c++)
-				f << "," << r.mean[roi][c];
-			for (int c = 0; c < 3; c++)
-				f << "," << r.tstd[roi][c];
-			for (int c = 0; c < 3; c++)
-				f << "," << r.sstd[roi][c];
-		}
+		// Only the TV ROI (roi 0) is measured in the TV sweep; the LED columns
+		// were always zero, so they are not written.
+		for (int c = 0; c < 3; c++)
+			f << "," << r.mean[0][c];
+		for (int c = 0; c < 3; c++)
+			f << "," << r.tstd[0][c];
+		for (int c = 0; c < 3; c++)
+			f << "," << r.sstd[0][c];
 		f << "," << r.frames << "\n";
 	}
 	std::cout << "Wrote " << path << " (" << sorted.size() << " patches)" << std::endl;
@@ -1319,8 +1328,8 @@ void LedCalib::writeMeta()
 	f << "  \"led_roi\": [" << _cfg.ledRoi.x << ", " << _cfg.ledRoi.y << ", " << _cfg.ledRoi.w << ", " << _cfg.ledRoi.h << "],\n";
 	f << "  \"led_grid\": " << _cfg.ledGrid << ",\n";
 	f << "  \"led_gray_ramp\": " << _cfg.ledGrayRamp << ",\n";
-	f << "  \"tv_patch_count\": " << _cfg.tvPatchCount << ",\n";
-	f << "  \"tv_patches_measured\": " << _tvDecoded << ",\n";
+	f << "  \"tv_patch_count\": " << (_cfg.tvGrid * _cfg.tvGrid * _cfg.tvGrid) << ",\n";
+	f << "  \"tv_patches_measured\": " << _tvRecords.size() << ",\n";
 	f << "  \"measure_frames\": " << _cfg.measureFrames << ",\n";
 	f << "  \"settle_ms\": " << _cfg.settleMs << ",\n";
 	f << "  \"timestamp\": " << static_cast<long long>(::time(nullptr)) << "\n";

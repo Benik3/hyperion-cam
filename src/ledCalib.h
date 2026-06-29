@@ -37,7 +37,6 @@ struct LedCalibConfig
 	std::string phase = "tv"; // tv | led | shading | gamma | white
 	int ledGrid = 8;		   // LED sweep cube grid points per axis
 	int ledGrayRamp = 17;	   // extra gray ramp steps in the LED sweep
-	int tvPatchCount = 216;	   // patches in the TV sweep (set to tvGrid^3)
 	int measureFrames = 20;	   // frames averaged per measurement
 	int settleMs = 700;		   // LED + HyperHDR smoothing settle before measuring
 	// Web only: after the user taps 'begin' (which puts the page fullscreen),
@@ -229,7 +228,6 @@ private:
 
 	// TV sweep
 	std::vector<SweepRecord> _tvRecords;
-	int _tvDecoded = 0;
 	std::vector<std::array<uint8_t, 3>> _tvPlan;
 	size_t _tvPlanPos = 0;
 	uint32_t _tvSeq = 0;		   // seq of the currently shown patch
