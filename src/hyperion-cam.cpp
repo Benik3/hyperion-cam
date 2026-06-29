@@ -708,6 +708,23 @@ static bool _ledCalibGammaSelftest = false;
 static bool _ledCalibWebDryrun = false;
 static LedCalibFitConfig _ledCalibFitCfg;
 
+// Allocate _ledCalibWeb, set its patch geometry, optionally hide the corner
+// keep-alive/status UI, and start it. Returns false (error printed) if the
+// server won't bind. (The web-dryrun uses its own stack-local server below.)
+static bool startCalibWeb(double pct, bool cleanField, const char *ctx)
+{
+	_ledCalibWeb = new LedCalibWeb(_ledCalibWebPort);
+	_ledCalibWeb->setPatchGeometry(pct, _patchX, _patchY);
+	if (cleanField)
+		_ledCalibWeb->setCleanField(true);
+	if (!_ledCalibWeb->start())
+	{
+		std::cout << "ERROR: " << ctx << " could not start the TV web server" << std::endl;
+		return false;
+	}
+	return true;
+}
+
 // Camera-free dry run of the TV web page (--ledcalib-web-dryrun): start the
 // server and cycle demo patches so the page can be checked on the TV PC
 // (fullscreen, colors, Phase 0 nudge UI, ack/SSE) before a real run.
@@ -3191,16 +3208,10 @@ int main(int argc, char *argv[])
 			}
 			// Default patch full-screen (edge-strip ROI); --patch-size to window it.
 			const double pct = (!vm["patch-size"].defaulted()) ? _patchSize : 100.0;
-			_ledCalibWeb = new LedCalibWeb(_ledCalibWebPort);
-			_ledCalibWeb->setPatchGeometry(pct, _patchX, _patchY);
 			// Hide the corner keep-alive + status: the edge-strip ROI samples the
 			// corners where they sit.
-			_ledCalibWeb->setCleanField(true);
-			if (!_ledCalibWeb->start())
-			{
-				std::cout << "ERROR: autocalib could not start the TV web server" << std::endl;
+			if (!startCalibWeb(pct, /*cleanField=*/true, "autocalib"))
 				return EXIT_FAILURE;
-			}
 			std::cout << "INFO: web-driven autocalib on port " << _ledCalibWebPort
 					  << " (open http://<this-pi>:" << _ledCalibWebPort << "/ fullscreen on the TV PC, tap begin); patch "
 					  << pct << "%" << (_autoCalibRoiEn ? ", custom ROI" : ", edge-strip ROI") << std::endl;
@@ -3400,13 +3411,8 @@ int main(int argc, char *argv[])
 				std::cout << "ERROR: --patch-size must be in (0, 100]" << std::endl;
 				return EXIT_FAILURE;
 			}
-			_ledCalibWeb = new LedCalibWeb(_ledCalibWebPort);
-			_ledCalibWeb->setPatchGeometry(_patchSize, _patchX, _patchY);
-			if (!_ledCalibWeb->start())
-			{
-				std::cout << "ERROR: --ledcalib could not start the TV web server" << std::endl;
+			if (!startCalibWeb(_patchSize, /*cleanField=*/false, "--ledcalib"))
 				return EXIT_FAILURE;
-			}
 			std::cout << "INFO: --ledcalib TV web page on port " << _ledCalibWebPort
 					  << " (open http://<this-pi>:" << _ledCalibWebPort << "/ fullscreen on the TV PC); patch "
 					  << _patchSize << "% " << (_patchX < 0 && _patchY < 0 ? "centered" : "positioned") << std::endl;

@@ -255,7 +255,7 @@ struct LedCalibWeb::Impl
 		std::lock_guard<std::mutex> lk(sm);
 		char buf[256];
 		std::snprintf(buf, sizeof(buf),
-					  "data: {\"r\":%u,\"g\":%u,\"b\":%u,\"seq\":%u,\"controls\":%s,\"lr\":%u,\"lg\":%u,\"lb\":%u,"
+					  "data: {\"r\":%d,\"g\":%d,\"b\":%d,\"seq\":%u,\"controls\":%s,\"lr\":%d,\"lg\":%d,\"lb\":%d,"
 					  "\"wp\":%.3f,\"wx\":%.3f,\"wy\":%.3f,\"clean\":%s}\n\n",
 					  color[0], color[1], color[2], seq, controls ? "true" : "false",
 					  led[0], led[1], led[2], wp, wx, wy, clean ? "true" : "false");
