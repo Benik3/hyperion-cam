@@ -11,7 +11,10 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
 endif()
 
-set(CMAKE_CXX_FLAGS "-Wall -Winvalid-pch -Wnon-virtual-dtor -Wextra -Werror -Wno-unused-parameter")
+# -Wno-psabi silences GCC's informational ARM ABI note about the C++14→C++17
+# change in how small aggregates (e.g. std::pair<double,double>) are passed/
+# returned; the whole binary uses one compiler/std, so there is no real mismatch.
+set(CMAKE_CXX_FLAGS "-Wall -Winvalid-pch -Wnon-virtual-dtor -Wextra -Werror -Wno-unused-parameter -Wno-psabi")
 set(CMAKE_CXX_FLAGS_RELEASE "-Ofast -fno-fast-math")
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
