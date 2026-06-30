@@ -2912,7 +2912,7 @@ int main(int argc, char *argv[])
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
 		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
 		("ledcalib-led-axis-steps", po::value<int>(&_ledCalibCfg.ledAxisSteps)->default_value(24), "LED calib: extra per-channel axis ramp, edge-dense near 0/255 for clip/crush resolution (0=off, else 4-64)")									  //
-		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(20), "LED calib: frames averaged per measurement")																										  //
+		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(10), "LED calib: frames averaged per measurement")																										  //
 		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(100), "LED calib: settle before each measurement (exposure locked + HyperHDR LED smoothing must be OFF, so this only covers panel/LED + pipeline; web patches also wait >=3 fresh frames)")									  //
 		("calib-start-delay-ms", po::value<int>(&_ledCalibCfg.startDelayMs)->default_value(5000), "Calib (web): hold the first patch this long after 'begin' so the browser's fullscreen prompt clears (0=off; --ledcalib + web autocalib)")									  //
 		("calib-tv-web", po::bool_switch(&_ledCalibCfg.tvWeb)->default_value(false), "LED calib: drive TV patches via a browser page on a PC on the TV's HDMI (required for tv/gamma/shading)")								  //

@@ -38,7 +38,7 @@ struct LedCalibConfig
 	int ledGrid = 8;		   // LED sweep cube grid points per axis
 	int ledGrayRamp = 17;	   // extra gray ramp steps in the LED sweep
 	int ledAxisSteps = 24;	   // extra per-channel axis ramp, edge-dense near 0/255 (0 = off)
-	int measureFrames = 20;	   // frames averaged per measurement
+	int measureFrames = 10;	   // frames averaged per measurement
 	// Settle before each measurement. Short because nothing slow has to converge:
 	// exposure/gain/AWB are locked, and HyperHDR LED smoothing must be DISABLED
 	// for calibration (see doc/calibration-guide.md) so the LEDs jump instantly —
