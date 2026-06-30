@@ -3338,6 +3338,11 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: --ledcalib is interactive and needs a terminal on stdin" << std::endl;
 			return EXIT_FAILURE;
 		}
+		// All checks passed and the run will start: create --calib-out now (white
+		// writes no files) so a bad/unwritable path fails here, not after a
+		// multi-minute sweep.
+		if ((gammaMode || shadingMode || tvMode || ledMode) && !LedCalib::ensureDir(_ledCalibCfg.outDir))
+			return EXIT_FAILURE;
 		_ledCalibCfg.phase = _ledCalibPhase;
 		_ledCalibCfg.verbose = _verbose;
 		// Raw ROI scaling reference = the resolution the ROI was picked at.

@@ -108,6 +108,11 @@ public:
 	/// frame. Returns true on PASS. Static so it needs no camera/web.
 	static bool gammaRawSelftest();
 
+	/// Create the output directory (recursively) if missing. Returns false and
+	/// prints an error on failure. Static so the CLI can fail-fast at startup,
+	/// before the long sweep, rather than only when the first file is written.
+	static bool ensureDir(const std::string &dir);
+
 private:
 	enum class Phase
 	{

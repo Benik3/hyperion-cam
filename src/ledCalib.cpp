@@ -1270,17 +1270,19 @@ void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
 	_settleUntilMs = nowMs + _cfg.settleMs;
 }
 
-bool LedCalib::ensureOutDir()
+bool LedCalib::ensureDir(const std::string &dir)
 {
 	std::error_code ec;
-	std::filesystem::create_directories(_cfg.outDir, ec);
+	std::filesystem::create_directories(dir, ec);
 	if (ec)
 	{
-		std::cout << "ERROR: cannot create output dir '" << _cfg.outDir << "': " << ec.message() << std::endl;
+		std::cout << "ERROR: cannot create output dir '" << dir << "': " << ec.message() << std::endl;
 		return false;
 	}
 	return true;
 }
+
+bool LedCalib::ensureOutDir() { return ensureDir(_cfg.outDir); }
 
 void LedCalib::writeTvSweep()
 {
