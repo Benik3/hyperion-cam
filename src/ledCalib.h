@@ -53,6 +53,9 @@ struct LedCalibConfig
 	// TV-patch display is web-only.
 	bool tvWeb = false; // drive the TV via the browser page
 	int tvGrid = 6;		// TV patch cube grid points per axis
+	// Manual white-balance phase ("white"): the level driven to BOTH the full-
+	// screen TV reference and the LEDs (then nudgeable). 255 = full white.
+	int whiteLevel = 255;
 	// Configured window-patch geometry for the measurement sweeps. The Phase 0
 	// white field overrides this to fullscreen; the sweeps restore it.
 	double patchPct = 10.0;

@@ -45,8 +45,10 @@ only role.
 Set white in **HyperHDR's white balance** so the LED glow matches the TV white by eye (this is
 where you fix bluish LEDs). It freezes into the LED sweep, so set it **before** measuring; the fit
 derives the white correction from the sweeps. `--ledcalib white` is an optional aid for this step —
-it drives the LEDs full white and sends a white frame to HyperHDR so you can eye-match in HyperHDR's
-white-balance settings; it takes no ROI, measures nothing, and writes no file (Enter/Accept exits).
+it drives the LEDs white (and shows a matching full-screen white reference on the TV) so you can
+eye-match in HyperHDR's white-balance settings; `--ledcalib-white-level N` (1-255, default 255) dims
+both the TV reference and the LEDs together (e.g. 127). It takes no ROI, measures nothing, and writes
+no file (Enter/Accept exits).
 
 ### 0b. ROIs and aim
 The page shows a 10%-of-screen **window patch** (dodges TV auto-dimming). Find where it lands and

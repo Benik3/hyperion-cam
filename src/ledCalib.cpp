@@ -311,15 +311,22 @@ void LedCalib::setLed(uint8_t r, uint8_t g, uint8_t b, int64_t nowMs)
 	if (_sendLed)
 		_sendLed(r, g, b);
 	// Keep the Phase 0 page overlay in sync with the LED drive (same seq: no
-	// new ack needed, just a display refresh).
+	// new ack needed, just a display refresh). The TV reference holds at the
+	// configured white level; r,g,b is the (nudgeable) LED-drive preview.
 	if (_web && _phase == Phase::White)
-		_web->setState(255, 255, 255, true, r, g, b, _webSeq);
+	{
+		const uint8_t w = static_cast<uint8_t>(_cfg.whiteLevel);
+		_web->setState(w, w, w, true, r, g, b, _webSeq);
+	}
 }
 
 void LedCalib::webRefreshWhite()
 {
 	if (_web)
-		_web->setState(255, 255, 255, true, _drive[0], _drive[1], _drive[2], _webSeq);
+	{
+		const uint8_t w = static_cast<uint8_t>(_cfg.whiteLevel);
+		_web->setState(w, w, w, true, _drive[0], _drive[1], _drive[2], _webSeq);
+	}
 }
 
 void LedCalib::beginActivePhase(Phase active, int64_t nowMs)
@@ -374,7 +381,11 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		}
 		break;
 	case Phase::White:
-		setLed(255, 255, 255, nowMs); // also sends a solid white frame to HyperHDR (LEDs go white)
+	{
+		// Drive both the LEDs and the TV reference to the configured white level
+		// (also sends a solid frame to HyperHDR so the LEDs go to that level).
+		const uint8_t w = static_cast<uint8_t>(_cfg.whiteLevel);
+		setLed(w, w, w, nowMs);
 		if (_web)
 		{
 			// Full-screen white field so the whole TV is the white reference.
@@ -382,12 +393,14 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 			_webSeq++;
 			webRefreshWhite();
 		}
-		std::cout << "\nManual white balance: the LEDs are driven full white. Adjust HyperHDR's\n"
+		std::cout << "\nManual white balance: the LEDs are driven white at level " << static_cast<int>(w)
+				  << ". Adjust HyperHDR's\n"
 					 "white balance until the LED glow matches the TV white (or nudge here/on the\n"
 					 "page to preview) —\n"
 					 "  1/2 = red -/+   3/4 = green -/+   5/6 = blue -/+\n"
 					 "  0 = toggle step (1/8)   Enter/Accept = done   q = quit" << std::endl;
 		break;
+	}
 	case Phase::TvWait:
 		setLed(0, 0, 0, nowMs);
 		if (_webStarted)

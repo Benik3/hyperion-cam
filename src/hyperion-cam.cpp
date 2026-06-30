@@ -2920,6 +2920,7 @@ int main(int argc, char *argv[])
 		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-16)")											  //
 		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
+		("ledcalib-white-level", po::value<int>(&_ledCalibCfg.whiteLevel)->default_value(255), "LED calib (phase white): white level (1-255) driven to both the full-screen TV reference and the LEDs; 255=full white, e.g. 127 for a dimmer match")					  //
 		("shading-level", po::value<int>(&_ledCalibCfg.shadingLevel)->default_value(180), "LED calib (phase shading): safe gray code value for the full-TV field (avoid clip/ABL)")					  //
 		("shading-grid", po::value<std::string>(&_shadingGridStr)->default_value("24x14"), "LED calib (phase shading): sample grid across the TV as UxV")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
@@ -3324,6 +3325,7 @@ int main(int argc, char *argv[])
 			_ledCalibCfg.measureFrames = 1;
 		if (_ledCalibCfg.settleMs < 0)
 			_ledCalibCfg.settleMs = 0;
+		_ledCalibCfg.whiteLevel = std::clamp(_ledCalibCfg.whiteLevel, 1, 255);
 		// tv/gamma/shading show full-screen TV fields and are always web-driven.
 		// Check this first so the missing-web error wins over the tty error below.
 		if ((gammaMode || shadingMode || tvMode) && !_ledCalibCfg.tvWeb)
