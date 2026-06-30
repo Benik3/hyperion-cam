@@ -21,8 +21,13 @@ only role.
 - **Dark room.** The page keeps the PC awake (Screen Wake Lock) and shows a tiny moving corner
   marker so most TVs won't screensaver. If your TV still blanks on a static image, disable its
   screensaver. Also disable **eco/ambient auto-dimming** (corrupts sweeps).
-- HyperHDR running, grabber the only source, **HyperHDR color + smoothing settings final** — they
-  bake into the LUT; change later → recalibrate.
+- HyperHDR running, grabber the only source, **HyperHDR color + white-balance settings final** —
+  they bake into the LUT; change later → recalibrate.
+- **Disable HyperHDR LED smoothing for the calibration run.** Smoothing is a temporal filter on
+  the LED output; with it on, the LEDs ramp toward each commanded colour over time, so the short
+  per-patch settle would measure mid-transition. Off → the LEDs jump instantly and the settle only
+  has to cover the panel/LED response + camera pipeline. It does not affect the steady-state colour,
+  so it has no bearing on the produced LUT — re-enable it for normal viewing afterwards.
 - Stop the service while calibrating, restart after:
   ```bash
   sudo systemctl stop hypercam      # before each run
@@ -184,4 +189,5 @@ runtime LUT stays a uniform 33³ and interpolates the fitted model.
 **Diagnostics:** `--ledcalib gamma [--gamma-raw]` (TV→camera transfer) + `tools/plot-gamma.py`;
 `--ledcalib-web-dryrun` (test the page).
 
-**Recalibrate when:** HyperHDR color/WB/smoothing changes, camera moves, TV picture-mode changes.
+**Recalibrate when:** HyperHDR color/WB changes, camera moves, TV picture-mode changes. (LED
+smoothing doesn't affect the LUT — it's off during calibration and only shapes runtime response.)

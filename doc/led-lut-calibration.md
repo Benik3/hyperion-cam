@@ -65,8 +65,10 @@ The user provides two axis-aligned ROIs in raw full-frame coordinates (pick them
   off-axis, which skews the TV-side readings)
 
 Requirements during the run: dark room, HyperHDR running with the grabber as the only active
-source, HyperHDR color/smoothing settings in their final state (the LUT bakes them in — change
-them later and the LUT is stale).
+source, HyperHDR color/WB settings in their final state (the LUT bakes them in — change them later
+and the LUT is stale), and HyperHDR **LED smoothing disabled** so the LEDs jump to each commanded
+colour instantly (the short settle would otherwise measure mid-ramp; smoothing doesn't change the
+steady-state colour, so it's off only for the run and re-enabled for viewing).
 
 ### Getting patches onto the TV: the web page (`--calib-tv-web`)
 
@@ -75,7 +77,9 @@ The grabber runs a tiny HTTP server (evhttp, on `--calib-tv-port`, default 8080)
 fullscreen color over SSE; the page paints it, double-`requestAnimationFrame`s to guarantee the
 frame is up, then `POST /ack?n=seq`. The grabber starts its settle timer **on the ack**, so timing
 covers only TV-internal latency, not network/paint lag — and a closed/frozen page is caught by an
-8 s ack timeout (clean abort). The grabber *commands* each patch directly (no decoding). The page
+8 s ack timeout (clean abort). After the ack it waits both the settle time **and** a minimum of 3
+fresh camera frames before measuring, so the stale in-flight frames are flushed even if the camera
+fps is low. The grabber *commands* each patch directly (no decoding). The page
 also hosts the white-phase nudge buttons so the whole run is driven from the TV-side PC.
 `src/ledCalibWeb.cpp`. Required for `tv`/`gamma`/`shading`. (A calib-video + index-decoder fallback
 existed early on and was removed 2026-06-16 — web only.)
@@ -126,9 +130,9 @@ or RAW is needed).
 TV shows black (the page blacks it out automatically). Baseline first:
 LEDs black, measure both
 ROIs (room ambient + TV black-level glow; subtracted later in the fit). Then for each drive
-value in an 8³ grid + 17-step gray ramp: send solid frame, wait settle (HyperHDR smoothing + LED
-response, default 700 ms), measure LED ROI (and TV ROI as a darkness sanity check), record same
-stats as Phase 1.
+value in an 8³ grid + 17-step gray ramp: send solid frame, wait settle (LED + panel response;
+default 100 ms, valid because smoothing is off), measure LED ROI (and TV ROI as a darkness sanity
+check), record same stats as Phase 1.
 
 ### Phase 3 — fit + LUT build (offline; implemented 2026-06-12: `--ledcalib-fit`)
 

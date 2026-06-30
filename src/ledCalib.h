@@ -39,7 +39,13 @@ struct LedCalibConfig
 	int ledGrayRamp = 17;	   // extra gray ramp steps in the LED sweep
 	int ledAxisSteps = 24;	   // extra per-channel axis ramp, edge-dense near 0/255 (0 = off)
 	int measureFrames = 20;	   // frames averaged per measurement
-	int settleMs = 700;		   // LED + HyperHDR smoothing settle before measuring
+	// Settle before each measurement. Short because nothing slow has to converge:
+	// exposure/gain/AWB are locked, and HyperHDR LED smoothing must be DISABLED
+	// for calibration (see doc/calibration-guide.md) so the LEDs jump instantly —
+	// the only waits are the TV panel showing the patch + the camera pipeline
+	// flushing stale frames. The web TV/gamma patches additionally require a
+	// minimum of fresh frames after the page's paint-ack (guards low camera fps).
+	int settleMs = 100;
 	// Web only: after the user taps 'begin' (which puts the page fullscreen),
 	// hold the first patch back this long so the browser's transient "press Esc
 	// to exit fullscreen" prompt clears before it can cover the patch. 0 = off.
@@ -234,6 +240,7 @@ private:
 	uint32_t _tvSeq = 0;		   // seq of the currently shown patch
 	int64_t _tvAckWaitStartMs = -1;
 	int64_t _tvSettleUntilMs = -1; // <0 = waiting for the page to ack the paint
+	int _tvSettleFrames = 0;	   // fresh camera frames seen since the ack (settle guard)
 
 	// Gamma ramp probe
 	struct GammaRecord

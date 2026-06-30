@@ -18,6 +18,7 @@ namespace
 {
 	constexpr int64_t kResendIntervalMs = 100;	  // keep HyperHDR fed while a color is held
 	constexpr int64_t kWebAckTimeoutMs = 8000;	  // page must ack a patch within this or we abort
+	constexpr int kMinSettleFrames = 3;			  // fresh camera frames to discard after a web-patch ack
 
 	// Edge-dense grid level: Chebyshev/cosine nodes -> samples clustered near 0
 	// and 255 (where crush/clip live), sparse in the middle. i in [0,n-1].
@@ -430,8 +431,9 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		_ledPlanPos = 0;
 		setLed((*_ledPlan.begin())[0], (*_ledPlan.begin())[1], (*_ledPlan.begin())[2], nowMs);
 		_settleUntilMs = nowMs + _cfg.settleMs;
+		// Rough ETA: settle + measurement (~16 ms/frame at the calib fps) per patch.
 		std::cout << "LED sweep: " << _ledPlan.size() << " drive values, ~"
-				  << (_ledPlan.size() * (static_cast<size_t>(_cfg.settleMs) + 700) / 1000 / 60 + 1)
+				  << (_ledPlan.size() * (static_cast<size_t>(_cfg.settleMs) + _cfg.measureFrames * 16) / 1000 / 60 + 1)
 				  << " min." << std::endl;
 		break;
 	case Phase::GammaWait:
@@ -681,6 +683,7 @@ void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs
 		if (_web->ackedSeq() >= _tvSeq)
 		{
 			_tvSettleUntilMs = nowMs + _cfg.settleMs;
+			_tvSettleFrames = 0;
 		}
 		else if (_tvAckWaitStartMs >= 0 && nowMs - _tvAckWaitStartMs > kWebAckTimeoutMs)
 		{
@@ -691,10 +694,16 @@ void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs
 		return;
 	}
 
-	if (nowMs < _tvSettleUntilMs)
-		return;
+	// Measure once BOTH the settle time has elapsed AND a few fresh frames have
+	// arrived since the ack: the time covers TV-panel + camera-pipeline latency,
+	// the frame floor flushes the stale in-flight frames even at low camera fps.
 	if (!_meas.active)
+	{
+		_tvSettleFrames++;
+		if (nowMs < _tvSettleUntilMs || _tvSettleFrames <= kMinSettleFrames)
+			return;
 		_meas.start(_cfg.measureFrames);
+	}
 	_meas.add(tv, led);
 	if (!_meas.done())
 		return;
@@ -765,7 +774,10 @@ void LedCalib::runGamma(const RoiSample &meas, int64_t nowMs)
 	if (_tvSettleUntilMs < 0)
 	{
 		if (_web->ackedSeq() >= _tvSeq)
+		{
 			_tvSettleUntilMs = nowMs + _cfg.settleMs;
+			_tvSettleFrames = 0;
+		}
 		else if (_tvAckWaitStartMs >= 0 && nowMs - _tvAckWaitStartMs > kWebAckTimeoutMs)
 		{
 			std::cout << "ERROR: web page did not acknowledge gamma patch " << _gammaPos << "/"
@@ -774,10 +786,14 @@ void LedCalib::runGamma(const RoiSample &meas, int64_t nowMs)
 		}
 		return;
 	}
-	if (nowMs < _tvSettleUntilMs)
-		return;
+	// Same dual settle gate as the TV sweep (time + min fresh frames).
 	if (!_meas.active)
+	{
+		_tvSettleFrames++;
+		if (nowMs < _tvSettleUntilMs || _tvSettleFrames <= kMinSettleFrames)
+			return;
 		_meas.start(_cfg.measureFrames);
+	}
 	_meas.add(meas, RoiSample{});
 	if (!_meas.done())
 		return;
