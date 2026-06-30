@@ -189,7 +189,8 @@ runtime LUT stays a uniform 33³ and interpolates the fitted model.
 `--ledcalib-settle-ms`.
 
 **Diagnostics:** `--ledcalib gamma [--gamma-raw]` (TV→camera transfer) + `tools/plot-gamma.py`;
-`--ledcalib-web-dryrun` (test the page).
+`--ledcalib gamma_leds` (same ramp driven into the LEDs, measures the LED ROI → `gamma_leds.csv`, for
+the LED-chain transfer/crush/clip); `--ledcalib-web-dryrun` (test the page).
 
 **Recalibrate when:** HyperHDR color/WB changes, camera moves, TV picture-mode changes. (LED
 smoothing doesn't affect the LUT — it's off during calibration and only shapes runtime response.)

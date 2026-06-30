@@ -101,6 +101,8 @@ LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, 
 		_phase = Phase::LedWait;
 	else if (_cfg.phase == "gamma")
 		_phase = Phase::GammaWait;
+	else if (_cfg.phase == "gamma_leds")
+		_phase = Phase::GammaLedsWait;
 	else if (_cfg.phase == "shading")
 		_phase = Phase::ShadingWait;
 	else
@@ -173,12 +175,12 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		{
 			return r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= width && r.y + r.h <= height;
 		};
-		// tv/gamma need the TV ROI; led needs the LED ROI (the TV ROI is an
-		// optional sanity column); shading samples the whole TV quad and white is a
-		// manual eye-match — neither uses a fixed ROI.
+		// tv/gamma need the TV ROI; led/gamma_leds need the LED ROI (the TV ROI is
+		// an optional sanity column); shading samples the whole TV quad and white is
+		// a manual eye-match — neither uses a fixed ROI.
 		const bool gamma = (_cfg.phase == "gamma");
 		const bool tvOnly = gamma || _cfg.phase == "tv";
-		const bool ledPhase = (_cfg.phase == "led");
+		const bool ledPhase = (_cfg.phase == "led" || _cfg.phase == "gamma_leds");
 		bool roiBad = false;
 		if (tvOnly)
 			roiBad = !inFrame(_cfg.tvRoi);
@@ -239,6 +241,9 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		break;
 	case Phase::Gamma:
 		runGamma(tv, nowMs);
+		break;
+	case Phase::GammaLeds:
+		runGammaLeds(led, nowMs);
 		break;
 	case Phase::Tv:
 		runTvWeb(tv, led, nowMs);
@@ -470,6 +475,40 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 				  << "." << std::endl;
 		showGammaPatch(nowMs);
 		break;
+	case Phase::GammaLedsWait:
+		setLed(0, 0, 0, nowMs);
+		// Black the TV through the page (like the LED sweep) so only the LEDs light
+		// the wall the LED ROI samples.
+		if (_web)
+		{
+			_webSeq++;
+			_web->setState(0, 0, 0, false, 0, 0, 0, _webSeq);
+		}
+		if (_webStarted)
+		{
+			enterPhase(Phase::GammaLeds, nowMs);
+			return;
+		}
+		if (_web)
+			std::cout << "\nLedCalib LED gamma probe: open the page fullscreen on the TV PC\n"
+						 "and tap 'begin' (the page will black out the TV; the LEDs are driven)." << std::endl;
+		else
+			std::cout << "\nLedCalib LED gamma probe: make sure the TV is black and press Enter\n"
+						 "(the LEDs are driven; only they should light the LED-ROI wall)." << std::endl;
+		_lastUrlPrintMs = nowMs;
+		break;
+	case Phase::GammaLeds:
+		buildGammaPlan();
+		_gammaPos = 0;
+		_gammaRecords.clear();
+		setLed(static_cast<uint8_t>(_gammaPlan[0][1]), static_cast<uint8_t>(_gammaPlan[0][2]),
+			   static_cast<uint8_t>(_gammaPlan[0][3]), nowMs);
+		_settleUntilMs = nowMs + _cfg.settleMs;
+		std::cout << "LED gamma probe: " << _gammaPlan.size() << " drive values (R/G/B/gray ramps, step "
+				  << _cfg.gammaStep << "), measuring the LED ROI, ~"
+				  << (_gammaPlan.size() * (static_cast<size_t>(_cfg.settleMs) + _cfg.measureFrames * 16) / 1000 / 60 + 1)
+				  << " min." << std::endl;
+		break;
 	case Phase::ShadingWait:
 		setLed(0, 0, 0, nowMs); // LEDs off; this maps the TV/lens, not the LEDs
 		if (_webStarted)
@@ -535,7 +574,7 @@ void LedCalib::handleKeys(int64_t nowMs)
 		// the unattended auto-advance of later wait phases.
 		if (_web && enter && (_phase == Phase::WhiteWait || _phase == Phase::TvWait ||
 							  _phase == Phase::LedWait || _phase == Phase::GammaWait ||
-							  _phase == Phase::ShadingWait))
+							  _phase == Phase::GammaLedsWait || _phase == Phase::ShadingWait))
 			_webStarted = true;
 		switch (_phase)
 		{
@@ -558,6 +597,10 @@ void LedCalib::handleKeys(int64_t nowMs)
 		case Phase::GammaWait:
 			if (enter)
 				beginActivePhase(Phase::Gamma, nowMs);
+			break;
+		case Phase::GammaLedsWait:
+			if (enter)
+				beginActivePhase(Phase::GammaLeds, nowMs);
 			break;
 		case Phase::White:
 			whiteKey(c, nowMs);
@@ -843,12 +886,60 @@ void LedCalib::runGamma(const RoiSample &meas, int64_t nowMs)
 	showGammaPatch(nowMs);
 }
 
+void LedCalib::runGammaLeds(const RoiSample &led, int64_t nowMs)
+{
+	// LED-driven ramp: time-settle only (no web ack — the page is black), measure
+	// the LED ROI (index 1), same machinery as the LED sweep.
+	if (nowMs < _settleUntilMs)
+		return;
+	if (!_meas.active)
+		_meas.start(_cfg.measureFrames);
+	_meas.add(RoiSample{}, led);
+	if (!_meas.done())
+		return;
+
+	double mean[2][3], tstd[2][3], sstd[2][3];
+	_meas.finish(mean, tstd, sstd);
+	GammaRecord rec;
+	rec.chan = _gammaPlan[_gammaPos][0];
+	rec.level = std::max({_gammaPlan[_gammaPos][1], _gammaPlan[_gammaPos][2], _gammaPlan[_gammaPos][3]});
+	rec.frames = _meas.target;
+	for (int c = 0; c < 3; c++)
+	{
+		rec.mean[c] = mean[1][c];
+		rec.tstd[c] = tstd[1][c];
+		rec.sstd[c] = sstd[1][c];
+	}
+	_gammaRecords.push_back(rec);
+
+	_gammaPos++;
+	if ((_gammaPos % 50) == 0 || _gammaPos == _gammaPlan.size())
+		std::cout << "LED gamma: " << _gammaPos << "/" << _gammaPlan.size() << " patches" << std::endl;
+	if (_gammaPos >= _gammaPlan.size())
+	{
+		if (!ensureOutDir())
+		{
+			finishAll(EXIT_FAILURE);
+			return;
+		}
+		reportGammaLimits();
+		writeGammaCsv();
+		finishAll(EXIT_SUCCESS);
+		return;
+	}
+	const auto &p = _gammaPlan[_gammaPos];
+	setLed(static_cast<uint8_t>(p[1]), static_cast<uint8_t>(p[2]), static_cast<uint8_t>(p[3]), nowMs);
+	_settleUntilMs = nowMs + _cfg.settleMs;
+}
+
 void LedCalib::writeGammaCsv()
 {
-	const std::string path = _cfg.outDir + (_cfg.gammaRaw ? "/raw_gamma.csv" : "/gamma.csv");
+	const bool leds = (_cfg.phase == "gamma_leds");
+	const std::string path =
+		_cfg.outDir + "/" + (leds ? "gamma_leds.csv" : (_cfg.gammaRaw ? "raw_gamma.csv" : "gamma.csv"));
 	std::ofstream f(path);
-	f << "# " << (_cfg.gammaRaw ? "RAW Bayer-plane" : "ISP RGB") << " gamma ramp; mean units "
-	  << (_cfg.gammaRaw ? "0..1023 (10-bit)" : "0..255 (8-bit)") << "\n";
+	f << "# " << (leds ? "LED-driven (LED-ROI, ISP RGB)" : (_cfg.gammaRaw ? "RAW Bayer-plane" : "ISP RGB"))
+	  << " gamma ramp; mean units " << ((!leds && _cfg.gammaRaw) ? "0..1023 (10-bit)" : "0..255 (8-bit)") << "\n";
 	f << "channel,level,meas_r,meas_g,meas_b,tstd_r,tstd_g,tstd_b,sstd_r,sstd_g,sstd_b,frames\n";
 	const char *names[4] = {"R", "G", "B", "gray"};
 	for (const auto &r : _gammaRecords)

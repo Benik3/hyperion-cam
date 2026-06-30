@@ -128,6 +128,8 @@ private:
 		LedSweep,
 		GammaWait,
 		Gamma,
+		GammaLedsWait,
+		GammaLeds,
 		ShadingWait,
 		Shading,
 		Done
@@ -187,6 +189,9 @@ private:
 	void buildGammaPlan();
 	void showGammaPatch(int64_t nowMs);
 	void runGamma(const RoiSample &meas, int64_t nowMs);
+	// Same R/G/B/gray ramp, but driven into the LEDs (flatbuffer) like the LED
+	// sweep — page stays black, measures the LED ROI → gamma_leds.csv.
+	void runGammaLeds(const RoiSample &led, int64_t nowMs);
 	void writeGammaCsv();
 	void reportGammaLimits(); // pre-flight: warn on per-channel camera clip/crush in the ramps
 

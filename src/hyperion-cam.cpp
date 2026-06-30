@@ -2906,7 +2906,7 @@ int main(int argc, char *argv[])
 		("shading-map", po::value<std::string>(&_shadingMapPath), "Apply an ALSC shading-correction map (shading.csv from --ledcalib shading) in the NV12 warp shader")								  //
 		("lut", po::value<std::string>(&_lutPath), "Apply a 3D color LUT (.cube from --ledcalib-fit) in the NV12 warp shader; composes with --shading-map")									  //
 		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread")														  //
-		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value(""), "One-shot LED 3D-LUT calibration measurement and exit. Phase: tv | led | shading | gamma | white (run tv+led separately; see doc/calibration-guide.md)")									  //
+		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value(""), "One-shot LED 3D-LUT calibration measurement and exit. Phase: tv | led | shading | gamma | gamma_leds | white (run tv+led separately; see doc/calibration-guide.md)")									  //
 		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h in raw full-frame coords (pick from --imgout without --crop)")																	  //
 		("calib-led-roi", po::value<std::string>(&_calibLedRoiStr), "LED calib: ROI on the LED-lit wall, x,y,w,h in raw full-frame coords")																										  //
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
@@ -3229,13 +3229,15 @@ int main(int argc, char *argv[])
 			return EXIT_FAILURE;
 		}
 		if (_ledCalibPhase != "white" && _ledCalibPhase != "tv" &&
-			_ledCalibPhase != "led" && _ledCalibPhase != "gamma" && _ledCalibPhase != "shading")
+			_ledCalibPhase != "led" && _ledCalibPhase != "gamma" && _ledCalibPhase != "gamma_leds" &&
+			_ledCalibPhase != "shading")
 		{
-			std::cout << "ERROR: --ledcalib needs a phase: tv | led | shading | gamma | white\n"
+			std::cout << "ERROR: --ledcalib needs a phase: tv | led | shading | gamma | gamma_leds | white\n"
 						 "       (run tv and led separately; the fit derives white from their white points)" << std::endl;
 			return EXIT_FAILURE;
 		}
 		const bool gammaMode = (_ledCalibPhase == "gamma");
+		const bool gammaLedsMode = (_ledCalibPhase == "gamma_leds");
 		const bool shadingMode = (_ledCalibPhase == "shading");
 		const bool tvMode = (_ledCalibPhase == "tv");
 		const bool ledMode = (_ledCalibPhase == "led");
@@ -3244,9 +3246,9 @@ int main(int argc, char *argv[])
 			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
 		};
 		// ROI requirements per phase: tv/gamma sample only the TV picture (TV ROI);
-		// led samples the LED wall (LED ROI; the TV ROI is an optional sanity
-		// column, unused by the fit); shading samples the whole TV quad and white is
-		// a manual eye-match (HyperHDR white balance) — neither needs a fixed ROI.
+		// led/gamma_leds sample the LED wall (LED ROI; the TV ROI is an optional
+		// sanity column, unused by the fit); shading samples the whole TV quad and
+		// white is a manual eye-match (HyperHDR white balance) — neither needs a ROI.
 		bool roiOk = true;
 		const char *roiNeed = nullptr;
 		if (tvMode || gammaMode)
@@ -3254,7 +3256,7 @@ int main(int argc, char *argv[])
 			roiNeed = "--calib-tv-roi";
 			roiOk = parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi);
 		}
-		else if (ledMode)
+		else if (ledMode || gammaLedsMode)
 		{
 			roiNeed = "--calib-led-roi";
 			roiOk = parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi);
@@ -3343,7 +3345,7 @@ int main(int argc, char *argv[])
 		// All checks passed and the run will start: create --calib-out now (white
 		// writes no files) so a bad/unwritable path fails here, not after a
 		// multi-minute sweep.
-		if ((gammaMode || shadingMode || tvMode || ledMode) && !LedCalib::ensureDir(_ledCalibCfg.outDir))
+		if ((gammaMode || gammaLedsMode || shadingMode || tvMode || ledMode) && !LedCalib::ensureDir(_ledCalibCfg.outDir))
 			return EXIT_FAILURE;
 		_ledCalibCfg.phase = _ledCalibPhase;
 		_ledCalibCfg.verbose = _verbose;
@@ -3351,6 +3353,8 @@ int main(int argc, char *argv[])
 		_ledCalibCfg.gammaRefW = _width;
 		_ledCalibCfg.gammaRefH = _height;
 		_ledCalibRaw = gammaMode && _ledCalibCfg.gammaRaw;
+		if (gammaLedsMode && _ledCalibCfg.gammaRaw)
+			std::cout << "WARNING: --gamma-raw ignored for --ledcalib gamma_leds (LED-wall ISP RGB only)" << std::endl;
 		// Configured sweep window geometry (Phase 0 overrides to fullscreen).
 		_ledCalibCfg.patchPct = _patchSize;
 		_ledCalibCfg.patchX = _patchX;
