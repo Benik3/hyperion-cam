@@ -131,7 +131,9 @@ TV shows black (the page blacks it out automatically). Baseline first:
 LEDs black, measure both
 ROIs (room ambient + TV black-level glow; subtracted later in the fit). Then for each drive
 value in an 8³ grid + 17-step gray ramp: send solid frame, wait settle (LED + panel response;
-default 100 ms, valid because smoothing is off), measure LED ROI (and TV ROI as a darkness sanity
+default 100 ms, valid because smoothing is off) **plus a minimum of 3 fresh camera frames since
+the drive change** (same guard as the web ack path — at low camera fps, in-flight frames showing
+the previous drive outlive the settle time), measure LED ROI (and TV ROI as a darkness sanity
 check), record same stats as Phase 1.
 
 ### Phase 3 — fit + LUT build (offline; implemented 2026-06-12: `--ledcalib-fit`)

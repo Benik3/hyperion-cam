@@ -43,8 +43,9 @@ struct LedCalibConfig
 	// exposure/gain/AWB are locked, and HyperHDR LED smoothing must be DISABLED
 	// for calibration (see doc/calibration-guide.md) so the LEDs jump instantly —
 	// the only waits are the TV panel showing the patch + the camera pipeline
-	// flushing stale frames. The web TV/gamma patches additionally require a
-	// minimum of fresh frames after the page's paint-ack (guards low camera fps).
+	// flushing stale frames. Every measurement additionally requires a minimum
+	// of fresh frames after the patch ack / LED drive change (guards low
+	// camera fps, where in-flight frames outlive the settle time).
 	int settleMs = 100;
 	// Web only: after the user taps 'begin' (which puts the page fullscreen),
 	// hold the first patch back this long so the browser's transient "press Esc
@@ -179,6 +180,19 @@ private:
 	void handleKeys(int64_t nowMs);
 	void whiteKey(char c, int64_t nowMs);
 	void finishTvPhase();
+	// Settle/measure gates shared by the sweeps. Both wait the settle time AND
+	// a minimum of fresh camera frames (flushes stale in-flight frames at low
+	// camera fps), then start the measurement; true = feed _meas this frame.
+	// webPatchReady() additionally waits for the page's paint-ack first (with
+	// timeout -> finishAll); ledPatchReady() keys off the LED drive change.
+	bool webPatchReady(const char *what, std::size_t pos, std::size_t total, int64_t nowMs);
+	bool ledPatchReady(int64_t nowMs);
+	// (Re)start the LED-drive settle window; call right after setLed().
+	void ledSettleStart(int64_t nowMs, int minSettleMs = 0);
+	// Finish _meas into a GammaRecord for ROI slot `roi` and advance _gammaPos.
+	void pushGammaRecord(int roi, const char *label);
+	// Shared gamma/gamma_leds completion; true = plan done (files written / failed).
+	bool gammaFinishIfDone();
 	// Web TV-patch path.
 	void buildTvPlan();
 	void showTvPatch(int64_t nowMs);
@@ -280,6 +294,7 @@ private:
 	std::vector<std::array<uint8_t, 3>> _ledPlan;
 	size_t _ledPlanPos = 0;
 	int64_t _settleUntilMs = -1;
+	int _ledSettleFrames = 0; // fresh frames since the last LED drive change (settle guard)
 	SweepRecord _baseline{};
 	bool _haveBaseline = false;
 	std::vector<SweepRecord> _ledRecords;

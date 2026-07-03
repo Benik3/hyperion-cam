@@ -449,14 +449,14 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		break;
 	case Phase::LedBaseline:
 		setLed(0, 0, 0, nowMs);
-		_settleUntilMs = nowMs + std::max(_cfg.settleMs, 1500);
+		ledSettleStart(nowMs, 1500);
 		std::cout << "LED sweep: measuring baseline (LEDs off, TV black)..." << std::endl;
 		break;
 	case Phase::LedSweep:
 		buildLedPlan();
 		_ledPlanPos = 0;
 		setLed((*_ledPlan.begin())[0], (*_ledPlan.begin())[1], (*_ledPlan.begin())[2], nowMs);
-		_settleUntilMs = nowMs + _cfg.settleMs;
+		ledSettleStart(nowMs);
 		// Rough ETA: settle + measurement (~16 ms/frame at the calib fps) per patch.
 		std::cout << "LED sweep: " << _ledPlan.size() << " drive values, ~"
 				  << (_ledPlan.size() * (static_cast<size_t>(_cfg.settleMs) + _cfg.measureFrames * 16) / 1000 / 60 + 1)
@@ -511,7 +511,7 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		_gammaRecords.clear();
 		setLed(static_cast<uint8_t>(_gammaPlan[0][1]), static_cast<uint8_t>(_gammaPlan[0][2]),
 			   static_cast<uint8_t>(_gammaPlan[0][3]), nowMs);
-		_settleUntilMs = nowMs + _cfg.settleMs;
+		ledSettleStart(nowMs);
 		std::cout << "LED gamma probe: " << _gammaPlan.size() << " drive values (R/G/B/gray ramps, step "
 				  << _cfg.gammaStep << "), measuring the LED ROI, ~"
 				  << (_gammaPlan.size() * (static_cast<size_t>(_cfg.settleMs) + _cfg.measureFrames * 16) / 1000 / 60 + 1)
@@ -739,9 +739,13 @@ void LedCalib::showTvPatch(int64_t nowMs)
 	_tvAckWaitStartMs = nowMs;
 }
 
-void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
+// Web-patch gate: wait for the page to confirm it painted this patch (with a
+// timeout -> abort), then measure once BOTH the settle time has elapsed AND a
+// few fresh frames have arrived since the ack: the time covers TV-panel +
+// camera-pipeline latency, the frame floor flushes the stale in-flight frames
+// even at low camera fps. True = feed _meas this frame.
+bool LedCalib::webPatchReady(const char *what, std::size_t pos, std::size_t total, int64_t nowMs)
 {
-	// Wait for the page to confirm it painted this patch, then settle.
 	if (_tvSettleUntilMs < 0)
 	{
 		if (_web->ackedSeq() >= _tvSeq)
@@ -751,23 +755,47 @@ void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs
 		}
 		else if (_tvAckWaitStartMs >= 0 && nowMs - _tvAckWaitStartMs > kWebAckTimeoutMs)
 		{
-			std::cout << "ERROR: web page did not acknowledge patch " << _tvPlanPos << "/" << _tvPlan.size()
+			std::cout << "ERROR: web page did not acknowledge " << what << " " << pos << "/" << total
 					  << " within " << (kWebAckTimeoutMs / 1000) << "s (page closed or left fullscreen?)" << std::endl;
 			finishAll(EXIT_FAILURE);
 		}
-		return;
+		return false;
 	}
-
-	// Measure once BOTH the settle time has elapsed AND a few fresh frames have
-	// arrived since the ack: the time covers TV-panel + camera-pipeline latency,
-	// the frame floor flushes the stale in-flight frames even at low camera fps.
 	if (!_meas.active)
 	{
 		_tvSettleFrames++;
 		if (nowMs < _tvSettleUntilMs || _tvSettleFrames <= kMinSettleFrames)
-			return;
+			return false;
 		_meas.start(_cfg.measureFrames);
 	}
+	return true;
+}
+
+// LED-drive gate: same dual settle (time + min fresh frames since the drive
+// change) without a web ack — the LEDs switch on the flatbuffer send, but
+// in-flight camera frames still show the previous drive at low fps.
+bool LedCalib::ledPatchReady(int64_t nowMs)
+{
+	if (!_meas.active)
+	{
+		_ledSettleFrames++;
+		if (nowMs < _settleUntilMs || _ledSettleFrames <= kMinSettleFrames)
+			return false;
+		_meas.start(_cfg.measureFrames);
+	}
+	return true;
+}
+
+void LedCalib::ledSettleStart(int64_t nowMs, int minSettleMs)
+{
+	_settleUntilMs = nowMs + std::max(_cfg.settleMs, minSettleMs);
+	_ledSettleFrames = 0;
+}
+
+void LedCalib::runTvWeb(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
+{
+	if (!webPatchReady("patch", _tvPlanPos, _tvPlan.size(), nowMs))
+		return;
 	_meas.add(tv, led);
 	if (!_meas.done())
 		return;
@@ -833,35 +861,10 @@ void LedCalib::showGammaPatch(int64_t nowMs)
 	_tvAckWaitStartMs = nowMs;
 }
 
-void LedCalib::runGamma(const RoiSample &meas, int64_t nowMs)
+// Finish the running measurement into a GammaRecord (ROI slot `roi`: 0 = TV,
+// 1 = LED wall), advance the plan and print progress.
+void LedCalib::pushGammaRecord(int roi, const char *label)
 {
-	if (_tvSettleUntilMs < 0)
-	{
-		if (_web->ackedSeq() >= _tvSeq)
-		{
-			_tvSettleUntilMs = nowMs + _cfg.settleMs;
-			_tvSettleFrames = 0;
-		}
-		else if (_tvAckWaitStartMs >= 0 && nowMs - _tvAckWaitStartMs > kWebAckTimeoutMs)
-		{
-			std::cout << "ERROR: web page did not acknowledge gamma patch " << _gammaPos << "/"
-					  << _gammaPlan.size() << " within " << (kWebAckTimeoutMs / 1000) << "s" << std::endl;
-			finishAll(EXIT_FAILURE);
-		}
-		return;
-	}
-	// Same dual settle gate as the TV sweep (time + min fresh frames).
-	if (!_meas.active)
-	{
-		_tvSettleFrames++;
-		if (nowMs < _tvSettleUntilMs || _tvSettleFrames <= kMinSettleFrames)
-			return;
-		_meas.start(_cfg.measureFrames);
-	}
-	_meas.add(meas, RoiSample{});
-	if (!_meas.done())
-		return;
-
 	double mean[2][3], tstd[2][3], sstd[2][3];
 	_meas.finish(mean, tstd, sstd);
 	GammaRecord rec;
@@ -870,74 +873,62 @@ void LedCalib::runGamma(const RoiSample &meas, int64_t nowMs)
 	rec.frames = _meas.target;
 	for (int c = 0; c < 3; c++)
 	{
-		rec.mean[c] = mean[0][c];
-		rec.tstd[c] = tstd[0][c];
-		rec.sstd[c] = sstd[0][c];
+		rec.mean[c] = mean[roi][c];
+		rec.tstd[c] = tstd[roi][c];
+		rec.sstd[c] = sstd[roi][c];
 	}
 	_gammaRecords.push_back(rec);
 
 	_gammaPos++;
 	if ((_gammaPos % 50) == 0 || _gammaPos == _gammaPlan.size())
-		std::cout << "Gamma: " << _gammaPos << "/" << _gammaPlan.size() << " patches" << std::endl;
-	if (_gammaPos >= _gammaPlan.size())
+		std::cout << label << ": " << _gammaPos << "/" << _gammaPlan.size() << " patches" << std::endl;
+}
+
+bool LedCalib::gammaFinishIfDone()
+{
+	if (_gammaPos < _gammaPlan.size())
+		return false;
+	if (!ensureOutDir())
 	{
-		if (!ensureOutDir())
-		{
-			finishAll(EXIT_FAILURE);
-			return;
-		}
-		reportGammaLimits();
-		writeGammaCsv();
-		finishAll(EXIT_SUCCESS);
-		return;
+		finishAll(EXIT_FAILURE);
+		return true;
 	}
+	reportGammaLimits();
+	writeGammaCsv();
+	finishAll(EXIT_SUCCESS);
+	return true;
+}
+
+void LedCalib::runGamma(const RoiSample &meas, int64_t nowMs)
+{
+	if (!webPatchReady("gamma patch", _gammaPos, _gammaPlan.size(), nowMs))
+		return;
+	_meas.add(meas, RoiSample{});
+	if (!_meas.done())
+		return;
+
+	pushGammaRecord(0, "Gamma");
+	if (gammaFinishIfDone())
+		return;
 	showGammaPatch(nowMs);
 }
 
 void LedCalib::runGammaLeds(const RoiSample &led, int64_t nowMs)
 {
-	// LED-driven ramp: time-settle only (no web ack — the page is black), measure
-	// the LED ROI (index 1), same machinery as the LED sweep.
-	if (nowMs < _settleUntilMs)
+	// LED-driven ramp: like the LED sweep (no web ack — the page is black),
+	// measure the LED ROI (index 1).
+	if (!ledPatchReady(nowMs))
 		return;
-	if (!_meas.active)
-		_meas.start(_cfg.measureFrames);
 	_meas.add(RoiSample{}, led);
 	if (!_meas.done())
 		return;
 
-	double mean[2][3], tstd[2][3], sstd[2][3];
-	_meas.finish(mean, tstd, sstd);
-	GammaRecord rec;
-	rec.chan = _gammaPlan[_gammaPos][0];
-	rec.level = std::max({_gammaPlan[_gammaPos][1], _gammaPlan[_gammaPos][2], _gammaPlan[_gammaPos][3]});
-	rec.frames = _meas.target;
-	for (int c = 0; c < 3; c++)
-	{
-		rec.mean[c] = mean[1][c];
-		rec.tstd[c] = tstd[1][c];
-		rec.sstd[c] = sstd[1][c];
-	}
-	_gammaRecords.push_back(rec);
-
-	_gammaPos++;
-	if ((_gammaPos % 50) == 0 || _gammaPos == _gammaPlan.size())
-		std::cout << "LED gamma: " << _gammaPos << "/" << _gammaPlan.size() << " patches" << std::endl;
-	if (_gammaPos >= _gammaPlan.size())
-	{
-		if (!ensureOutDir())
-		{
-			finishAll(EXIT_FAILURE);
-			return;
-		}
-		reportGammaLimits();
-		writeGammaCsv();
-		finishAll(EXIT_SUCCESS);
+	pushGammaRecord(1, "LED gamma");
+	if (gammaFinishIfDone())
 		return;
-	}
 	const auto &p = _gammaPlan[_gammaPos];
 	setLed(static_cast<uint8_t>(p[1]), static_cast<uint8_t>(p[2]), static_cast<uint8_t>(p[3]), nowMs);
-	_settleUntilMs = nowMs + _cfg.settleMs;
+	ledSettleStart(nowMs);
 }
 
 void LedCalib::writeGammaCsv()
@@ -1340,10 +1331,8 @@ void LedCalib::writeShadingMap()
 
 void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
 {
-	if (nowMs < _settleUntilMs)
+	if (!ledPatchReady(nowMs))
 		return;
-	if (!_meas.active)
-		_meas.start(_cfg.measureFrames);
 	_meas.add(tv, led);
 	if (!_meas.done())
 		return;
@@ -1387,7 +1376,7 @@ void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
 	if ((_ledPlanPos % 25) == 0)
 		std::cout << "LED sweep: " << _ledPlanPos << "/" << _ledPlan.size() << std::endl;
 	setLed(_ledPlan[_ledPlanPos][0], _ledPlan[_ledPlanPos][1], _ledPlan[_ledPlanPos][2], nowMs);
-	_settleUntilMs = nowMs + _cfg.settleMs;
+	ledSettleStart(nowMs);
 }
 
 bool LedCalib::ensureDir(const std::string &dir)
