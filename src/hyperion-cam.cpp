@@ -2907,7 +2907,7 @@ int main(int argc, char *argv[])
 		("lut", po::value<std::string>(&_lutPath), "Apply a 3D color LUT (.cube from --ledcalib-fit) in the NV12 warp shader; composes with --shading-map")									  //
 		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread")														  //
 		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value(""), "One-shot LED 3D-LUT calibration measurement and exit. Phase: tv | led | shading | gamma | gamma_leds | white (run tv+led separately; see doc/calibration-guide.md)")									  //
-		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h in raw full-frame coords (pick from --imgout without --crop)")																	  //
+		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h; tv/gamma keep the production --crop, so pick it from an --imgout taken WITH the same --crop (see doc/calibration-guide.md)")																	  //
 		("calib-led-roi", po::value<std::string>(&_calibLedRoiStr), "LED calib: ROI on the LED-lit wall, x,y,w,h in raw full-frame coords")																										  //
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
 		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
@@ -3209,6 +3209,11 @@ int main(int argc, char *argv[])
 				_autoCalibRoiEn = true;
 			}
 			// Default patch full-screen (edge-strip ROI); --patch-size to window it.
+			if (_patchSize <= 0.0 || _patchSize > 100.0)
+			{
+				std::cout << "ERROR: --patch-size must be in (0, 100]" << std::endl;
+				return EXIT_FAILURE;
+			}
 			const double pct = (!vm["patch-size"].defaulted()) ? _patchSize : 100.0;
 			// Hide the corner keep-alive + status: the edge-strip ROI samples the
 			// corners where they sit.
