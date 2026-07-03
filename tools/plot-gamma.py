@@ -54,13 +54,13 @@ def series_value(ch, meas):
     return meas[comp]
 
 
-def norm_max(datasets):
-    """Global max measured value across all sets, per the dominant component."""
+def norm_max(data):
+    """Max measured value within ONE dataset. Each set is normalised to its
+    own max (ISP is 0..255, RAW is 0..1023) so the overlay compares shapes."""
     mx = 1e-9
-    for data in datasets:
-        for ch, pts in data.items():
-            for _, m in pts:
-                mx = max(mx, series_value(ch, m))
+    for ch, pts in data.items():
+        for _, m in pts:
+            mx = max(mx, series_value(ch, m))
     return mx
 
 
@@ -76,14 +76,11 @@ def polyline(pts, col, dash=""):
 
 
 def build_svg(isp, raw):
-    datasets = [d for d in (isp, raw) if d]
-    gmax = norm_max(datasets)
-
     def X(level):
         return PAD + (level / 255.0) * (W - 2 * PAD)
 
-    def Y(val):
-        return H - PAD - (val / gmax) * (H - 2 * PAD)
+    def Y(frac):
+        return H - PAD - frac * (H - 2 * PAD)
 
     s = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif" font-size="13">']
     s.append(f'<rect width="{W}" height="{H}" fill="#fff"/>')
@@ -98,21 +95,22 @@ def build_svg(isp, raw):
     s.append(line(PAD, PAD, PAD, H - PAD, "#333"))
     s.append(line(PAD, H - PAD, W - PAD, H - PAD, "#333"))
     # diagonal reference (perfect linear) faint
-    s.append(line(X(0), Y(0), X(255), Y(gmax), "#ccc", 1, "4 4"))
+    s.append(line(X(0), Y(0.0), X(255), Y(1.0), "#ccc", 1, "4 4"))
     s.append(f'<text x="{W/2:.0f}" y="{H-12:.0f}" text-anchor="middle" fill="#333">commanded code value</text>')
     s.append(f'<text x="16" y="{H/2:.0f}" text-anchor="middle" fill="#333" transform="rotate(-90 16 {H/2:.0f})">measured (% of max)</text>')
 
-    def draw(data, dash, label_suffix):
+    def draw(data, dash):
+        gmax = norm_max(data)  # per-set normalisation: overlay compares curve shapes
         for ch, (_, col) in CH.items():
             if ch not in data:
                 continue
-            pts = [(X(lvl), Y(series_value(ch, m))) for lvl, m in data[ch]]
+            pts = [(X(lvl), Y(series_value(ch, m) / gmax)) for lvl, m in data[ch]]
             s.append(polyline(pts, col, dash))
 
     if isp:
-        draw(isp, "", " ISP")
+        draw(isp, "")
     if raw:
-        draw(raw, "6 3", " RAW")
+        draw(raw, "6 3")
 
     # legend
     ly = PAD + 6
