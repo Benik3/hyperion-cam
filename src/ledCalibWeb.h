@@ -4,6 +4,12 @@
 #include <cstdint>
 #include <memory>
 
+// Key the page's 'begin' tap is delivered as (via popKey). Distinct from
+// Enter/'\n' ('accept') so that reloading the page mid-phase and tapping
+// begin again cannot fake an accept (e.g. instantly "confirming" the White
+// phase). Consumers treat it like Enter in the wait phases only.
+constexpr char kCalibBeginKey = 'B';
+
 // Lightweight web display + control surface for --ledcalib (doc/led-lut-calibration.md,
 // "Web TV-patch path"). A PC connected to the TV opens this page in a fullscreen
 // browser; the grabber pushes the fullscreen color over SSE and the page acks

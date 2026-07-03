@@ -577,37 +577,39 @@ void LedCalib::handleKeys(int64_t nowMs)
 			finishAll(EXIT_FAILURE);
 			return;
 		}
-		const bool enter = (c == '\n' || c == '\r');
-		// In web mode the page's "begin" button arrives as enter and unlocks
-		// the unattended auto-advance of later wait phases.
-		if (_web && enter && (_phase == Phase::WhiteWait || _phase == Phase::TvWait ||
+		// The page's "begin" button arrives as kCalibBeginKey (distinct from
+		// Enter so a reload + begin during the White phase can't fake the
+		// accept); a tty run begins with Enter. Both start a wait phase and
+		// unlock the unattended auto-advance of later wait phases.
+		const bool begin = (c == '\n' || c == '\r' || c == kCalibBeginKey);
+		if (_web && begin && (_phase == Phase::WhiteWait || _phase == Phase::TvWait ||
 							  _phase == Phase::LedWait || _phase == Phase::GammaWait ||
 							  _phase == Phase::GammaLedsWait || _phase == Phase::ShadingWait))
 			_webStarted = true;
 		switch (_phase)
 		{
 		case Phase::WhiteWait:
-			if (enter)
+			if (begin)
 				beginActivePhase(Phase::White, nowMs);
 			break;
 		case Phase::ShadingWait:
-			if (enter)
+			if (begin)
 				beginActivePhase(Phase::Shading, nowMs);
 			break;
 		case Phase::TvWait:
-			if (enter)
+			if (begin)
 				beginActivePhase(Phase::Tv, nowMs);
 			break;
 		case Phase::LedWait:
-			if (enter)
+			if (begin)
 				beginActivePhase(Phase::LedBaseline, nowMs);
 			break;
 		case Phase::GammaWait:
-			if (enter)
+			if (begin)
 				beginActivePhase(Phase::Gamma, nowMs);
 			break;
 		case Phase::GammaLedsWait:
-			if (enter)
+			if (begin)
 				beginActivePhase(Phase::GammaLeds, nowMs);
 			break;
 		case Phase::White:

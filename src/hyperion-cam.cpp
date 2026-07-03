@@ -924,7 +924,7 @@ static bool autoCalibWebGate()
 			imgOutExit(EXIT_FAILURE);
 			return true;
 		}
-		if ((c == '\n' || c == '\r') && !_autoCalibWebStarted)
+		if ((c == '\n' || c == '\r' || c == kCalibBeginKey) && !_autoCalibWebStarted)
 		{
 			_autoCalibWebStarted = true;
 			// First patch after 'begin': wait at least the configured start delay

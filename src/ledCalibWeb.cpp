@@ -201,8 +201,10 @@ es.onmessage=ev=>{
 			return '6';
 		if (c == "step")
 			return '0';
-		if (c == "accept" || c == "start")
+		if (c == "accept")
 			return '\n';
+		if (c == "start")
+			return kCalibBeginKey; // begin != accept: a reload + begin must not confirm a phase
 		if (c == "quit")
 			return 'q';
 		return 0;
