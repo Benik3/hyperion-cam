@@ -159,6 +159,11 @@ document.addEventListener('keydown',e=>{
 const es=new EventSource('/events');
 es.onopen=()=>{st.textContent='connected';};
 es.onerror=()=>{st.textContent='disconnected — is the grabber running?';};
+// The grabber ends this stream when the page is opened elsewhere (last
+// connection wins). Close so EventSource doesn't auto-reconnect and steal
+// the stream back from the new tab.
+es.addEventListener('replaced',()=>{es.close();st.style.display='';
+  st.textContent='replaced — the page was opened elsewhere';});
 es.onmessage=ev=>{
   let s; try{s=JSON.parse(ev.data);}catch(_){return;}
   last=s;
@@ -299,7 +304,25 @@ namespace
 		evhttp_add_header(oh, "Cache-Control", "no-cache");
 		evhttp_add_header(oh, "Connection", "keep-alive");
 
-		// Replace any previous stream (last connection wins).
+		// Replace any previous stream (last connection wins). Tell the old tab
+		// it was replaced — the page closes its EventSource on this event (so
+		// it won't auto-reconnect and steal the stream back) — then finish the
+		// old reply so that tab isn't left a silent half-open stream forever
+		// showing "connected".
+		if (d->sse && d->sse != req)
+		{
+			evhttp_request *old = d->sse;
+			d->sse = nullptr;
+			evhttp_connection *oc = evhttp_request_get_connection(old);
+			if (oc)
+				evhttp_connection_set_closecb(oc, nullptr, nullptr);
+			evbuffer *bye = evbuffer_new();
+			const char *msg = "event: replaced\ndata: 1\n\n";
+			evbuffer_add(bye, msg, std::strlen(msg));
+			evhttp_send_reply_chunk(old, bye);
+			evbuffer_free(bye);
+			evhttp_send_reply_end(old);
+		}
 		d->sse = req;
 		d->hasClient.store(true, std::memory_order_release);
 		{
