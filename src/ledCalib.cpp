@@ -427,16 +427,24 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 		break;
 	case Phase::LedWait:
 		setLed(0, 0, 0, nowMs);
-		// Drive the TV black through the page; no manual step needed.
-		_webSeq++;
-		_web->setState(0, 0, 0, false, 0, 0, 0, _webSeq);
+		// Drive the TV black through the page; no manual step needed. On a tty
+		// run (no --calib-tv-web) the user blacks the TV themselves.
+		if (_web)
+		{
+			_webSeq++;
+			_web->setState(0, 0, 0, false, 0, 0, 0, _webSeq);
+		}
 		if (_webStarted)
 		{
 			enterPhase(Phase::LedBaseline, nowMs);
 			return;
 		}
-		std::cout << "\nLedCalib phase 2 (LED sweep): open the page fullscreen on the TV PC\n"
-					 "and tap 'begin' (the page will black out the TV)." << std::endl;
+		if (_web)
+			std::cout << "\nLedCalib phase 2 (LED sweep): open the page fullscreen on the TV PC\n"
+						 "and tap 'begin' (the page will black out the TV)." << std::endl;
+		else
+			std::cout << "\nLedCalib phase 2 (LED sweep): make sure the TV is black and press Enter\n"
+						 "(the LEDs are driven; only they should light the LED-ROI wall)." << std::endl;
 		_lastUrlPrintMs = nowMs;
 		break;
 	case Phase::LedBaseline:
@@ -962,7 +970,10 @@ void LedCalib::reportGammaLimits()
 	// the camera clips (pins near full scale) or crushes (sits in the dark floor),
 	// so a bad exposure / TV-brightness is caught HERE, before the long sweep.
 	const char *names[4] = {"R", "G", "B", "gray"};
-	const double full = _cfg.gammaRaw ? 1023.0 : 255.0;
+	// gamma_leds ignores --gamma-raw (always 8-bit ISP RGB), so its full scale
+	// must not follow the flag — same rule as writeGammaCsv's units line.
+	const bool ledsRun = (_cfg.phase == "gamma_leds");
+	const double full = (!ledsRun && _cfg.gammaRaw) ? 1023.0 : 255.0;
 	const double ceilNear = 0.96 * full; // a reading this high is almost certainly sensor clip
 	bool anyWarn = false;
 	for (int chan = 0; chan < 4; chan++)
@@ -1120,6 +1131,11 @@ void LedCalib::processRawFrame(const uint8_t *img, int width, int height, int st
 		}
 		enterPhase(_phase, nowMs);
 	}
+
+	// Release a deferred first-patch start (begin-tap fullscreen grace), same as
+	// processFrame — the raw stream is the only frame source in --gamma-raw, so
+	// without this tick the deferred Gamma phase would never fire.
+	tickStartDelay(nowMs);
 
 	const RoiSample meas = sampleRoiBayer(img, width, height, strideBytes, fourcc, _rawRoi);
 
