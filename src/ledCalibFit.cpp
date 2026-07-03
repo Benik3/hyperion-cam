@@ -544,11 +544,22 @@ namespace
 				maxAll = std::max(maxAll, s.led[c]);
 		if (maxAll < 245.0)
 			return; // nothing reached the sensor ceiling -> no clipping anywhere
-		constexpr double kEps = 2.5;   // readings within this of the ADC ceiling are pinned
-		constexpr int kPlateauMin = 5; // need a cluster at the ceiling, not a lone peak
+		constexpr double kEps = 2.5;	// readings within this of the ADC ceiling are pinned
+		constexpr double kOwnEps = 1.0; // ...but only if the channel itself reaches the ceiling
+		constexpr int kPlateauMin = 5;	// need a cluster at the ceiling, not a lone peak
 		const double ceiling = maxAll - kEps;
 		for (int c = 0; c < 3; c++)
 		{
+			// A clipped channel by definition attains the single ADC ceiling
+			// (maxAll). A soft-compressed channel whose plateau merely lands
+			// within kEps of another channel's pin (e.g. 252-253 vs a 254 pin)
+			// is still rising and must be kept, so require the channel's own
+			// max to reach the ceiling itself.
+			double ownMax = 0.0;
+			for (const auto &s : samples)
+				ownMax = std::max(ownMax, s.led[c]);
+			if (ownMax < maxAll - kOwnEps)
+				continue;
 			int nearCeil = 0;
 			for (const auto &s : samples)
 				if (s.led[c] >= ceiling)
@@ -1208,6 +1219,16 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 		clipOk = (ceil[2] > 0 && ceil[0] == 0 && ceil[1] == 0); // only blue pins at the sensor ceiling
 		std::cout << "Clip-detect selftest: ceilings R=" << ceil[0] << " G=" << ceil[1]
 				  << " B=" << ceil[2] << " -> " << (clipOk ? "PASS" : "FAIL") << std::endl;
+
+		// A soft plateau just under the pinned ceiling (many samples within kEps
+		// of blue's 254 pin, but never reaching it) must also be kept.
+		for (int i = 0; i < 40; i++)
+			cs[i].led[0] = std::min(252.5, i * 7.2);
+		detectClipCeilings(cs, ceil, clp);
+		const bool softOk = (ceil[0] == 0 && ceil[2] > 0);
+		clipOk = clipOk && softOk;
+		std::cout << "Clip-detect selftest (soft plateau near pin): R=" << ceil[0]
+				  << " B=" << ceil[2] << " -> " << (softOk ? "PASS" : "FAIL") << std::endl;
 	}
 
 	const bool pass = (p95 <= 2.0) && (mx <= 6.0) && (anchorErr <= 3.0) && clipOk;
