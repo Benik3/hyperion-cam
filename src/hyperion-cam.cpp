@@ -2920,7 +2920,7 @@ int main(int argc, char *argv[])
 		("calib-tv-grid", po::value<int>(&_ledCalibCfg.tvGrid)->default_value(6), "LED calib: TV patch cube grid points per axis (--calib-tv-web, 2-16)")											  //
 		("gamma-raw", po::bool_switch(&_ledCalibCfg.gammaRaw)->default_value(false), "LED calib (phase gamma): measure the raw Bayer stream instead of ISP RGB")										  //
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
-		("ledcalib-white-level", po::value<int>(&_ledCalibCfg.whiteLevel)->default_value(255), "LED calib (phase white): white level (1-255) driven to both the full-screen TV reference and the LEDs; 255=full white, e.g. 127 for a dimmer match")					  //
+		("ledcalib-white-level", po::value<int>(&_ledCalibCfg.whiteLevel)->default_value(127), "LED calib: reference white level (1-255). In phase white it drives both the full-screen TV reference and the LEDs; in the tv/led sweeps it is injected as a guaranteed neutral patch and becomes the fit's von-Kries white-anchor level. Default 127 (mid-gray, where the WB eye-match is most trustworthy); 255=full white")					  //
 		("shading-level", po::value<int>(&_ledCalibCfg.shadingLevel)->default_value(180), "LED calib (phase shading): safe gray code value for the full-TV field (avoid clip/ABL)")					  //
 		("shading-grid", po::value<std::string>(&_shadingGridStr)->default_value("24x14"), "LED calib (phase shading): sample grid across the TV as UxV")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
@@ -2932,7 +2932,8 @@ int main(int argc, char *argv[])
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
 		("lut-size", po::value<int>(&_ledCalibFitCfg.lutSize)->default_value(33), "LUT grid points per axis for --ledcalib-fit (2-65)")									  //
-		("calib-clip-level", po::value<double>(&_ledCalibFitCfg.clipLevel)->default_value(250.0), "--ledcalib-fit: camera reading >= this (per channel) = clipped; the white anchor uses the brightest unclipped neutral level")									  //
+		("calib-clip-level", po::value<double>(&_ledCalibFitCfg.clipLevel)->default_value(250.0), "--ledcalib-fit: camera reading >= this (per channel) = clipped; the white anchor uses the unclipped neutral nearest the anchor level")									  //
+		("calib-white-anchor-level", po::value<int>(&_ledCalibFitCfg.whiteAnchorLevel)->default_value(0), "--ledcalib-fit: neutral level to anchor the metameric white at (von-Kries gains computed here). 0=auto (use the sweeps' meta.json white_level, else 127); overrides at fit time")									  //
 		("calib-curve-floor", po::value<double>(&_ledCalibFitCfg.curveFloor)->default_value(0.05), "--ledcalib-fit: regularize each drive curve below this fraction of full output with a power law (fixes dark-tone crush/colour cast from camera floor noise); 0 disables");
 
 	std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on broken pipes

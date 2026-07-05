@@ -46,6 +46,7 @@ namespace
 		cv::Vec3d anchorTv{255, 255, 255};
 		cv::Vec3d anchorLed{255, 255, 255};
 		cv::Vec3d gains{1, 1, 1};
+		double anchorLevelTarget = 127; // neutral level to anchor the white at
 	};
 
 	// Monotone curve as a (level -> value) table with linear interpolation.
@@ -156,6 +157,18 @@ namespace
 		return std::sscanf(text.c_str() + k, "[ %lf , %lf , %lf", &out[0], &out[1], &out[2]) == 3;
 	}
 
+	bool jsonScalar(const std::string &text, const char *key, double &out)
+	{
+		const std::string needle = std::string("\"") + key + "\"";
+		std::size_t k = text.find(needle);
+		if (k == std::string::npos)
+			return false;
+		k = text.find(':', k);
+		if (k == std::string::npos)
+			return false;
+		return std::sscanf(text.c_str() + k + 1, " %lf", &out) == 1;
+	}
+
 	bool loadLedSweepCsv(const std::string &path, std::vector<SweepSample> &out)
 	{
 		std::ifstream f(path);
@@ -247,10 +260,14 @@ namespace
 		AllClipped
 	};
 
-	// HyperHDR-WB workflow: derive the von-Kries white from the brightest neutral
-	// level where NEITHER the TV nor the LED camera reading clips. The camera
-	// maxes below 255, and the TV or the LEDs can be the brighter side, so the
-	// true-white (255) point is often saturated -> use a dimmer clean white.
+	// HyperHDR-WB workflow: derive the von-Kries white from the neutral level
+	// closest to d.anchorLevelTarget (the --ledcalib-white-level the sweeps ran
+	// with, default mid-gray 127) at which NEITHER the TV nor the LED camera
+	// reading clips. Anchoring at the eye-match level — rather than the brightest
+	// clean level — computes the metameric gains where the WB eye-match is most
+	// trustworthy and where clipping is least likely; the sweeps inject that exact
+	// neutral so the TV side is a real patch, not interpolated. If the target level
+	// itself is clipped/absent we take the nearest clean neutral instead.
 	// doc/led-lut-calibration.md.
 	AnchorResult deriveAnchorFromSweeps(const std::string &dir, CalibData &d, double clip)
 	{
@@ -284,24 +301,42 @@ namespace
 		auto clipped = [&](const cv::Vec3d &v)
 		{ return v[0] >= clip || v[1] >= clip || v[2] >= clip; };
 
-		// Brightest neutral level (from the TV patches) with both sides clean.
-		std::sort(tvN.begin(), tvN.end(), [](auto &a, auto &b) { return a.first > b.first; });
+		// Clean neutral (both sides unclipped) nearest the target level. A hard
+		// floor of 32 keeps a noise-dominated dark patch from ever being the white
+		// reference even if it is the closest clean level to a very dim target.
+		constexpr double kMinAnchor = 32.0;
+		const double target = d.anchorLevelTarget;
+		bool found = false;
+		double bestDist = 1e18, bestL = 0;
+		cv::Vec3d bestTv, bestLed;
 		for (const auto &[L, tv] : tvN)
 		{
-			if (L < 64.0)
-				break; // too dark to be a usable white reference
+			if (L < kMinAnchor)
+				continue; // too dark to be a usable white reference
 			const cv::Vec3d led = ledAt(L);
 			if (clipped(tv) || clipped(led))
 				continue;
-			d.anchorDrive[0] = d.anchorDrive[1] = d.anchorDrive[2] = L;
-			d.anchorTv = tv;
-			d.anchorLed = led;
+			const double dist = std::fabs(L - target);
+			if (!found || dist < bestDist)
+			{
+				found = true;
+				bestDist = dist;
+				bestL = L;
+				bestTv = tv;
+				bestLed = led;
+			}
+		}
+		if (found)
+		{
+			d.anchorDrive[0] = d.anchorDrive[1] = d.anchorDrive[2] = bestL;
+			d.anchorTv = bestTv;
+			d.anchorLed = bestLed;
 			for (int c = 0; c < 3; c++)
-				d.gains[c] = led[c] > 1.0 ? tv[c] / led[c] : 1.0;
-			std::cout << "White anchor from sweeps at neutral level " << L
-					  << (L < 254.0 ? " (dimmer than 255 to avoid camera clipping)" : "") << ": "
-					  << "TV " << tv[0] << "," << tv[1] << "," << tv[2]
-					  << "  LED " << led[0] << "," << led[1] << "," << led[2]
+				d.gains[c] = bestLed[c] > 1.0 ? bestTv[c] / bestLed[c] : 1.0;
+			std::cout << "White anchor from sweeps at neutral level " << bestL
+					  << " (target " << target << (bestL != target ? ", nearest clean neutral" : "") << "): "
+					  << "TV " << bestTv[0] << "," << bestTv[1] << "," << bestTv[2]
+					  << "  LED " << bestLed[0] << "," << bestLed[1] << "," << bestLed[2]
 					  << "  gains " << d.gains[0] << "," << d.gains[1] << "," << d.gains[2] << std::endl;
 			return AnchorResult::Derived;
 		}
@@ -311,10 +346,22 @@ namespace
 		return AnchorResult::AllClipped;
 	}
 
-	bool loadCalibData(const std::string &dir, CalibData &d, double clip = 250.0)
+	bool loadCalibData(const std::string &dir, CalibData &d, double clip = 250.0, int anchorOverride = 0)
 	{
 		if (!loadLedSweepCsv(dir + "/led_sweep.csv", d.samples))
 			return false;
+
+		// White-anchor level: CLI override (>0) wins; else the level the sweeps
+		// recorded in meta.json; else the mid-gray default already in CalibData.
+		if (anchorOverride > 0)
+			d.anchorLevelTarget = anchorOverride;
+		else
+		{
+			std::string meta;
+			double wl = 0;
+			if (readFile(dir + "/meta.json", meta) && jsonScalar(meta, "white_level", wl) && wl > 0)
+				d.anchorLevelTarget = wl;
+		}
 
 		std::string txt;
 		if (readFile(dir + "/baseline.json", txt))
@@ -1046,7 +1093,7 @@ namespace
 int runLedCalibFit(const LedCalibFitConfig &cfg)
 {
 	CalibData data;
-	if (!loadCalibData(cfg.calibDir, data, cfg.clipLevel))
+	if (!loadCalibData(cfg.calibDir, data, cfg.clipLevel, cfg.whiteAnchorLevel))
 		return EXIT_FAILURE;
 	std::cout << "Loaded " << data.samples.size() << " LED sweep samples from " << cfg.calibDir << std::endl;
 
@@ -1133,8 +1180,9 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 	cfg.lutOut = dir + "/lut.cube";
 
 	CalibData data;
-	// Lower clip so the brightest clean neutral (the derived white anchor) lands
-	// interior to the gamut, not on the corner - a cleaner round-trip target.
+	// Lower clip so all neutral readings stay interior to the gamut. No meta.json
+	// here, so the white anchor falls to the default mid-gray target (127) — the
+	// synthetic gray ramp lands a clean neutral exactly there.
 	if (!loadCalibData(cfg.calibDir, data, 200.0))
 		return EXIT_FAILURE;
 	// White anchor now comes from the sweeps (deriveAnchorFromSweeps), exactly as

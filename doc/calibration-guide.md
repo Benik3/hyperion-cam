@@ -46,8 +46,9 @@ Set white in **HyperHDR's white balance** so the LED glow matches the TV white b
 where you fix bluish LEDs). It freezes into the LED sweep, so set it **before** measuring; the fit
 derives the white correction from the sweeps. `--ledcalib white` is an optional aid for this step —
 it drives the LEDs white (and shows a matching full-screen white reference on the TV) so you can
-eye-match in HyperHDR's white-balance settings; `--ledcalib-white-level N` (1-255, default 255) dims
-both the TV reference and the LEDs together (e.g. 127). It takes no ROI, measures nothing, and writes
+eye-match in HyperHDR's white-balance settings; `--ledcalib-white-level N` (1-255, **default 127** =
+mid-gray) sets the level driven to both the TV reference and the LEDs together. This same level is the
+fit's white anchor — eye-match WB at it. It takes no ROI, measures nothing, and writes
 no file (Enter/Accept exits).
 
 ### 0b. ROIs and aim
@@ -145,12 +146,14 @@ cat cal/fit_report.json              # rel_resid_p95 small (<0.10); note gamut %
 Reads `led_sweep.csv` + `baseline.json` + the **white point from `tv_sweep.csv`** (derives the
 von-Kries white from the sweeps = your HyperHDR WB). Writes `cal/lut.cube` + `cal/fit_report.json`.
 
-> **Clipping / white level.** If the LEDs are brighter than the TV (or vice-versa), true white
-> (255) can saturate the camera — and the camera maxes *below* 255 anyway (often ~252). The fit
-> auto-picks the **brightest neutral level where neither the TV nor LED reading clips**
-> (`--calib-clip-level`, default 250); it prints e.g. `White anchor from sweeps at neutral level
-> 204 (dimmer than 255 to avoid camera clipping)`. If it says *no unclipped neutral level found*,
-> lower the brighter side (TV backlight or LED max) so white isn't blown out, and re-measure.
+> **White anchor level / clipping.** The fit anchors the von-Kries white at the **white-anchor
+> neutral level** — the `--ledcalib-white-level` the sweeps ran with (recorded in `meta.json`,
+> default mid-gray **127**), i.e. where you eye-matched WB. It prints e.g. `White anchor from sweeps
+> at neutral level 127 (target 127)`. Override with `--calib-white-anchor-level N`. If that level
+> happens to clip the camera (readings ≥ `--calib-clip-level`, default 250 — the camera maxes *below*
+> 255, often ~252, so a bright anchor can saturate), the fit falls back to the nearest clean neutral
+> and notes it. If it says *no unclipped neutral level found*, lower the brighter side (TV backlight
+> or LED max) so white isn't blown out, and re-measure.
 
 ---
 

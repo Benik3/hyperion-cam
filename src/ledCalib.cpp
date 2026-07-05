@@ -31,6 +31,18 @@ namespace
 		return static_cast<uint8_t>(std::lround(255.0 * t));
 	}
 
+	// Append a {L,L,L} neutral to a sweep plan unless it is already present, so a
+	// chosen reference level is a real measured point independent of grid parity.
+	void ensureNeutral(std::vector<std::array<uint8_t, 3>> &plan, int level)
+	{
+		const uint8_t L = static_cast<uint8_t>(std::clamp(level, 0, 255));
+		const std::array<uint8_t, 3> n = {L, L, L};
+		for (const auto &e : plan)
+			if (e == n)
+				return;
+		plan.push_back(n);
+	}
+
 	int64_t steadyMs()
 	{
 		return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -720,6 +732,9 @@ void LedCalib::buildLedPlan()
 				d[c] = edgeLevel(i, a);
 				_ledPlan.push_back(d);
 			}
+	// Guarantee the white-anchor neutral is a measured LED sample regardless of
+	// grid/ramp granularity, so the fit reads it directly instead of interpolating.
+	ensureNeutral(_ledPlan, _cfg.whiteLevel);
 }
 
 void LedCalib::buildTvPlan()
@@ -730,6 +745,10 @@ void LedCalib::buildTvPlan()
 		for (int gg = 0; gg < g; gg++)
 			for (int b = 0; b < g; b++)
 				_tvPlan.push_back({edgeLevel(r, g), edgeLevel(gg, g), edgeLevel(b, g)});
+	// The fit anchors the metameric white at the reference level (--ledcalib-white-
+	// level); the TV side is not interpolated, so that neutral must be an actual
+	// measured patch here whatever the grid parity/size is.
+	ensureNeutral(_tvPlan, _cfg.whiteLevel);
 }
 
 void LedCalib::showTvPatch(int64_t nowMs)
@@ -1467,6 +1486,7 @@ void LedCalib::writeMeta()
 	f << "  \"led_roi\": [" << _cfg.ledRoi.x << ", " << _cfg.ledRoi.y << ", " << _cfg.ledRoi.w << ", " << _cfg.ledRoi.h << "],\n";
 	f << "  \"led_grid\": " << _cfg.ledGrid << ",\n";
 	f << "  \"led_gray_ramp\": " << _cfg.ledGrayRamp << ",\n";
+	f << "  \"white_level\": " << _cfg.whiteLevel << ",\n";
 	f << "  \"tv_patch_count\": " << (_cfg.tvGrid * _cfg.tvGrid * _cfg.tvGrid) << ",\n";
 	f << "  \"tv_patches_measured\": " << _tvRecords.size() << ",\n";
 	f << "  \"measure_frames\": " << _cfg.measureFrames << ",\n";

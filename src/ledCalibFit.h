@@ -25,6 +25,11 @@ struct LedCalibFitConfig
 	// above. Removes the monotonize() plateaus that cause dark-grey crush + colour
 	// cast. 0 disables (use the raw measured bottom). doc/led-lut-calibration.md.
 	double curveFloor = 0.05;
+	// Neutral level at which the von-Kries metameric white is anchored (the fit
+	// computes gains cam_tv_white/cam_led_white here). 0 = auto: use the sweep's
+	// meta.json "white_level" (the --ledcalib-white-level the sweeps ran with),
+	// falling back to 127. Set >0 to override at fit time. doc/led-lut-calibration.md.
+	int whiteAnchorLevel = 0;
 	bool verbose = false;
 };
 

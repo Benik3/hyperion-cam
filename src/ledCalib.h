@@ -54,9 +54,15 @@ struct LedCalibConfig
 	// TV-patch display is web-only.
 	bool tvWeb = false; // drive the TV via the browser page
 	int tvGrid = 6;		// TV patch cube grid points per axis
-	// Manual white-balance phase ("white"): the level driven to BOTH the full-
-	// screen TV reference and the LEDs (then nudgeable). 255 = full white.
-	int whiteLevel = 255;
+	// Reference white level for the whole calibration. In the manual "white"
+	// phase it is the level driven to BOTH the full-screen TV reference and the
+	// LEDs (then nudgeable). It is ALSO injected as a guaranteed neutral patch
+	// into the tv/led sweeps and becomes the fit's von-Kries white anchor level
+	// (see writeMeta + ledCalibFit deriveAnchorFromSweeps), so the metameric
+	// white correction is computed where the eye white-balance was matched.
+	// Default 127 (mid-gray) — where the WB eye-match is most trustworthy and
+	// clipping least likely; 255 = full white.
+	int whiteLevel = 127;
 	// Configured window-patch geometry for the measurement sweeps. The Phase 0
 	// white field overrides this to fullscreen; the sweeps restore it.
 	double patchPct = 10.0;

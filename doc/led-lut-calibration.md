@@ -191,10 +191,15 @@ correction than the diagonal white (multiple TV/LED correspondences → a 3×3).
 
 There is **no `all` phase**: run `--ledcalib tv` (cropped+shaded) and `--ledcalib led` (full frame)
 separately into the same `--calib-out`. `--ledcalib-fit` **derives** the von-Kries white from the
-sweep white points — `cam_tv_white / cam_led_white` at the
-**brightest neutral level where neither side clips the camera** (`--calib-clip-level`, default 250;
-the camera maxes below 255 and the TV or LEDs may be the brighter side, so true-255 white often
-saturates → a dimmer clean neutral is used, with the LED side interpolated to that level). The eye-truth comes from
+sweep white points — `cam_tv_white / cam_led_white` at the **white-anchor neutral level**: by
+default the `--ledcalib-white-level` the sweeps ran with (recorded in `meta.json`, default mid-gray
+**127**), i.e. *the level where you eye-matched WB* — not the brightest clean level, because the
+metameric gains are one per-channel scalar applied across the whole LUT and are most trustworthy where
+the eye-match was done, and 127 also stays clear of camera clipping. `--calib-white-anchor-level N`
+overrides at fit time. The sweeps inject that exact neutral into both tv and led plans so the TV side
+is a real measured patch (the TV reading is not interpolated); the LED side is interpolated to the
+level if needed. If the target level clips the camera (`--calib-clip-level`, default 250) the fit
+falls back to the nearest clean neutral. The eye-truth comes from
 **HyperHDR's white balance** (set it to match the LED white to the TV white before measuring —
 e.g. to pull down bluish LEDs). The TV and LED can't
 share a frame anyway (cropped TV vs full-frame wall). **Timing rule:** HyperHDR WB (and all HyperHDR
