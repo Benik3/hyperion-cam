@@ -48,8 +48,12 @@ public:
 	/// patch needs a fresh ack; pass the same seq to merely update the overlay
 	/// (e.g. nudge feedback) without expecting a new ack. showControls draws
 	/// the Phase 0 nudge UI and the led* values.
+	/// patchTotal > 0 makes the corner status line report the LED drive and
+	/// progress (`LED idx/total: r,g,b`) instead of the patch colour — used by
+	/// the LED-driven sweeps, where the page itself stays black.
 	void setState(uint8_t r, uint8_t g, uint8_t b, bool showControls,
-				  uint8_t ledR, uint8_t ledG, uint8_t ledB, uint32_t seq);
+				  uint8_t ledR, uint8_t ledG, uint8_t ledB, uint32_t seq,
+				  uint32_t patchIdx = 0, uint32_t patchTotal = 0);
 
 	/// Highest seq the page has confirmed painting (0 = none yet).
 	uint32_t ackedSeq() const;

@@ -178,7 +178,10 @@ es.onmessage=ev=>{
     document.getElementById('dg').textContent=s.lg;
     document.getElementById('db').textContent=s.lb;}
   else ui.classList.remove('on');
-  st.textContent=s.seq+': '+s.r+', '+s.g+', '+s.b;
+  // LED-driven sweeps keep the page black; show the LED drive + patch progress
+  // rather than the (always 0,0,0) patch colour.
+  st.textContent = s.pn>0 ? 'LED '+s.pi+'/'+s.pn+':  '+s.lr+', '+s.lg+', '+s.lb
+                          : s.seq+': '+s.r+', '+s.g+', '+s.b;
   if(s.seq!==lastSeq){ lastSeq=s.seq;
     requestAnimationFrame(()=>requestAnimationFrame(()=>{
       fetch('/ack?n='+s.seq,{method:'POST'}).catch(()=>{});
@@ -231,6 +234,7 @@ struct LedCalibWeb::Impl
 	uint8_t led[3] = {0, 0, 0};
 	bool controls = false;
 	uint32_t seq = 0;
+	uint32_t patchIdx = 0, patchTotal = 0; // >0 total: show LED drive + progress
 	bool dirty = true;
 	double wp = 100.0, wx = -1.0, wy = -1.0; // window-patch geometry (% / %pos)
 	bool clean = false;						 // hide keep-alive + status (shading)
@@ -260,12 +264,12 @@ struct LedCalibWeb::Impl
 	std::string buildSseData()
 	{
 		std::lock_guard<std::mutex> lk(sm);
-		char buf[256];
+		char buf[320];
 		std::snprintf(buf, sizeof(buf),
 					  "data: {\"r\":%d,\"g\":%d,\"b\":%d,\"seq\":%u,\"controls\":%s,\"lr\":%d,\"lg\":%d,\"lb\":%d,"
-					  "\"wp\":%.3f,\"wx\":%.3f,\"wy\":%.3f,\"clean\":%s}\n\n",
+					  "\"wp\":%.3f,\"wx\":%.3f,\"wy\":%.3f,\"clean\":%s,\"pi\":%u,\"pn\":%u}\n\n",
 					  color[0], color[1], color[2], seq, controls ? "true" : "false",
-					  led[0], led[1], led[2], wp, wx, wy, clean ? "true" : "false");
+					  led[0], led[1], led[2], wp, wx, wy, clean ? "true" : "false", patchIdx, patchTotal);
 		return buf;
 	}
 };
@@ -473,7 +477,8 @@ void LedCalibWeb::setPatchGeometry(double pct, double x, double y)
 }
 
 void LedCalibWeb::setState(uint8_t r, uint8_t g, uint8_t b, bool showControls,
-						   uint8_t ledR, uint8_t ledG, uint8_t ledB, uint32_t seq)
+						   uint8_t ledR, uint8_t ledG, uint8_t ledB, uint32_t seq,
+						   uint32_t patchIdx, uint32_t patchTotal)
 {
 	std::lock_guard<std::mutex> lk(_d->sm);
 	_d->color[0] = r;
@@ -484,6 +489,8 @@ void LedCalibWeb::setState(uint8_t r, uint8_t g, uint8_t b, bool showControls,
 	_d->led[2] = ledB;
 	_d->controls = showControls;
 	_d->seq = seq;
+	_d->patchIdx = patchIdx;
+	_d->patchTotal = patchTotal;
 	_d->dirty = true;
 }
 

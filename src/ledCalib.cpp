@@ -327,13 +327,25 @@ void LedCalib::setLed(uint8_t r, uint8_t g, uint8_t b, int64_t nowMs)
 	_lastSendMs = nowMs;
 	if (_sendLed)
 		_sendLed(r, g, b);
-	// Keep the Phase 0 page overlay in sync with the LED drive (same seq: no
-	// new ack needed, just a display refresh). The TV reference holds at the
-	// configured white level; r,g,b is the (nudgeable) LED-drive preview.
+	// Keep the page overlay in sync with the LED drive (same seq: no new ack
+	// needed, just a display refresh).
 	if (_web && _phase == Phase::White)
 	{
+		// The TV reference holds at the configured white level; r,g,b is the
+		// (nudgeable) LED-drive preview.
 		const uint8_t w = static_cast<uint8_t>(_cfg.whiteLevel);
 		_web->setState(w, w, w, true, r, g, b, _webSeq);
+	}
+	else if (_web && _phase == Phase::LedSweep)
+	{
+		// Page stays black; show the LED drive + progress in the corner status.
+		_web->setState(0, 0, 0, false, r, g, b, _webSeq,
+					   static_cast<uint32_t>(_ledPlanPos) + 1, static_cast<uint32_t>(_ledPlan.size()));
+	}
+	else if (_web && _phase == Phase::GammaLeds)
+	{
+		_web->setState(0, 0, 0, false, r, g, b, _webSeq,
+					   static_cast<uint32_t>(_gammaPos) + 1, static_cast<uint32_t>(_gammaPlan.size()));
 	}
 }
 
