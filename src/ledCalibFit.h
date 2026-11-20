@@ -12,7 +12,7 @@ struct LedCalibFitConfig
 {
 	std::string calibDir = "ledcalib-out"; // input: led_sweep.csv, tv_sweep.csv, baseline.json
 	std::string lutOut;					   // output .cube path (default <calibDir>/lut.cube)
-	int lutSize = 33;					   // LUT grid per axis (trilinear runtime -> use dense grid)
+	int lutSize = 65;					   // LUT grid per axis (trilinear runtime -> use dense grid)
 	// Camera-clipping threshold: a reading >= this (per channel) is treated as
 	// clipped/saturated. The white anchor uses the brightest neutral level where
 	// neither the TV nor the LED reading clips (the camera maxes below 255, and
@@ -36,8 +36,12 @@ struct LedCalibFitConfig
 	std::string response = "auto";
 	// Soft knee: "auto" (start at 85% of full LED output), "off", or the start in %.
 	std::string knee = "auto";
-	// Dark fallback floor (encoded camera luma): "auto" (TV black + one LUT step), "off", or a level.
+	// Dark fallback floor (encoded camera units, brightest channel): "auto" (TV
+	// black + 8 codes), "off", or a level.
 	std::string darkFloor = "auto";
+	// Round-off-aware dark end (snap dark nodes to whole LED drive steps measured
+	// from the sweep's low ramp): "auto" (when the staircase is resolved), "on", "off".
+	std::string darkQuant = "auto";
 	bool verbose = false;
 };
 

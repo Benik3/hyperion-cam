@@ -2,6 +2,7 @@
 #define __TUNING_H__
 
 #include <string>
+#include <vector>
 
 // Frozen libcamera (Raspberry Pi IPA) tuning file for the calibrated LUT path
 // (--make-tuning / --tuning). doc/led-lut-calibration.md, "Frozen tuning file".
@@ -38,6 +39,11 @@ std::string findSystemTuningFile(const std::string &sensorModel);
 
 /// Write the frozen tuning file. Returns a process exit code.
 int runMakeTuning(const MakeTuningConfig &cfg);
+
+/// Linear light (0..1, pre-gamma ISP units) for ISP output codes 0..255 under
+/// the tone curve of a tuning file, as the hardware realises it (vc4: the
+/// curve sampled on its 33 knots, linear between). False if unreadable.
+bool loadTuningToneCurve(const std::string &path, std::vector<double> &linOfCode);
 
 /// FNV-1a 64 hex digest of a file ("" if unreadable) - provenance in meta_*.json.
 std::string fileHash(const std::string &path);

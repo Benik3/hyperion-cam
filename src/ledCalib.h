@@ -69,6 +69,7 @@ struct LedCalibConfig
 	int ledGrid = 8;		   // LED sweep cube grid points per axis
 	int ledGrayRamp = 17;	   // extra gray ramp steps in the LED sweep
 	int ledAxisSteps = 24;	   // extra per-channel axis ramp, edge-dense near 0/255 (0 = off)
+	int ledLowMax = 96;		   // per-channel ramp over every code 1..N: the LED chain's drive staircase (0 = off)
 	int measureFrames = 10;	   // frames averaged per measurement
 	// Settle before each measurement. Short because nothing slow has to converge:
 	// exposure/gain/AWB are locked, and HyperHDR LED smoothing must be DISABLED
@@ -212,6 +213,7 @@ private:
 		double satSum[kSlots][3] = {};
 		double expSum = 0.0; // per-frame reported exposure (us), averaged
 		double gainSum = 0.0;
+		double dgainSum = 0.0; // ISP digital gain (exposure-quantisation compensation)
 
 		void start(int frames);
 		void add(const RoiSample &tv, const RoiSample &led); // ISP slots only
@@ -222,6 +224,7 @@ private:
 					double sat[kSlots][3] = nullptr);
 		double exposureUs() const { return n ? expSum / n : 0.0; }
 		double analogueGain() const { return n ? gainSum / n : 0.0; }
+		double digitalGain() const { return n ? dgainSum / n : 0.0; }
 	};
 
 	struct SweepRecord
@@ -235,6 +238,7 @@ private:
 		double windowPct = 0.0;		 // TV patch area % (tv-raw)
 		double exposureUs = 0.0;	 // measured (metadata) exposure
 		double analogueGain = 0.0;
+		double digitalGain = 0.0;	   // ISP digital gain (the RAW frame does not see it)
 		double targetExposureUs = 0.0; // response phase: commanded exposure
 		int64_t tMs = 0;			   // response phase: time since phase start
 		int frames = 0;

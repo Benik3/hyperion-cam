@@ -39,17 +39,38 @@ struct CameraResponse
 	int series = 0;
 	int samples = 0;
 	int zMin = 0, zMax = 255; // code range actually covered by data
+	int spliceBelow = 0;	  // > 0: below this code the tuning curve's shape (no data there)
 
 	double eval(double z) const;	 // encoded 0..255 -> relative linear
 	double invert(double l) const; // relative linear -> encoded 0..255
 };
 
+/// What is known about the ISP state the sweep ran under (meta_response.json).
+struct ResponseHints
+{
+	// Tone curve of the tuning file in effect (linear light per ISP code
+	// 0..255): the smoothness prior of the fit (else a pure 2.2 power). The
+	// frozen "power" curve is LINEAR below code ~38 (vc4's first knot segment),
+	// so a power prior is wrong exactly where the dark end has the least data.
+	std::vector<double> priorLin;
+	// Inverse colour matrix in effect: with priorLin it reconstructs the
+	// pre-matrix value, so samples clipped at the ISP's colour-gain stage (which
+	// the RAW and the post-matrix readings can't show) are dropped.
+	bool haveCcm = false;
+	double ccmInv[9] = {};
+	std::string tuningFile;
+};
+
+/// Hints from a phase meta file (tuning_file + frame.ccm). Missing parts stay empty.
+bool loadResponseHints(const std::string &metaPath, ResponseHints &out);
+
 /// Recover the tone curve from camera_response.csv. Prints details if verbose.
-bool fitCameraResponse(const std::string &csvPath, CameraResponse &out, bool verbose);
+bool fitCameraResponse(const std::string &csvPath, CameraResponse &out, bool verbose,
+					   const ResponseHints *hints = nullptr);
 
 /// Fit + print the verdict the response phase reports (curve shape, fit
 /// residual = frozen-ISP check, source drift). False only if no curve could be
 /// recovered; a suspicious curve is a loud WARNING, not a failure.
-bool ledCalibCheckResponse(const std::string &csvPath, bool verbose);
+bool ledCalibCheckResponse(const std::string &csvPath, bool verbose, const ResponseHints *hints = nullptr);
 
 #endif /* __CAMERA_RESPONSE_H__ */

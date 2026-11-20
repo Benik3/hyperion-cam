@@ -155,6 +155,27 @@ namespace
 		return x;
 	}
 
+	// Adaptive ISP stages still enabled in a tuning (empty = frozen): contrast
+	// enhancement and ALSC iterations change the camera's response with the scene.
+	std::string adaptiveStagesOf(const json::value &root)
+	{
+		json::value &r = const_cast<json::value &>(root);
+		std::string what;
+		if (const json::object *c = findAlgo(r, "rpi.contrast"))
+		{
+			auto it = c->find("ce_enable");
+			if (it == c->end() || num(it->value()) != 0.0) // libcamera default: enabled
+				what += "contrast enhancement (ce_enable)";
+		}
+		if (const json::object *a = findAlgo(r, "rpi.alsc"))
+		{
+			auto it = a->find("n_iter");
+			if (it == a->end() || num(it->value()) != 0.0) // libcamera default: 8
+				what += std::string(what.empty() ? "" : " + ") + "adaptive lens shading (alsc n_iter)";
+		}
+		return what;
+	}
+
 	// Piecewise-linear tone curve (x,y in 0..1) from a gamma_curve array.
 	struct ToneCurve
 	{
@@ -284,6 +305,18 @@ namespace
 				std::cout << "ERROR: no gamma_curve in the tuning used for tv-raw" << std::endl;
 				return false;
 			}
+			// The per-channel ISP gain below is fitted from the tv-raw ISP readings
+			// decoded with this static curve: an adaptive tuning (stock: contrast
+			// enhancement + ALSC iterations) biases it by a few %, and production
+			// (frozen) will not reproduce that state.
+			const std::string adaptive = adaptiveStagesOf(*src);
+			if (!adaptive.empty())
+				std::cout << "WARNING: tv-raw ran under a tuning with " << adaptive
+						  << " enabled (" << (tf.empty() ? "the stock file" : tf)
+						  << "); the ISP readings the matrix is fitted to were scene-adaptive. Rerun tv-raw under "
+							 "an interim frozen tuning (--make-tuning interim.json without --from-calib, then "
+							 "--tuning interim.json --saturation 1)."
+						  << std::endl;
 		}
 
 		std::vector<TvPatch> patches;
@@ -329,7 +362,9 @@ namespace
 				if (p->rawSat[c] > 0.01)
 				{
 					std::cout << "ERROR: the TV patch " << p->rgb[0] << "," << p->rgb[1] << "," << p->rgb[2]
-							  << " clips the SENSOR (RAW). Lower --gain and rerun tv-raw." << std::endl;
+							  << " clips the SENSOR (RAW). Shorten the shutter (-s; the gain is already at the "
+								 "sensor minimum) and rerun tv-raw."
+							  << std::endl;
 					return false;
 				}
 		// The matrix is fitted on the light exactly as the ISP will see it (TV
@@ -407,41 +442,72 @@ namespace
 		for (int r = 0; r < 3; r++)
 			for (int c = 0; c < 3; c++)
 				Q(r, c) *= wbv[c];
-		std::vector<double> Arows, brows;
-		int nEq = 0;
-		for (const auto &p : patches)
+		// The ISP applies the colour gains (x digital gain x lens shading) BEFORE
+		// the matrix and clips there at full scale: with -b 2.6,1.6 a TV red
+		// saturates the ISP's red at ~38% of the sensor range, invisible to the
+		// sensor-clip check and to the post-matrix readings. Pre-matrix value of
+		// raw channel c: wb*dg*a*raw. Patches clipped there are dropped from the
+		// fit (one refit), and a clipped peak / bright patch is reported.
+		auto preCcm = [&](const TvPatch &p, int c) { return wbv[c] * out.alsc[c] * p.raw[c]; };
+		auto preClipped = [&](const TvPatch &p)
+		{ return std::max({preCcm(p, 0), preCcm(p, 1), preCcm(p, 2)}) > 0.97; };
+		bool haveA = false;
+		for (int pass = 0; pass < 2; pass++)
 		{
-			if (p.peak)
-				continue;
-			for (int r = 0; r < 3; r++)
+			std::vector<double> Arows, brows;
+			int nEq = 0;
+			for (const auto &p : patches)
 			{
-				if (p.isp[r] < 40.0 || p.isp[r] > 200.0)
+				if (p.peak || (haveA && preClipped(p)))
 					continue;
-				for (int c = 0; c < 3; c++)
-					Arows.push_back(Q(r, c) * p.raw[c]);
-				brows.push_back(curve.inverse(p.isp[r] / 255.0));
-				nEq++;
-			}
-		}
-		if (nEq >= 6)
-		{
-			cv::Mat A(nEq, 3, CV_64F, Arows.data()), b(nEq, 1, CV_64F, brows.data()), a;
-			if (cv::solve(A, b, a, cv::DECOMP_SVD))
-			{
-				for (int c = 0; c < 3; c++)
-					out.alsc[c] = a.at<double>(c);
-				cv::Mat r = A * a - b;
-				double ss = 0.0, sb = 0.0;
-				for (int i = 0; i < nEq; i++)
+				for (int r = 0; r < 3; r++)
 				{
-					ss += r.at<double>(i) * r.at<double>(i);
-					sb += b.at<double>(i) * b.at<double>(i);
+					if (p.isp[r] < 40.0 || p.isp[r] > 200.0)
+						continue;
+					for (int c = 0; c < 3; c++)
+						Arows.push_back(Q(r, c) * p.raw[c]);
+					brows.push_back(curve.inverse(p.isp[r] / 255.0));
+					nEq++;
 				}
-				out.alscResid = std::sqrt(ss / std::max(sb, 1e-12));
 			}
+			if (nEq < 6)
+			{
+				std::cout << "WARNING: too few mid-range TV patches to measure the ISP gain; assuming 1" << std::endl;
+				break;
+			}
+			cv::Mat A(nEq, 3, CV_64F, Arows.data()), b(nEq, 1, CV_64F, brows.data()), a;
+			if (!cv::solve(A, b, a, cv::DECOMP_SVD))
+				break;
+			for (int c = 0; c < 3; c++)
+				out.alsc[c] = a.at<double>(c);
+			cv::Mat r = A * a - b;
+			double ss = 0.0, sb = 0.0;
+			for (int i = 0; i < nEq; i++)
+			{
+				ss += r.at<double>(i) * r.at<double>(i);
+				sb += b.at<double>(i) * b.at<double>(i);
+			}
+			out.alscResid = std::sqrt(ss / std::max(sb, 1e-12));
+			haveA = true;
+			bool any = false;
+			for (const auto &p : patches)
+				any = any || (!p.peak && preClipped(p));
+			if (!any)
+				break; // nothing to drop: the first fit stands
 		}
-		else
-			std::cout << "WARNING: too few mid-range TV patches to measure the ISP gain; assuming 1" << std::endl;
+		if (haveA)
+		{
+			int nPre = 0;
+			for (const auto &p : patches)
+				if (!p.peak && preClipped(p))
+					nPre++;
+			if (nPre > 0)
+				std::cout << "WARNING: " << nPre << " TV patches clip the ISP's colour-gain stage (before the "
+						  << "matrix; colour gains " << out.wb[0] << "," << out.wb[1]
+						  << "). Rerun tv-raw with -b 1,1: the fitted matrix absorbs the gains, so the ISP then "
+							 "clips only where the sensor does."
+						  << std::endl;
+		}
 		for (int c = 0; c < 3; c++)
 			if (!(out.alsc[c] > 0.05 && out.alsc[c] < 50.0))
 			{
@@ -457,8 +523,13 @@ namespace
 		const cv::Vec3d peakM = M2 * (pk->raw - black);
 		out.scale = cfg.peakTarget / std::max({peakM[0], peakM[1], peakM[2], 1e-9});
 		if (pk->rawSat[0] > 0.01 || pk->rawSat[1] > 0.01 || pk->rawSat[2] > 0.01)
-			std::cout << "WARNING: the peak-white window clips the SENSOR; highlights will still clip. Lower --gain "
-						 "and rerun tv-raw." << std::endl;
+			std::cout << "WARNING: the peak-white window clips the SENSOR; highlights will still clip. Shorten the "
+						 "shutter (-s) and rerun tv-raw."
+					  << std::endl;
+		else if (haveA && preClipped(*pk))
+			std::cout << "WARNING: the peak-white window clips the ISP's colour-gain stage (pre-matrix "
+					  << preCcm(*pk, 0) << "," << preCcm(*pk, 1) << "," << preCcm(*pk, 2)
+					  << " of full scale): the 95% peak target is unreachable. Rerun tv-raw with -b 1,1." << std::endl;
 
 		// ISP-linear = CCMnew * diag(wb*dg) * diag(a) * raw  ==  scale * M2 * raw
 		cv::Matx33d S = cv::Matx33d::zeros();
@@ -504,6 +575,32 @@ std::string fileHash(const std::string &path)
 	char buf[17];
 	std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
 	return buf;
+}
+
+bool loadTuningToneCurve(const std::string &path, std::vector<double> &linOfCode)
+{
+	linOfCode.clear();
+	json::value root;
+	if (path.empty() || !parseJsonFile(path, root))
+		return false;
+	ToneCurve tc;
+	if (!tc.load(findAlgo(root, "rpi.contrast")))
+		return false;
+	// vc4 evaluates the curve at its 33 hardware knots and interpolates linearly
+	// between them; pisp resamples finely (~ the curve's own PWL).
+	ToneCurve hw;
+	if (platformDir() == "vc4")
+		for (int k : curveKnots())
+		{
+			hw.x.push_back(k / 65535.0);
+			hw.y.push_back(tc.forward(k / 65535.0));
+		}
+	else
+		hw = tc;
+	linOfCode.resize(256);
+	for (int z = 0; z < 256; z++)
+		linOfCode[z] = std::clamp(hw.inverse(z / 255.0), 0.0, 1.0);
+	return linOfCode[255] > 0.0;
 }
 
 int runMakeTuning(const MakeTuningConfig &cfg)
@@ -605,8 +702,8 @@ int runMakeTuning(const MakeTuningConfig &cfg)
 				  << "    stock matrix pushed " << fit.negBefore << " bright TV patches to 0 in some channel; the new "
 				  << "matrix keeps every measured patch >= 0.5% of its brightest channel" << std::endl;
 		if (maxCoef > 7.9)
-			std::cout << "WARNING: matrix coefficient " << maxCoef << " is beyond the ISP's range; lower --gain "
-						 "instead of relying on matrix gain." << std::endl;
+			std::cout << "WARNING: matrix coefficient " << maxCoef << " is beyond the ISP's range (+-8); lengthen "
+						 "the shutter instead of relying on matrix gain." << std::endl;
 	}
 	std::cout << "  rpi.ccm: " << ccmDesc << std::endl;
 
@@ -657,6 +754,12 @@ int runMakeTuning(const MakeTuningConfig &cfg)
 				  << "(the matrix already contains the colour gains and the saturation; a different -b or\n"
 				  << " --saturation would be applied ON TOP of it). Then re-measure shading, response, tv, led."
 				  << std::endl;
+		if (std::fabs(fit.wb[0] - 1.0) > 1e-3 || std::fabs(fit.wb[1] - 1.0) > 1e-3)
+			std::cout << "NOTE: tv-raw ran with colour gains " << fit.wb[0] << "," << fit.wb[1]
+					  << ". The ISP applies them BEFORE the matrix and clips there, so anything redder/bluer than "
+						 "white (e.g. the LED glow) saturates long before the sensor does. Prefer rerunning tv-raw "
+						 "with -b 1,1 (the matrix then carries the gains)."
+					  << std::endl;
 	}
 	else
 		std::cout << "\nUse it with --tuning " << cfg.outPath

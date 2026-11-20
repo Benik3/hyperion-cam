@@ -3062,6 +3062,7 @@ int main(int argc, char *argv[])
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
 		("ledcalib-led-grid", po::value<int>(&_ledCalibCfg.ledGrid)->default_value(8), "LED calib: LED sweep cube grid points per axis (2-16)")																									  //
 		("ledcalib-led-axis-steps", po::value<int>(&_ledCalibCfg.ledAxisSteps)->default_value(24), "LED calib: extra per-channel axis ramp, edge-dense near 0/255 for clip/crush resolution (0=off, else 4-64)")									  //
+		("ledcalib-led-low-max", po::value<int>(&_ledCalibCfg.ledLowMax)->default_value(96), "LED calib: per-channel ramp over EVERY code 1..N, to measure the LED chain's whole drive steps for the round-off-aware dark end of --ledcalib-fit (0=off, else 24-160)")	  //
 		("ledcalib-frames", po::value<int>(&_ledCalibCfg.measureFrames)->default_value(10), "LED calib: frames averaged per measurement")																										  //
 		("ledcalib-settle-ms", po::value<int>(&_ledCalibCfg.settleMs)->default_value(100), "LED calib: settle before each measurement (exposure locked + HyperHDR LED smoothing must be OFF, so this only covers panel/LED + pipeline; every measurement also waits >=3 fresh frames after the patch/drive change)")									  //
 		("calib-start-delay-ms", po::value<int>(&_ledCalibCfg.startDelayMs)->default_value(5000), "Calib (web): hold the first patch this long after 'begin' so the browser's fullscreen prompt clears (0=off; --ledcalib + web autocalib)")									  //
@@ -3088,11 +3089,12 @@ int main(int argc, char *argv[])
 		("from-calib", po::value<std::string>(&_makeTuningCfg.fromCalib), "--make-tuning: calib dir with tv_raw.csv (--ledcalib tv-raw) -> fit the colour matrix to the TV")								  //
 		("calib-response", po::value<std::string>(&_ledCalibFitCfg.response)->default_value("auto"), "--ledcalib-fit camera model: auto (measured tone curve from camera_response.csv + LEDs on RAW if present), on (require), off (legacy power law)")	  //
 		("calib-knee", po::value<std::string>(&_ledCalibFitCfg.knee)->default_value("auto"), "--ledcalib-fit soft knee: auto (start at 85% of full LED output), off, or the start in percent (50-99)")							  //
-		("calib-dark-floor", po::value<std::string>(&_ledCalibFitCfg.darkFloor)->default_value("auto"), "--ledcalib-fit dark fallback: below this camera luma blend to neutral equal drive; auto (TV black + 8 codes), off, or a level")		  //
+		("calib-dark-floor", po::value<std::string>(&_ledCalibFitCfg.darkFloor)->default_value("auto"), "--ledcalib-fit dark fallback: inputs with every channel below this camera level blend to the eye-matched white; auto (TV black + 8 codes), off, or a level")		  //
+		("calib-dark-quant", po::value<std::string>(&_ledCalibFitCfg.darkQuant)->default_value("auto"), "--ledcalib-fit round-off-aware dark end: snap dark LUT nodes to whole LED drive steps measured by the led sweep's low ramp; auto (when resolved), on, off")	  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
-		("lut-size", po::value<int>(&_ledCalibFitCfg.lutSize)->default_value(33), "LUT grid points per axis for --ledcalib-fit (2-65)")									  //
+		("lut-size", po::value<int>(&_ledCalibFitCfg.lutSize)->default_value(65), "LUT grid points per axis for --ledcalib-fit (2-65; 65 costs the same as 33 on the GPU and halves the gray-axis interpolation error)")									  //
 		("calib-clip-level", po::value<double>(&_ledCalibFitCfg.clipLevel)->default_value(250.0), "--ledcalib-fit: camera reading >= this (per channel) = clipped; the white anchor uses the unclipped neutral nearest the anchor level")									  //
 		("calib-white-anchor-level", po::value<int>(&_ledCalibFitCfg.whiteAnchorLevel)->default_value(0), "--ledcalib-fit: neutral level to anchor the metameric white at (von-Kries gains computed here). 0=auto (use the sweeps' meta.json white_level, else 127); overrides at fit time")									  //
 		("calib-curve-floor", po::value<double>(&_ledCalibFitCfg.curveFloor)->default_value(0.05), "--ledcalib-fit: regularize each drive curve below this fraction of full output with a power law (fixes dark-tone crush/colour cast from camera floor noise); 0 disables");
@@ -3526,6 +3528,11 @@ int main(int argc, char *argv[])
 		if (_ledCalibCfg.ledGrid < 2 || _ledCalibCfg.ledGrid > 16)
 		{
 			std::cout << "ERROR: --ledcalib-led-grid must be 2-16" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (_ledCalibCfg.ledLowMax != 0 && (_ledCalibCfg.ledLowMax < 24 || _ledCalibCfg.ledLowMax > 160))
+		{
+			std::cout << "ERROR: --ledcalib-led-low-max must be 0 or 24-160" << std::endl;
 			return EXIT_FAILURE;
 		}
 		if (_ledCalibCfg.ledAxisSteps != 0 && (_ledCalibCfg.ledAxisSteps < 4 || _ledCalibCfg.ledAxisSteps > 64))

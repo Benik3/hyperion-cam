@@ -73,6 +73,7 @@ void LedCalib::Measurement::start(int frames)
 	std::memset(satSum, 0, sizeof(satSum));
 	expSum = 0.0;
 	gainSum = 0.0;
+	dgainSum = 0.0;
 }
 
 void LedCalib::Measurement::add(const RoiSample &tv, const RoiSample &led)
@@ -101,6 +102,7 @@ void LedCalib::Measurement::add(const RoiSample &tv, const RoiSample &led, const
 	{
 		expSum += static_cast<double>(meta->exposureUs);
 		gainSum += meta->analogueGain;
+		dgainSum += meta->digitalGain;
 	}
 	n++;
 }
@@ -917,6 +919,20 @@ void LedCalib::buildLedPlan()
 				d[c] = edgeLevel(i, a);
 				_ledPlan.push_back(d);
 			}
+	// Low ramp: every code 1..ledLowMax per channel, so the fit can measure where
+	// each whole drive step of HyperHDR + LED driver begins (the round-off-aware
+	// dark end of --ledcalib-fit). Interleaved darks give the noise floor and
+	// catch drift. Whatever HyperHDR's white balance / gamma is, it is measured.
+	if (_cfg.ledLowMax > 0)
+		for (int c = 0; c < 3; c++)
+			for (int v = 1; v <= _cfg.ledLowMax; v++)
+			{
+				if (v % 16 == 1)
+					_ledPlan.push_back({0, 0, 0});
+				std::array<uint8_t, 3> d = {0, 0, 0};
+				d[c] = static_cast<uint8_t>(v);
+				_ledPlan.push_back(d);
+			}
 	// Guarantee the white-anchor neutral is a measured LED sample regardless of
 	// grid/ramp granularity, so the fit reads it directly instead of interpolating.
 	ensureNeutral(_ledPlan, _cfg.whiteLevel);
@@ -1575,6 +1591,7 @@ void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, const RoiSample
 	rec.frames = _meas.target;
 	rec.exposureUs = _meas.exposureUs();
 	rec.analogueGain = _meas.analogueGain();
+	rec.digitalGain = _meas.digitalGain();
 	_meas.finish(rec.mean, rec.tstd, rec.sstd, rec.sat);
 
 	if (_phase == Phase::LedBaseline)
@@ -1850,6 +1867,7 @@ void LedCalib::runTvRaw(const RoiSample &tv, const RoiSample &tvRaw, const LedCa
 	rec.windowPct = _tvRawPlan[_tvRawPos].windowPct;
 	rec.exposureUs = _meas.exposureUs();
 	rec.analogueGain = _meas.analogueGain();
+	rec.digitalGain = _meas.digitalGain();
 	_meas.finish(rec.mean, rec.tstd, rec.sstd, rec.sat);
 	_tvRawRecords.push_back(rec);
 	const size_t done = _tvRawRecords.size();
@@ -1984,6 +2002,7 @@ void LedCalib::runResponse(const RoiSample &tv, const RoiSample &led, const RoiS
 	rec.targetExposureUs = target;
 	rec.exposureUs = _meas.exposureUs();
 	rec.analogueGain = _meas.analogueGain();
+	rec.digitalGain = _meas.digitalGain();
 	rec.tMs = nowMs - _respStartMs;
 	_meas.finish(rec.mean, rec.tstd, rec.sstd, rec.sat);
 	if (!atTarget && rec.exposureUs > 0)
@@ -2013,7 +2032,9 @@ void LedCalib::runResponse(const RoiSample &tv, const RoiSample &led, const RoiS
 	writePhaseMeta(_haveMeta ? &_lastMeta : nullptr);
 	// Recover the curve now: a non-frozen ISP shows up as a poor fit here,
 	// before the long sweeps are wasted on it.
-	const bool ok = ledCalibCheckResponse(_cfg.outDir + "/camera_response.csv", true);
+	ResponseHints hints;
+	loadResponseHints(_cfg.outDir + "/meta_response.json", hints);
+	const bool ok = ledCalibCheckResponse(_cfg.outDir + "/camera_response.csv", true, &hints);
 	finishAll(ok ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
@@ -2025,7 +2046,7 @@ void LedCalib::writeResponse()
 	f << "# hyperion-cam camera response (shutter sweep over a fixed scene): isp = ISP RGB 0..255, raw = "
 		 "black-subtracted sensor samples (10-bit); rois: "
 	  << (tvUsed ? "tv,led" : "led") << "\n";
-	f << "step,t_ms,target_exposure_us,exposure_us,analogue_gain,frames";
+	f << "step,t_ms,target_exposure_us,exposure_us,analogue_gain,digital_gain,frames";
 	const char *rois[2] = {"led", "tv"};
 	const int ispSlot[2] = {kLed, kTv}, rawSlot[2] = {kLedRaw, kTvRaw};
 	const int nRoi = tvUsed ? 2 : 1;
@@ -2037,7 +2058,7 @@ void LedCalib::writeResponse()
 	for (const auto &r : _respRecords)
 	{
 		f << r.idx << "," << r.tMs << "," << r.targetExposureUs << "," << r.exposureUs << "," << r.analogueGain
-		  << "," << r.frames;
+		  << "," << r.digitalGain << "," << r.frames;
 		for (int k = 0; k < nRoi; k++)
 		{
 			const int is = ispSlot[k], rs = rawSlot[k];

@@ -74,14 +74,18 @@ namespace
 		// the sweep has RAW columns) or the legacy power law.
 		Linearizer cam;
 		bool useRaw = false;
-		// Camera luma of the TV's black patch (tv_sweep 0,0,0), for the automatic
-		// dark floor; < 0 = unknown.
-		double tvBlackLuma = -1.0;
+		// Brightest camera channel of the TV's black patch (tv_sweep 0,0,0), for
+		// the automatic dark floor; < 0 = unknown.
+		double tvBlackLevel = -1.0;
 		double anchorDrive[3] = {255, 255, 255};
 		cv::Vec3d anchorTv{255, 255, 255};
 		cv::Vec3d anchorLed{255, 255, 255};
 		cv::Vec3d gains{1, 1, 1};
 		double anchorLevelTarget = 127; // neutral level to anchor the white at
+		// Colour matrix in effect during the LED sweep (meta_led.json): reconstructs
+		// the ISP's pre-matrix value to drop samples clipped at its colour-gain stage.
+		bool haveLedCcm = false;
+		cv::Matx33d ledCcmInv = cv::Matx33d::eye();
 	};
 
 	// Monotone curve as a (level -> value) table with linear interpolation.
@@ -138,9 +142,33 @@ namespace
 		// Eye-matched white in drive-fraction space (camera white's solution,
 		// normalised to max 1): the gray that near-neutral overflow desaturates to.
 		cv::Vec3d whiteDir{0, 0, 0};
-		// Dark fallback: below darkFloor (encoded camera luma) blend to equal
-		// R=G=B drive (HyperHDR's eye-matched white) at matching luminance.
+		// Dark fallback: inputs whose brightest channel is below darkFloor (encoded
+		// camera units) blend to the eye-matched white at matching luminance.
 		double darkFloor = 0.0;
+		// Eye-matched white as LED light: drive fractions e(anchor drive), max 1.
+		// The dark fallback fades to THIS colour. Equal R=G=B drive is that white
+		// only at the anchor level: HyperHDR v22 applies its white balance in
+		// linear light and re-encodes, so equal drive tints with level (red/orange
+		// near black at gamma 1).
+		cv::Vec3d eyeWhite{1, 1, 1};
+		// Round-off-aware dark end. HyperHDR + the LED driver output whole drive
+		// steps, so near black only a few step triples exist and plain rounding
+		// gives single-channel glows (e.g. red-only). The staircase of each channel
+		// (code where each step starts, light per step) is MEASURED from the
+		// sweep's dense low-code ramp - nothing about HyperHDR's settings is
+		// assumed - and dark nodes snap to the best-looking step triple.
+		struct Staircase
+		{
+			bool ok = false;
+			double step = 0.0;		// light of one drive step (drive-fraction units, e(255) = 1)
+			std::vector<int> start; // start[k] = first LUT output code giving step k (start[0] = 0)
+			int known = 0;			// steps 0..known-1 have a fully measured code range
+			int firstCode = 0;		// first code that lights the channel
+			double snr = 0.0;		// step / dark-reading noise
+			std::string why;		// reason when !ok
+		};
+		Staircase stairs[3];
+		bool quantOn = false;
 		cv::Matx33d A;
 		cv::Matx33d Ainv;
 		Curve e[3];
@@ -162,7 +190,8 @@ namespace
 		NodeLumClipped = 2,
 		NodeBlack = 4,
 		NodeKnee = 8, // brightness compressed by the soft knee (policy, not error)
-		NodeDark = 16 // blended toward neutral equal drive below the dark floor
+		NodeDark = 16, // blended toward the eye-matched white below the dark floor
+		NodeQuant = 32 // snapped to a whole-step drive triple (round-off-aware dark end)
 	};
 
 	struct FitResult
@@ -171,7 +200,7 @@ namespace
 		int n = 33;
 		std::vector<cv::Vec3d> lut; // drive 0..255, red index fastest
 		std::vector<uint8_t> flags;
-		double pctDesat = 0.0, pctClip = 0.0, pctKnee = 0.0, pctDark = 0.0;
+		double pctDesat = 0.0, pctClip = 0.0, pctKnee = 0.0, pctDark = 0.0, pctQuant = 0.0;
 		// Diagnostics: per TV gray patch {level, camera reading (G), LUT drive R,G,B}.
 		std::vector<std::array<double, 5>> grayAxis;
 	};
@@ -261,15 +290,15 @@ namespace
 		return !out.empty();
 	}
 
-	// Camera luma of the TV black patch (0,0,0) in tv_sweep.csv; -1 if absent.
-	double loadTvBlackLuma(const std::string &path)
+	// Brightest camera channel of the TV black patch (0,0,0) in tv_sweep.csv; -1 if absent.
+	double loadTvBlackLevel(const std::string &path)
 	{
 		CsvTable t;
 		if (!loadCsvTable(path, t) || !t.has("tv_r"))
 			return -1.0;
 		for (std::size_t i = 0; i < t.rows.size(); i++)
 			if (t.get(i, "patch_r", 1) == 0 && t.get(i, "patch_g", 1) == 0 && t.get(i, "patch_b", 1) == 0)
-				return 0.299 * t.get(i, "tv_r") + 0.587 * t.get(i, "tv_g") + 0.114 * t.get(i, "tv_b");
+				return std::max({t.get(i, "tv_r"), t.get(i, "tv_g"), t.get(i, "tv_b")});
 		return -1.0;
 	}
 
@@ -474,14 +503,25 @@ namespace
 		if (!loadLedSweepCsv(dir + "/led_sweep.csv", d.samples))
 			return false;
 		checkPhaseMetas(dir);
-		d.tvBlackLuma = loadTvBlackLuma(dir + "/tv_sweep.csv");
+		d.tvBlackLevel = loadTvBlackLevel(dir + "/tv_sweep.csv");
+		{
+			ResponseHints lh;
+			if (loadResponseHints(dir + "/meta_led.json", lh) && lh.haveCcm)
+			{
+				for (int k = 0; k < 9; k++)
+					d.ledCcmInv.val[k] = lh.ccmInv[k];
+				d.haveLedCcm = true;
+			}
+		}
 
 		// Camera model: the measured tone curve when the response phase ran
 		// (--calib-response auto), else the legacy self-estimated power law.
 		const std::string respPath = dir + "/camera_response.csv";
 		if (responseMode != "off" && std::filesystem::exists(respPath))
 		{
-			if (!fitCameraResponse(respPath, d.cam.resp, false))
+			ResponseHints hints;
+			loadResponseHints(dir + "/meta_response.json", hints);
+			if (!fitCameraResponse(respPath, d.cam.resp, false, &hints))
 				return false;
 			d.cam.measured = true;
 			std::cout << "Camera response: measured curve from camera_response.csv (" << d.cam.resp.samples
@@ -786,12 +826,35 @@ namespace
 	{
 		double ssAll = 0.0;
 		int nAll = 0;
+		// The ISP clips at its colour-gain stage, BEFORE the matrix: a sample can
+		// read clean after the matrix (and on RAW) yet be clipped there - e.g. the
+		// red LED glow under -b 2.6,1.6. Reconstruct the pre-matrix value from the
+		// recorded matrix and drop such samples from the map.
+		std::vector<char> preClip(d.samples.size(), 0);
+		int nPre = 0;
+		if (d.haveLedCcm)
+			for (std::size_t i = 0; i < d.samples.size(); i++)
+			{
+				const SweepSample &s = d.samples[i];
+				if (std::min({s.led[0], s.led[1], s.led[2]}) < 1.0 || std::max({s.led[0], s.led[1], s.led[2]}) > 253.0)
+					continue; // a post-matrix channel is clipped: not reconstructable
+				const cv::Vec3d pre = d.ledCcmInv * d.cam.lin3(s.led);
+				if (std::max({pre[0], pre[1], pre[2]}) > 0.97)
+				{
+					preClip[i] = 1;
+					nPre++;
+				}
+			}
+		if (nPre > 0)
+			std::cout << "WARNING: " << nPre << " LED sweep samples clip the ISP's colour-gain stage (before the "
+					  << "matrix); excluded from the RAW->ISP map. Use -b 1,1 (see make-tuning)." << std::endl;
 		for (int r = 0; r < 3; r++)
 		{
 			std::vector<double> Ar, br;
-			for (const auto &s : d.samples)
+			for (std::size_t i = 0; i < d.samples.size(); i++)
 			{
-				if (!s.hasRaw || std::max({s.rawSat[0], s.rawSat[1], s.rawSat[2]}) > 0.002)
+				const SweepSample &s = d.samples[i];
+				if (preClip[i] || !s.hasRaw || std::max({s.rawSat[0], s.rawSat[1], s.rawSat[2]}) > 0.002)
 					continue;
 				if (s.ledSat[r] > 0.005 || s.led[r] > 245.0 || s.led[r] < 12.0)
 					continue;
@@ -828,6 +891,193 @@ namespace
 			std::cout << "WARNING: RAW and ISP disagree by " << (100.0 * m.rawMapResid)
 					  << "% RMS on the LED ROI (ISP not frozen, or a wrong camera response?)" << std::endl;
 		return true;
+	}
+
+	// Steps per channel the round-off-aware dark end handles (beyond ~14 steps
+	// plain rounding is already within ~10% chroma of the target).
+	constexpr int kQuantSteps = 14;
+
+	// Measure each channel's drive staircase from the single-channel low ramp
+	// (every code 1..L, --ledcalib-led-low-max): light per code in drive-fraction
+	// units (z = A^-1 * light, so e(255) = 1), plateaus = whole drive steps. Only
+	// assumes the LED chain ends in equal light steps (integer PWM); that is
+	// validated, and anything unresolved just disables the snapping.
+	void detectStaircases(const CalibData &d, const std::vector<cv::Vec3d> &Y, const std::vector<char> &clipped,
+						  FitModel &m)
+	{
+		std::vector<double> zeroZ[3];
+		std::map<int, std::vector<double>> byCode[3];
+		for (std::size_t i = 0; i < d.samples.size(); i++)
+		{
+			if (clipped[i])
+				continue;
+			const SweepSample &s = d.samples[i];
+			int on = 0, ch = -1;
+			for (int c = 0; c < 3; c++)
+				if (s.drive[c] > 0)
+				{
+					on++;
+					ch = c;
+				}
+			const cv::Vec3d z = m.Ainv * Y[i];
+			if (on == 0)
+				for (int c = 0; c < 3; c++)
+					zeroZ[c].push_back(z[c]);
+			else if (on == 1)
+				byCode[ch][static_cast<int>(std::lround(s.drive[ch]))].push_back(z[ch]);
+		}
+		for (int c = 0; c < 3; c++)
+		{
+			FitModel::Staircase &st = m.stairs[c];
+			st = FitModel::Staircase{};
+			int L = 0;
+			while (byCode[c].count(L + 1))
+				L++;
+			if (L < 24)
+			{
+				st.why = "no dense low-code ramp in led_sweep.csv (codes 1.." + std::to_string(L) +
+						 " only; rerun --ledcalib led)";
+				continue;
+			}
+			double mean0 = 0.0, sigma = 0.0;
+			if (zeroZ[c].size() >= 3)
+			{
+				for (double v : zeroZ[c])
+					mean0 += v;
+				mean0 /= static_cast<double>(zeroZ[c].size());
+				for (double v : zeroZ[c])
+					sigma += (v - mean0) * (v - mean0);
+				sigma = std::sqrt(sigma / static_cast<double>(zeroZ[c].size() - 1));
+			}
+			sigma = std::max(sigma, 1e-7);
+			std::vector<double> z(L + 1, 0.0);
+			for (int v = 1; v <= L; v++)
+			{
+				const auto &xs = byCode[c][v];
+				double sum = 0.0;
+				for (double x : xs)
+					sum += x;
+				z[v] = sum / static_cast<double>(xs.size()) - mean0;
+			}
+			int v1 = -1;
+			for (int v = 1; v < L; v++)
+				if (z[v] > 6.0 * sigma && z[v + 1] > 6.0 * sigma)
+				{
+					v1 = v;
+					break;
+				}
+			if (v1 < 0)
+			{
+				st.why = "no light measured within codes 1.." + std::to_string(L);
+				continue;
+			}
+			double step = z[v1];
+			for (int it = 0; it < 3; it++)
+			{
+				double sum = 0.0;
+				int n = 0;
+				for (int v = v1; v <= L && z[v] < 1.5 * step; v++)
+				{
+					sum += z[v];
+					n++;
+				}
+				if (n > 0)
+					step = sum / n;
+			}
+			st.snr = step / sigma;
+			if (st.snr < 8.0)
+			{
+				std::ostringstream w;
+				w << "first drive step not resolved (step/noise " << st.snr << ", need >= 8)";
+				st.why = w.str();
+				continue;
+			}
+			std::vector<int> n(L + 1, 0);
+			for (int it = 0; it < 3; it++)
+			{
+				int run = 0;
+				for (int v = 0; v <= L; v++)
+				{
+					n[v] = std::max(run, static_cast<int>(std::lround(z[v] / step)));
+					run = n[v];
+				}
+				double sz = 0.0, sn = 0.0;
+				for (int v = 1; v <= L; v++)
+					if (n[v] >= 1 && n[v] <= 2 * kQuantSteps)
+					{
+						sz += z[v] * n[v];
+						sn += static_cast<double>(n[v]) * n[v];
+					}
+				if (sn > 0.0)
+					step = sz / sn;
+			}
+			int bad = 0, tot = 0;
+			for (int v = 1; v <= L; v++)
+				if (n[v] <= kQuantSteps + 2)
+				{
+					tot++;
+					if (std::fabs(z[v] / step - n[v]) > 0.35)
+						bad++;
+				}
+			if (tot == 0 || bad > tot / 10)
+			{
+				st.why = "LED light is not in equal drive steps (" + std::to_string(bad) + "/" + std::to_string(tot) +
+						 " low codes off; non-linear LED driver or drifting light?)";
+				continue;
+			}
+			st.start.assign(1, 0);
+			for (int k = 1; k <= n[L]; k++)
+			{
+				int v = 0;
+				while (v <= L && n[v] < k)
+					v++;
+				st.start.push_back(v);
+			}
+			st.known = n[L];
+			st.step = step;
+			st.firstCode = v1;
+			st.ok = true;
+		}
+	}
+
+	// A resolved staircase pins the CONTINUOUS (pre-rounding) drive curve exactly
+	// where it matters most: the code where rounding switches from step k-1 to k
+	// is where the continuous output crosses k - 1/2. Rebuild each curve's bottom
+	// from those crossings - replacing the power-law regularization, which suits
+	// a noisy ISP floor but not HyperHDR's real dark-end shape (sRGB toe +
+	// linear-light white balance + gamma) - so the inversion, the dark floor and
+	// the snapping all see the real dark-end colour.
+	void rebuildCurveBottoms(FitModel &m, bool verbose)
+	{
+		for (int c = 0; c < 3; c++)
+		{
+			const FitModel::Staircase &st = m.stairs[c];
+			if (!st.ok || st.known < 2)
+				continue;
+			std::vector<double> px{0.0}, py{0.0};
+			for (int k = 1; k <= st.known; k++)
+			{
+				px.push_back(st.start[k] - 0.5);
+				py.push_back((k - 0.5) * st.step);
+			}
+			const double top = px.back();
+			Curve &cv = m.e[c];
+			for (std::size_t i = 0; i < cv.level.size(); i++)
+			{
+				const double lv = cv.level[i];
+				if (lv > top)
+					break;
+				std::size_t j = 1;
+				while (j < px.size() && px[j] < lv)
+					j++;
+				const double t = (px[j] > px[j - 1]) ? (lv - px[j - 1]) / (px[j] - px[j - 1]) : 0.0;
+				cv.value[i] = py[j - 1] + t * (py[j] - py[j - 1]);
+			}
+			monotonize(cv);
+			if (verbose)
+				std::cout << "Curve " << "rgb"[c] << ": bottom rebuilt from the measured staircase up to code " << top
+						  << std::endl;
+		}
 	}
 
 	bool fitModel(const CalibData &d, FitModel &m, bool verbose, double curveFloor)
@@ -1061,6 +1311,8 @@ namespace
 		cv::Vec3d eW;
 		for (int c = 0; c < 3; c++)
 			eW[c] = m.e[c].eval(d.anchorDrive[c]);
+		if (const double mw = std::max({eW[0], eW[1], eW[2]}); mw > 1e-9)
+			m.eyeWhite = eW * (1.0 / mw);
 		const cv::Vec3d totalW = m.A * eW + m.baselineLin;
 		const cv::Vec3d tW = m.cam.lin3(d.anchorTv);
 		for (int c = 0; c < 3; c++)
@@ -1081,6 +1333,9 @@ namespace
 						  << "); the noise-dominated white correction will crush it across the LUT."
 						  << " Reduce its HyperHDR WB attenuation or raise LED brightness, then recalibrate."
 						  << std::endl;
+
+		detectStaircases(d, Y, clipped, m);
+		rebuildCurveBottoms(m, verbose);
 
 		if (verbose)
 		{
@@ -1224,25 +1479,101 @@ namespace
 		return flag;
 	}
 
-	// Equal R=G=B drive (HyperHDR's eye-matched white) whose modelled LED light
-	// has the luminance of target t.
-	double neutralDrive(const FitModel &m, const cv::Vec3d &t)
+	// Drive of the eye-matched white (its LED light colour, not equal drive)
+	// whose modelled LED light has the luminance of target t.
+	cv::Vec3d eyeWhiteDrive(const FitModel &m, const cv::Vec3d &t)
 	{
 		const cv::Vec3d lumW{0.299, 0.587, 0.114};
-		const double yt = t.dot(lumW);
-		if (yt <= 0.0)
-			return 0.0;
-		auto yAt = [&](double d)
-		{ return (m.A * cv::Vec3d{m.e[0].eval(d), m.e[1].eval(d), m.e[2].eval(d)}).dot(lumW); };
-		if (yt >= yAt(255.0))
-			return 255.0;
-		double lo = 0.0, hi = 255.0;
-		for (int i = 0; i < 40; i++)
+		const cv::Vec3d &w = m.eyeWhite;
+		const double yt = t.dot(lumW), yw = (m.A * w).dot(lumW);
+		if (yt <= 0.0 || yw <= 0.0)
+			return {0, 0, 0};
+		const double k = std::min(yt / yw, 1.0); // w has max 1: k <= 1 keeps every channel in range
+		cv::Vec3d d;
+		for (int c = 0; c < 3; c++)
+			d[c] = std::clamp(m.e[c].invert(k * w[c]), 0.0, 255.0);
+		return d;
+	}
+
+	// Plateau centre (LUT output code) of step k of a measured staircase.
+	double stepCode(const FitModel::Staircase &st, int k)
+	{
+		const int a = st.start[k], b = st.start[k + 1];
+		return std::floor(0.5 * (a + b - 1) + 0.5);
+	}
+
+	// Round-off-aware dark end: snap a dark node's drive to the whole-step
+	// triple that looks closest to its intended light (chroma weighted 4x over
+	// brightness, in units of the eye-matched white), output at plateau centres
+	// so the LUT's interpolation and the NV12 round trip (+-1-2 codes) don't
+	// flip a channel to its neighbour step. True if snapped.
+	bool quantizeDark(const FitModel &m, cv::Vec3d &drive)
+	{
+		if (!m.quantOn)
+			return false;
+		cv::Vec3d e, x, w;
+		for (int c = 0; c < 3; c++)
 		{
-			const double mid = 0.5 * (lo + hi);
-			(yAt(mid) < yt ? lo : hi) = mid;
+			e[c] = m.e[c].eval(drive[c]);
+			x[c] = e[c] / m.stairs[c].step;
+			w[c] = std::max(m.eyeWhite[c], 1e-3);
 		}
-		return 0.5 * (lo + hi);
+		if (std::max({x[0], x[1], x[2]}) > kQuantSteps)
+			return false;
+		int lo[3], hi[3];
+		for (int c = 0; c < 3; c++)
+		{
+			lo[c] = std::max(0, static_cast<int>(std::floor(x[c])) - 1);
+			hi[c] = static_cast<int>(std::ceil(x[c])) + 1;
+			if (hi[c] >= m.stairs[c].known)
+				return false; // beyond the measured staircase
+		}
+		cv::Vec3d ut;
+		for (int c = 0; c < 3; c++)
+			ut[c] = e[c] / w[c];
+		const double ref = (ut[0] + ut[1] + ut[2]) / 3.0;
+		if (ref <= 0.0)
+		{
+			const bool changed = drive[0] != 0.0 || drive[1] != 0.0 || drive[2] != 0.0;
+			drive = {0, 0, 0};
+			return changed; // no light intended: black (already black = not a snap)
+		}
+		auto cost = [&](const int n[3])
+		{
+			cv::Vec3d dd;
+			for (int c = 0; c < 3; c++)
+				dd[c] = n[c] * m.stairs[c].step / w[c] - ut[c];
+			const double lum = (dd[0] + dd[1] + dd[2]) / 3.0;
+			const cv::Vec3d ch = dd - cv::Vec3d{lum, lum, lum};
+			return (4.0 * ch.dot(ch) + lum * lum) / (ref * ref);
+		};
+		int best[3] = {0, 0, 0};
+		double bestCost = cost(best);
+		int n[3];
+		for (n[0] = lo[0]; n[0] <= hi[0]; n[0]++)
+			for (n[1] = lo[1]; n[1] <= hi[1]; n[1]++)
+				for (n[2] = lo[2]; n[2] <= hi[2]; n[2]++)
+				{
+					bool reachable = true;
+					for (int c = 0; c < 3; c++)
+						reachable = reachable && (n[c] == 0 || m.stairs[c].start[n[c] + 1] > m.stairs[c].start[n[c]]);
+					if (!reachable)
+						continue;
+					const double cst = cost(n);
+					if (cst < bestCost)
+					{
+						bestCost = cst;
+						std::copy(n, n + 3, best);
+					}
+				}
+		if (best[0] == 0 && best[1] == 0 && best[2] == 0)
+		{
+			drive = {0, 0, 0};
+			return true;
+		}
+		for (int c = 0; c < 3; c++)
+			drive[c] = stepCode(m.stairs[c], best[c]);
+		return true;
 	}
 
 	void buildLut(const FitModel &m, FitResult &res)
@@ -1251,7 +1582,7 @@ namespace
 		res.lut.assign(static_cast<std::size_t>(n) * n * n, cv::Vec3d{0, 0, 0});
 		res.flags.assign(res.lut.size(), 0);
 		std::size_t idx = 0;
-		int desat = 0, clip = 0, knee = 0, dark = 0;
+		int desat = 0, clip = 0, knee = 0, dark = 0, quant = 0;
 		for (int b = 0; b < n; b++)
 		{
 			for (int g = 0; g < n; g++)
@@ -1260,18 +1591,21 @@ namespace
 				{
 					const cv::Vec3d v{255.0 * r / (n - 1), 255.0 * g / (n - 1), 255.0 * b / (n - 1)};
 					res.flags[idx] = invertNode(m, v, res.lut[idx]);
-					// Dark fallback: below the floor the measurements can't resolve
-					// colour; fade to the neutral equal drive at the same luminance
-					// (full neutral below half the floor, smoothstep up to the floor).
-					const double luma = 0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2];
-					if (m.darkFloor > 0.0 && luma < m.darkFloor)
+					// Dark fallback: where every channel is below the floor the
+					// measurements can't resolve colour; fade to the eye-matched white
+					// at the same luminance (fully below half the floor, smoothstep up
+					// to it). Gated on the BRIGHTEST channel, not luma, so a saturated
+					// dark colour (blue 40 has luma 4.6) keeps its colour.
+					const double mxIn = std::max({v[0], v[1], v[2]});
+					if (m.darkFloor > 0.0 && mxIn < m.darkFloor)
 					{
-						const double u = std::clamp((luma - 0.5 * m.darkFloor) / (0.5 * m.darkFloor), 0.0, 1.0);
+						const double u = std::clamp((mxIn - 0.5 * m.darkFloor) / (0.5 * m.darkFloor), 0.0, 1.0);
 						const double w = u * u * (3.0 - 2.0 * u);
-						const double dN = neutralDrive(m, nodeTarget(m, v));
-						res.lut[idx] = w * res.lut[idx] + (1.0 - w) * cv::Vec3d{dN, dN, dN};
+						res.lut[idx] = w * res.lut[idx] + (1.0 - w) * eyeWhiteDrive(m, nodeTarget(m, v));
 						res.flags[idx] |= NodeDark;
 					}
+					if (quantizeDark(m, res.lut[idx]))
+						res.flags[idx] |= NodeQuant;
 					if (res.flags[idx] & NodeDesaturated)
 						desat++;
 					if (res.flags[idx] & NodeLumClipped)
@@ -1280,6 +1614,8 @@ namespace
 						knee++;
 					if (res.flags[idx] & NodeDark)
 						dark++;
+					if (res.flags[idx] & NodeQuant)
+						quant++;
 				}
 			}
 		}
@@ -1288,6 +1624,7 @@ namespace
 		res.pctClip = 100.0 * clip / N;
 		res.pctKnee = 100.0 * knee / N;
 		res.pctDark = 100.0 * dark / N;
+		res.pctQuant = 100.0 * quant / N;
 	}
 
 	// Eye-matched white direction (camera white's drive fractions, max 1).
@@ -1347,7 +1684,7 @@ namespace
 	// rig it is ~20% of the mean at every level - panel structure, not noise.)
 	double autoDarkFloor(const CalibData &d)
 	{
-		const double black = d.tvBlackLuma >= 0.0 ? d.tvBlackLuma : 0.0;
+		const double black = d.tvBlackLevel >= 0.0 ? d.tvBlackLevel : 0.0;
 		return std::clamp(black + 8.0, 4.0, 24.0);
 	}
 
@@ -1414,8 +1751,28 @@ namespace
 		f << "  \"knee\": {\"on\": " << (m.kneeOn ? "true" : "false") << ", \"start\": " << m.kneeStart
 		  << ", \"white_needs\": " << m.kneeMax << ", \"a\": " << m.kneeA << "},\n";
 		f << "  \"dark_floor\": " << m.darkFloor << ",\n";
+		f << "  \"eye_white\": [" << m.eyeWhite[0] << ", " << m.eyeWhite[1] << ", " << m.eyeWhite[2] << "],\n";
+		f << "  \"dark_quant\": {\"on\": " << (m.quantOn ? "true" : "false") << ", \"channels\": [";
+		for (int c = 0; c < 3; c++)
+		{
+			const auto &st = m.stairs[c];
+			f << (c ? ", " : "") << "{\"ok\": " << (st.ok ? "true" : "false");
+			if (st.ok)
+			{
+				f << ", \"steps_full\": " << (st.step > 0 ? 1.0 / st.step : 0.0) << ", \"first_code\": " << st.firstCode
+				  << ", \"snr\": " << st.snr << ", \"step_start\": [";
+				for (std::size_t k = 0; k < st.start.size(); k++)
+					f << (k ? ", " : "") << st.start[k];
+				f << "]";
+			}
+			else
+				f << ", \"why\": \"" << st.why << "\"";
+			f << "}";
+		}
+		f << "]},\n";
 		f << "  \"pct_knee\": " << res.pctKnee << ",\n";
 		f << "  \"pct_dark\": " << res.pctDark << ",\n";
+		f << "  \"pct_quant\": " << res.pctQuant << ",\n";
 		f << "  \"gray_axis\": [";
 		for (std::size_t i = 0; i < res.grayAxis.size(); i++)
 		{
@@ -1476,14 +1833,45 @@ namespace
 		if (!parseSwitch(cfg.knee, "--calib-knee", 50.0, 99.0, kneePct, kAuto, kOff) ||
 			!parseSwitch(cfg.darkFloor, "--calib-dark-floor", 0.0, 128.0, floorV, fAuto, fOff))
 			return false;
+		if (cfg.darkQuant != "auto" && cfg.darkQuant != "on" && cfg.darkQuant != "off")
+		{
+			std::cout << "ERROR: --calib-dark-quant must be auto, on or off" << std::endl;
+			return false;
+		}
 		if (!fitModel(data, res.model, cfg.verbose, cfg.curveFloor))
 			return false;
 		setupWhiteDir(res.model);
 		setupKnee(res.model, kOff ? 0.0 : (kAuto ? 0.85 : kneePct / 100.0));
 		res.model.darkFloor = fOff ? 0.0 : (fAuto ? autoDarkFloor(data) : floorV);
 		if (res.model.darkFloor > 0.0)
-			std::cout << "Dark floor: camera luma < " << res.model.darkFloor << (fAuto ? " (auto: TV black + 8 codes)" : "")
-					  << " fades to the neutral equal drive" << std::endl;
+			std::cout << "Dark floor: inputs with every channel < " << res.model.darkFloor
+					  << (fAuto ? " (auto: TV black + 8 codes)" : "") << " fade to the eye-matched white (drive fractions "
+					  << res.model.eyeWhite[0] << "," << res.model.eyeWhite[1] << "," << res.model.eyeWhite[2] << ")"
+					  << std::endl;
+		{
+			FitModel &m = res.model;
+			const bool all = m.stairs[0].ok && m.stairs[1].ok && m.stairs[2].ok;
+			for (int c = 0; c < 3; c++)
+			{
+				const auto &st = m.stairs[c];
+				if (st.ok)
+					std::cout << "LED staircase " << "rgb"[c] << ": first step at code " << st.firstCode << ", "
+							  << std::lround(1.0 / st.step) << " drive steps at full output, " << st.known
+							  << " steps resolved (step/noise " << std::lround(st.snr) << ")" << std::endl;
+				else
+					std::cout << "LED staircase " << "rgb"[c] << ": " << st.why << std::endl;
+			}
+			if (cfg.darkQuant == "on" && !all)
+			{
+				std::cout << "ERROR: --calib-dark-quant on, but the LED staircase is not resolved on every channel"
+						  << std::endl;
+				return false;
+			}
+			m.quantOn = cfg.darkQuant != "off" && all;
+			std::cout << "Round-off-aware dark end: " << (m.quantOn ? "on" : "off")
+					  << (cfg.darkQuant == "off" ? " (--calib-dark-quant off)" : (all ? "" : " (staircase not resolved)"))
+					  << std::endl;
+		}
 		res.n = std::clamp(cfg.lutSize, 2, 65);
 		buildLut(res.model, res);
 		return true;
@@ -1508,8 +1896,27 @@ namespace
 		cv::Vec3d tvWhite{0.55, 0.60, 0.58};
 		cv::Vec3d tvAmbient{0.001, 0.001, 0.0012};
 
-		static double curve(double x, bool inverse)
+		// The frozen tuning's curve instead of the stock one: power 2.2 sampled on
+		// the vc4 knots, linear between them (so LINEAR below code ~38).
+		bool frozenCurve = false;
+		double curve(double x, bool inverse) const
 		{
+			if (frozenCurve)
+			{
+				std::vector<double> kx, ky;
+				for (int i = 0; i < 32; i++)
+					kx.push_back((i < 16 ? i * 1024 : (i < 24 ? (i - 16) * 2048 + 16384 : (i - 24) * 4096 + 32768)) /
+								 65535.0);
+				kx.push_back(1.0);
+				for (double v : kx)
+					ky.push_back(std::pow(v, 1.0 / 2.2));
+				const std::vector<double> &a = inverse ? ky : kx, &b = inverse ? kx : ky;
+				x = std::clamp(x, 0.0, 1.0);
+				for (std::size_t i = 1; i < a.size(); i++)
+					if (a[i] >= x)
+						return b[i - 1] + (a[i] > a[i - 1] ? (x - a[i - 1]) / (a[i] - a[i - 1]) : 0.0) * (b[i] - b[i - 1]);
+				return 1.0;
+			}
 			static const double k[66] = {0, 0, 1024, 5040, 2048, 9338, 3072, 12356, 4096, 15312, 5120, 18051, 6144,
 										 20790, 7168, 23193, 8192, 25744, 9216, 27942, 10240, 30035, 11264, 32005,
 										 12288, 33975, 13312, 35815, 14336, 37600, 15360, 39168, 16384, 40642, 18432,
@@ -1528,11 +1935,27 @@ namespace
 			return 1.0;
 		}
 
+		// Optional HyperHDR v22 output stage (round-off-aware dark end test): the
+		// LUT output code goes through HyperHDR's white balance in linear light,
+		// sRGB re-encode and user gamma, then WHOLE drive steps into linear-PWM
+		// LEDs. Off = the smooth power-law LED curve above.
+		bool hh = false;
+		double hhT[3] = {1, 1, 1};
+		double hhGamma = 1.0;
+		double hhDriveCont(double code, int c) const
+		{
+			auto eotf = [](double v) { return v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4); };
+			auto oetf = [](double l) { return l <= 0.0031308 ? 12.92 * l : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055; };
+			const double x = std::clamp(code, 0.0, 255.0) / 255.0;
+			return 255.0 * std::pow(oetf(std::clamp(hhT[c] * eotf(x), 0.0, 1.0)), hhGamma);
+		}
+		double hhDrive(double code, int c) const { return std::round(hhDriveCont(std::round(code), c)); }
+
 		cv::Vec3d glowLin(const cv::Vec3d &drive) const
 		{
 			cv::Vec3d e;
 			for (int c = 0; c < 3; c++)
-				e[c] = std::pow(std::clamp(drive[c], 0.0, 255.0) / 255.0, exps[c]);
+				e[c] = hh ? hhDrive(drive[c], c) / 255.0 : std::pow(std::clamp(drive[c], 0.0, 255.0) / 255.0, exps[c]);
 			return A * e + ambient;
 		}
 		cv::Vec3d encode(const cv::Vec3d &lin) const
@@ -1626,7 +2049,8 @@ int runLedCalibFit(const LedCalibFitConfig &cfg)
 	std::cout << "Fit: camera " << (res.model.cam.measured ? "measured response" : "power law p=" + std::to_string(res.model.p))
 			  << ", rel resid median=" << res.model.residMedian << " p95=" << res.model.residP95
 			  << "; gamut: " << res.pctDesat << "% desaturated, " << res.pctClip << "% luminance-clipped, "
-			  << res.pctKnee << "% knee, " << res.pctDark << "% dark-blended" << std::endl;
+			  << res.pctKnee << "% knee, " << res.pctDark << "% dark-blended, " << res.pctQuant << "% step-snapped"
+			  << std::endl;
 
 	// Gray-axis diagnostics: what the LUT drives for each measured TV gray.
 	{
@@ -1672,101 +2096,117 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 	{
 		cv::Vec3d isp, ispSat, raw, rawSat;
 	};
-	auto observe = [&](const cv::Vec3d &lin, double nIsp)
+	auto observeT = [&](const TruthChain &tc, const cv::Vec3d &lin, double nIsp, double rawSd)
 	{
 		Obs o;
-		o.isp = truth.encode(lin);
-		o.raw = truth.rawOf(lin);
+		o.isp = tc.encode(lin);
+		o.raw = tc.rawOf(lin);
 		for (int c = 0; c < 3; c++)
 		{
 			o.ispSat[c] = lin[c] >= 1.0 ? 1.0 : 0.0;
 			o.isp[c] = std::clamp(o.isp[c] + nIsp * noise(rng), 0.0, 255.0);
-			o.raw[c] = std::clamp(o.raw[c] + rawNoise(rng), -2.0, 1023.0 - 64.0);
+			o.raw[c] = std::clamp(o.raw[c] + rawSd * rawNoise(rng), -2.0, 1023.0 - 64.0);
 			o.rawSat[c] = o.raw[c] >= 1022.0 - 64.0 ? 1.0 : 0.0;
 		}
 		return o;
 	};
 
-	// Synthetic LED sweep (dual-stream format): cube + gray ramp + axis ramps.
+	// Synthetic measurement files of a truth chain (dual-stream format): LED
+	// sweep (cube + gray ramp + axis ramps [+ low ramp]), baseline, TV grays,
+	// camera response.
+	auto synthesize = [&](const TruthChain &tc, const std::string &d, int lowMax, double rawSd)
 	{
-		std::ofstream f(dir + "/led_sweep.csv");
-		f << "drive_r,drive_g,drive_b,led_r,led_g,led_b,led_r_tstd,led_g_tstd,led_b_tstd,led_r_sstd,led_g_sstd,"
-			 "led_b_sstd,frames,led_r_sat,led_g_sat,led_b_sat,raw_r,raw_g,raw_b,raw_r_tstd,raw_g_tstd,raw_b_tstd,"
-			 "raw_r_sat,raw_g_sat,raw_b_sat,exposure_us,analogue_gain\n";
-		auto emit = [&](int r, int g, int b)
+		// Synthetic LED sweep (dual-stream format): cube + gray ramp + axis ramps.
 		{
-			const Obs o = observe(truth.glowLin({double(r), double(g), double(b)}), 1.0 / std::sqrt(20.0));
-			f << r << "," << g << "," << b << "," << o.isp[0] << "," << o.isp[1] << "," << o.isp[2]
-			  << ",0.3,0.3,0.3,1,1,1,20," << o.ispSat[0] << "," << o.ispSat[1] << "," << o.ispSat[2] << ","
-			  << o.raw[0] << "," << o.raw[1] << "," << o.raw[2] << ",0.5,0.5,0.5," << o.rawSat[0] << ","
-			  << o.rawSat[1] << "," << o.rawSat[2] << ",13600,1\n";
-		};
-		for (int r = 0; r < 8; r++)
-			for (int g = 0; g < 8; g++)
-				for (int b = 0; b < 8; b++)
-					emit(r * 255 / 7, g * 255 / 7, b * 255 / 7);
-		for (int i = 0; i < 17; i++)
-			emit(i * 255 / 16, i * 255 / 16, i * 255 / 16);
-		for (int i = 1; i < 24; i++)
-		{
-			const int v = static_cast<int>(edgeLevelSelftest(i, 24));
-			emit(v, 0, 0);
-			emit(0, v, 0);
-			emit(0, 0, v);
-		}
-	}
-	{
-		std::ofstream f(dir + "/baseline.json");
-		const cv::Vec3d b = truth.reading({0, 0, 0}), br = truth.rawOf(truth.glowLin({0, 0, 0}));
-		f << "{\n  \"led_mean\": [" << b[0] << ", " << b[1] << ", " << b[2] << "],\n  \"led_raw_mean\": [" << br[0]
-		  << ", " << br[1] << ", " << br[2] << "]\n}\n";
-	}
-
-	// TV gray sweep: the TV's own light (camera-linear) through the true curve;
-	// per-pixel noise (sstd) for the automatic dark floor.
-	{
-		std::ofstream f(dir + "/tv_sweep.csv");
-		f << "index,patch_r,patch_g,patch_b,tv_r,tv_g,tv_b,tv_r_tstd,tv_g_tstd,tv_b_tstd,tv_r_sstd,tv_g_sstd,"
-			 "tv_b_sstd,frames\n";
-		for (int i = 0; i < 17; i++)
-		{
-			const int L = i * 255 / 16;
-			const Obs o = observe(truth.tvLin(L), 0.05);
-			f << i << "," << L << "," << L << "," << L << "," << o.isp[0] << "," << o.isp[1] << "," << o.isp[2]
-			  << ",0.1,0.1,0.1";
-			for (int c = 0; c < 3; c++)
-				f << "," << (0.6 + 0.012 * o.isp[c]);
-			f << ",10\n";
-		}
-	}
-
-	// Camera response shutter sweep over the LED white and a TV gray.
-	{
-		std::ofstream f(dir + "/camera_response.csv");
-		f << "# synthetic\nstep,t_ms,target_exposure_us,exposure_us,analogue_gain,frames";
-		for (const char *roi : {"led", "tv"})
-			for (const char *what : {"isp", "isp_tstd", "isp_sat", "raw", "raw_tstd", "raw_sat"})
-				for (const char *c : {"r", "g", "b"})
-					f << "," << roi << "_" << what << "_" << c;
-		f << "\n";
-		const cv::Vec3d L0 = truth.glowLin({255, 255, 255}), T0 = truth.tvLin(180);
-		int step = 0;
-		for (int j = -24; j <= 8; j++)
-		{
-			const double k = std::pow(2.0, j / 4.0);
-			f << step << "," << step * 100 << "," << std::lround(13600 * k) << "," << std::lround(13600 * k) << ",1,10";
-			step++;
-			for (const cv::Vec3d &L : {L0, T0})
+			std::ofstream f(d + "/led_sweep.csv");
+			f << "drive_r,drive_g,drive_b,led_r,led_g,led_b,led_r_tstd,led_g_tstd,led_b_tstd,led_r_sstd,led_g_sstd,"
+				 "led_b_sstd,frames,led_r_sat,led_g_sat,led_b_sat,raw_r,raw_g,raw_b,raw_r_tstd,raw_g_tstd,raw_b_tstd,"
+				 "raw_r_sat,raw_g_sat,raw_b_sat,exposure_us,analogue_gain\n";
+			auto emit = [&](int r, int g, int b)
 			{
-				const Obs o = observe(L * k, 0.3 / std::sqrt(10.0));
-				const cv::Vec3d *cols[6] = {&o.isp, nullptr, &o.ispSat, &o.raw, nullptr, &o.rawSat};
-				for (const cv::Vec3d *v : cols)
-					for (int c = 0; c < 3; c++)
-						f << "," << (v ? (*v)[c] : 0.1);
+				const Obs o = observeT(tc, tc.glowLin({double(r), double(g), double(b)}), 1.0 / std::sqrt(20.0), rawSd);
+				f << r << "," << g << "," << b << "," << o.isp[0] << "," << o.isp[1] << "," << o.isp[2]
+				  << ",0.3,0.3,0.3,1,1,1,20," << o.ispSat[0] << "," << o.ispSat[1] << "," << o.ispSat[2] << ","
+				  << o.raw[0] << "," << o.raw[1] << "," << o.raw[2] << ",0.5,0.5,0.5," << o.rawSat[0] << ","
+				  << o.rawSat[1] << "," << o.rawSat[2] << ",13600,1\n";
+			};
+			for (int r = 0; r < 8; r++)
+				for (int g = 0; g < 8; g++)
+					for (int b = 0; b < 8; b++)
+						emit(r * 255 / 7, g * 255 / 7, b * 255 / 7);
+			for (int i = 0; i < 17; i++)
+				emit(i * 255 / 16, i * 255 / 16, i * 255 / 16);
+			for (int i = 1; i < 24; i++)
+			{
+				const int v = static_cast<int>(edgeLevelSelftest(i, 24));
+				emit(v, 0, 0);
+				emit(0, v, 0);
+				emit(0, 0, v);
 			}
-			f << "\n";
+			// Low ramp (every code 1..lowMax per channel, darks interleaved), as the
+			// led phase records it for the round-off-aware dark end.
+			for (int c = 0; c < 3; c++)
+				for (int v = 1; v <= lowMax; v++)
+				{
+					if (v % 16 == 1)
+						emit(0, 0, 0);
+					emit(c == 0 ? v : 0, c == 1 ? v : 0, c == 2 ? v : 0);
+				}
 		}
-	}
+		{
+			std::ofstream f(d + "/baseline.json");
+			const cv::Vec3d b = tc.reading({0, 0, 0}), br = tc.rawOf(tc.glowLin({0, 0, 0}));
+			f << "{\n  \"led_mean\": [" << b[0] << ", " << b[1] << ", " << b[2] << "],\n  \"led_raw_mean\": [" << br[0]
+			  << ", " << br[1] << ", " << br[2] << "]\n}\n";
+		}
+
+		// TV gray sweep: the TV's own light (camera-linear) through the true curve;
+		// per-pixel noise (sstd) for the automatic dark floor.
+		{
+			std::ofstream f(d + "/tv_sweep.csv");
+			f << "index,patch_r,patch_g,patch_b,tv_r,tv_g,tv_b,tv_r_tstd,tv_g_tstd,tv_b_tstd,tv_r_sstd,tv_g_sstd,"
+				 "tv_b_sstd,frames\n";
+			for (int i = 0; i < 17; i++)
+			{
+				const int L = i * 255 / 16;
+				const Obs o = observeT(tc, tc.tvLin(L), 0.05, 1.0);
+				f << i << "," << L << "," << L << "," << L << "," << o.isp[0] << "," << o.isp[1] << "," << o.isp[2]
+				  << ",0.1,0.1,0.1";
+				for (int c = 0; c < 3; c++)
+					f << "," << (0.6 + 0.012 * o.isp[c]);
+				f << ",10\n";
+			}
+		}
+
+		// Camera response shutter sweep over the LED white and a TV gray.
+		{
+			std::ofstream f(d + "/camera_response.csv");
+			f << "# synthetic\nstep,t_ms,target_exposure_us,exposure_us,analogue_gain,frames";
+			for (const char *roi : {"led", "tv"})
+				for (const char *what : {"isp", "isp_tstd", "isp_sat", "raw", "raw_tstd", "raw_sat"})
+					for (const char *c : {"r", "g", "b"})
+						f << "," << roi << "_" << what << "_" << c;
+			f << "\n";
+			const cv::Vec3d L0 = tc.glowLin({255, 255, 255}), T0 = tc.tvLin(180);
+			int step = 0;
+			for (int j = -24; j <= 8; j++)
+			{
+				const double k = std::pow(2.0, j / 4.0);
+				f << step << "," << step * 100 << "," << std::lround(13600 * k) << "," << std::lround(13600 * k) << ",1,10";
+				step++;
+				for (const cv::Vec3d &L : {L0, T0})
+				{
+					const Obs o = observeT(tc, L * k, 0.3 / std::sqrt(10.0), rawSd);
+					const cv::Vec3d *cols[6] = {&o.isp, nullptr, &o.ispSat, &o.raw, nullptr, &o.rawSat};
+					for (const cv::Vec3d *v : cols)
+						for (int c = 0; c < 3; c++)
+							f << "," << (v ? (*v)[c] : 0.1);
+				}
+				f << "\n";
+			}
+		}
+	};
+	synthesize(truth, dir, 0, 1.0);
 
 	LedCalibFitConfig cfg = cfgIn;
 	cfg.calibDir = dir;
@@ -1898,25 +2338,39 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 				prevLum = lum;
 			}
 			kneeOk = (!pres.model.kneeOn || std::max({dW[0], dW[1], dW[2]}) >= 250.0) && mono;
+			// Dark floor: fully faded nodes (every channel < F/2) emit the eye-matched
+			// white's LED light colour (not equal drive); a saturated dark blue
+			// (brightest channel above F) is not faded at all.
 			const double F = pres.model.darkFloor;
-			double maxSpread = 0.0;
+			const cv::Vec3d eyeL = truth.glowLin(anchorDrive) - truth.ambient;
+			double maxChroma = 0.0;
 			const int n = pres.n;
 			for (int b = 0; b < n; b++)
 				for (int g = 0; g < n; g++)
 					for (int r = 0; r < n; r++)
 					{
 						const double vr = 255.0 * r / (n - 1), vg = 255.0 * g / (n - 1), vb = 255.0 * b / (n - 1);
-						if (0.299 * vr + 0.587 * vg + 0.114 * vb >= 0.5 * F)
+						if (std::max({vr, vg, vb}) >= 0.5 * F || std::max({vr, vg, vb}) <= 0.0)
 							continue;
-						const cv::Vec3d &d = pres.lut[(static_cast<std::size_t>(b) * n + g) * n + r];
-						maxSpread = std::max({maxSpread, std::fabs(d[0] - d[1]), std::fabs(d[1] - d[2])});
+						const cv::Vec3d l = truth.glowLin(pres.lut[(static_cast<std::size_t>(b) * n + g) * n + r]) -
+											truth.ambient;
+						if (std::max({l[0], l[1], l[2]}) < 1e-7)
+							continue;
+						cv::Vec3d u;
+						for (int c = 0; c < 3; c++)
+							u[c] = l[c] / eyeL[c];
+						const double um = std::max({u[0], u[1], u[2]});
+						maxChroma = std::max(maxChroma, (um - std::min({u[0], u[1], u[2]})) / um);
 					}
-			darkOk = F > 0.0 && maxSpread < 0.5;
+			const int ib = static_cast<int>(std::lround(40.0 / 255.0 * (n - 1)));
+			const bool blueKept = !(pres.flags[static_cast<std::size_t>(ib) * n * n] & NodeDark);
+			darkOk = F > 0.0 && maxChroma < 0.05 && blueKept;
 			std::cout << "Selftest knee: " << (pres.model.kneeOn ? "on" : "off") << ", camera-white drive max "
 					  << std::max({dW[0], dW[1], dW[2]}) << ", gray axis " << (mono ? "monotone" : "NOT monotone")
 					  << " -> " << (kneeOk ? "PASS" : "FAIL") << std::endl;
-			std::cout << "Selftest dark floor " << F << ": max R/G/B drive spread below half of it " << maxSpread
-					  << " -> " << (darkOk ? "PASS" : "FAIL") << std::endl;
+			std::cout << "Selftest dark floor " << F << ": faded nodes' LED light vs the eye-matched white, max chroma "
+					  << "error " << (100.0 * maxChroma) << "%; dark blue " << (blueKept ? "kept" : "FADED") << " -> "
+					  << (darkOk ? "PASS" : "FAIL") << std::endl;
 		}
 	}
 
@@ -1950,8 +2404,160 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 				  << " B=" << ceil[2] << " -> " << (softOk ? "PASS" : "FAIL") << std::endl;
 	}
 
+	// 6. Round-off-aware dark end on a QUANTIZING LED chain (HyperHDR v22: white
+	// balance in linear light, sRGB re-encode, user gamma, whole drive steps into
+	// linear-PWM LEDs), at three white balance / gamma settings - the fit must
+	// measure the staircase, nothing about the settings is assumed. Along the
+	// dark gray axis (LUT trilinear -> 8-bit code -> drive steps) count outputs
+	// whose colour is far (>34% chroma) from the eye-matched white: snapping must
+	// reduce them (<= 2.5% left), keep brightness monotone, and the dark floor must
+	// still land on the eye-matched white's light colour (equal drive would not:
+	// at gamma 1 it is red/orange near black).
+	bool quantOk = true;
+	{
+		struct HhCase
+		{
+			double t[3], g;
+		};
+		const HhCase cases[] = {{{1.0, 0.38, 0.22}, 1.0}, {{1.0, 0.64, 0.49}, 2.2}, {{0.7, 1.0, 0.45}, 1.8}};
+		for (const HhCase &hc : cases)
+		{
+			TruthChain q;
+			q.hh = true;
+			std::copy(hc.t, hc.t + 3, q.hhT);
+			q.hhGamma = hc.g;
+			// No ambient on the wall / TV black: the ideal LED gray is then exactly the
+			// eye-matched white at every level, so the metric sees only the rounding
+			// (with ambient the fit rightly tints the glow to make glow + ambient match).
+			q.ambient = {0, 0, 0};
+			q.tvAmbient = {0, 0, 0};
+			const std::string qd = dir + "/quant";
+			std::filesystem::create_directories(qd, ec);
+			for (const char *f : {"meta.json", "meta_tv.json", "meta_led.json", "meta_response.json"})
+				std::filesystem::remove(qd + "/" + f, ec);
+			synthesize(q, qd, 96, 0.05);
+			CalibData qdata;
+			if (!loadCalibData(qd, qdata, 200.0, 0, "auto"))
+			{
+				quantOk = false;
+				continue;
+			}
+			LedCalibFitConfig qc = cfg;
+			qc.calibDir = qd;
+			qc.knee = "auto";
+			qc.darkFloor = "auto";
+			const cv::Vec3d dw{q.hhDriveCont(127, 0), q.hhDriveCont(127, 1), q.hhDriveCont(127, 2)};
+			auto stats = [&](const FitResult &r, double &badPct, int &rev)
+			{
+				int bad = 0, tot = 0;
+				rev = 0;
+				double prevY = -1.0;
+				for (double v = 0.0; v <= 100.0; v += 0.25)
+				{
+					const cv::Vec3d code = sampleLutTrilinear(r, {v, v, v});
+					cv::Vec3d u;
+					for (int c = 0; c < 3; c++)
+						u[c] = q.hhDrive(code[c], c) / dw[c];
+					const double um = std::max({u[0], u[1], u[2]});
+					const double ce = um > 0.0 ? (um - std::min({u[0], u[1], u[2]})) / um : 0.0;
+					tot++;
+					bad += ce > 0.34;
+					if (std::getenv("HYPERCAM_SELFTEST_DUMP") && std::fmod(v, 1.0) == 0.0)
+						std::cout << "    v " << v << " code " << code[0] << "," << code[1] << "," << code[2] << " drive "
+								  << q.hhDrive(code[0], 0) << "," << q.hhDrive(code[1], 1) << "," << q.hhDrive(code[2], 2)
+								  << " ce " << ce << std::endl;
+					const cv::Vec3d l = q.glowLin(code) - q.ambient;
+					const double Y = 0.299 * l[0] + 0.587 * l[1] + 0.114 * l[2];
+					if (Y < prevY - 1e-12)
+						rev++;
+					prevY = Y;
+				}
+				badPct = 100.0 * bad / tot;
+			};
+			double badOn = 100, badOff = 100;
+			int revOn = 99, revOff = 99;
+			bool resolved = false;
+			double floorChroma = 1.0;
+			for (const char *mode : {"off", "auto"})
+			{
+				qc.darkQuant = mode;
+				FitResult qr;
+				if (!runFitCore(qc, qdata, qr))
+					continue;
+				if (std::string(mode) == "off")
+				{
+					stats(qr, badOff, revOff);
+					// Dark floor colour (continuous light, before the step rounding).
+					const double F = qr.model.darkFloor;
+					const int n = qr.n;
+					floorChroma = 0.0;
+					for (int k = 1; k < n && 255.0 * k / (n - 1) < 0.5 * F; k++)
+					{
+						const cv::Vec3d d = qr.lut[(static_cast<std::size_t>(k) * n + k) * n + k];
+						cv::Vec3d u;
+						for (int c = 0; c < 3; c++)
+							u[c] = q.hhDriveCont(d[c], c) / dw[c];
+						const double um = std::max({u[0], u[1], u[2]});
+						if (um > 1e-6)
+							floorChroma = std::max(floorChroma, (um - std::min({u[0], u[1], u[2]})) / um);
+					}
+				}
+				else
+				{
+					resolved = qr.model.quantOn;
+					stats(qr, badOn, revOn);
+				}
+			}
+			// Measured on this chain: curve rebuild + snapping take the gamma-2.2 case
+			// from ~5% (power-law bottom, plain rounding) to ~2% off-white; the rest
+			// is the trilinear blend between the black node and the first lit one.
+			const bool ok =
+				resolved && badOn <= 0.8 * badOff + 0.1 && badOn <= 2.5 && revOn == 0 && floorChroma < 0.15;
+			quantOk = quantOk && ok;
+			std::cout << "Selftest round-off dark end (HyperHDR wb " << hc.t[0] << "/" << hc.t[1] << "/" << hc.t[2]
+					  << ", gamma " << hc.g << "): staircase " << (resolved ? "resolved" : "NOT resolved")
+					  << ", off-white dark grays " << badOff << "% -> " << badOn << "% snapped, brightness reversals "
+					  << revOn << ", dark-floor chroma " << (100.0 * floorChroma) << "% -> " << (ok ? "PASS" : "FAIL")
+					  << std::endl;
+		}
+	}
+
+	// 7. Response prior on the FROZEN curve (power 2.2 on the vc4 knots, linear
+	// below code ~38): the tuning file's own curve as the prior must recover the
+	// dark end better than the pure power-law prior.
+	bool priorOk = false;
+	{
+		TruthChain fz;
+		fz.frozenCurve = true;
+		const std::string fd = dir + "/frozen";
+		std::filesystem::create_directories(fd, ec);
+		synthesize(fz, fd, 0, 0.1); // realistic ROI-averaged RAW noise
+		ResponseHints h;
+		h.tuningFile = "(selftest frozen curve)";
+		for (int z = 0; z < 256; z++)
+			h.priorLin.push_back(fz.linOf(z));
+		CameraResponse r0, r1;
+		if (fitCameraResponse(fd + "/camera_response.csv", r0, false, nullptr) &&
+			fitCameraResponse(fd + "/camera_response.csv", r1, false, &h))
+		{
+			double e0 = 0.0, e1 = 0.0;
+			for (int z = 4; z <= 60; z++)
+			{
+				e0 = std::max(e0, std::fabs(r0.eval(z) / fz.linOf(z) - 1.0));
+				e1 = std::max(e1, std::fabs(r1.eval(z) / fz.linOf(z) - 1.0));
+			}
+			if (std::getenv("HYPERCAM_SELFTEST_DUMP"))
+				for (int z : {2, 4, 6, 8, 12, 16, 20, 25, 30, 38, 45, 60, 90, 128})
+					std::cout << "    z " << z << " truth " << fz.linOf(z) << " power " << r0.eval(z) / fz.linOf(z) - 1.0
+							  << " tuning " << r1.eval(z) / fz.linOf(z) - 1.0 << std::endl;
+			priorOk = e1 < 0.03 && e1 < e0;
+			std::cout << "Selftest response prior on the frozen curve, codes 4..60: power prior max err " << (100.0 * e0)
+					  << "%, tuning-curve prior " << (100.0 * e1) << "% -> " << (priorOk ? "PASS" : "FAIL") << std::endl;
+		}
+	}
+
 	const bool pass = tested >= 100 && (p95 <= 2.0) && (mx <= 6.0) && (anchorErr <= 3.0) && respOk && legacyWorse &&
-					  kneeOk && darkOk && clipOk;
+					  kneeOk && darkOk && clipOk && quantOk && priorOk;
 	std::cout << (pass ? "SELFTEST PASS" : "SELFTEST FAIL") << std::endl;
 	return pass ? EXIT_SUCCESS : EXIT_FAILURE;
 }
