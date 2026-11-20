@@ -19,7 +19,9 @@
 #include <cmath>
 #include <mutex>
 #include <memory>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <boost/program_options.hpp>
 #include <libcamera/libcamera.h>
@@ -34,6 +36,7 @@
 #include "ledCalib.h"
 #include "ledCalibFit.h"
 #include "ledCalibWeb.h"
+#include "tuning.h"
 
 #ifdef HAVE_GPU_TRANSFORM
 #include "gpuNv12Transform.h"
@@ -719,6 +722,9 @@ static bool _ledCalibFitSelftest = false;
 static bool _ledCalibGammaSelftest = false;
 static bool _ledCalibWebDryrun = false;
 static LedCalibFitConfig _ledCalibFitCfg;
+// --make-tuning / --tuning: frozen libcamera tuning file (src/tuning.cpp).
+static MakeTuningConfig _makeTuningCfg;
+static std::string _tuningPath;
 
 // Allocate _ledCalibWeb, set its patch geometry, optionally hide the corner
 // keep-alive/status UI, and start it. Returns false (error printed) if the
@@ -3072,6 +3078,11 @@ int main(int argc, char *argv[])
 		("patch-size", po::value<double>(&_patchSize)->default_value(10.0), "TV patch window size as % of screen area (default 10; 100=fullscreen) to avoid TV auto-dimming")						  //
 		("patch-x", po::value<double>(&_patchX)->default_value(-1.0), "TV patch top-left X in screen-% (<0 = centered)")																			  //
 		("patch-y", po::value<double>(&_patchY)->default_value(-1.0), "TV patch top-left Y in screen-% (<0 = centered)")																			  //
+		("tuning", po::value<std::string>(&_tuningPath), "Use this libcamera tuning file (sets LIBCAMERA_RPI_TUNING_FILE); use the --make-tuning frozen file for the production service AND every calibration phase")	  //
+		("make-tuning", po::value<std::string>(&_makeTuningCfg.outPath), "Write a frozen tuning file (no adaptive contrast/lens shading, power-law tone curve; with --from-calib a TV-fitted colour matrix) and exit")	  //
+		("tuning-base", po::value<std::string>(&_makeTuningCfg.basePath), "--make-tuning: stock tuning file to start from (default: the system file for the detected sensor)")								  //
+		("tuning-curve", po::value<std::string>(&_makeTuningCfg.curve)->default_value("2.2"), "--make-tuning: tone curve, a power-law exponent (default 2.2) or 'stock'")										  //
+		("from-calib", po::value<std::string>(&_makeTuningCfg.fromCalib), "--make-tuning: calib dir with tv_raw.csv (--ledcalib tv-raw) -> fit the colour matrix to the TV")								  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //
@@ -3368,6 +3379,46 @@ int main(int argc, char *argv[])
 					  << " (open http://<this-pi>:" << _ledCalibWebPort << "/ fullscreen on the TV PC, tap begin); patch "
 					  << pct << "%" << (_autoCalibRoiEn ? ", custom ROI" : ", edge-strip ROI") << std::endl;
 		}
+	}
+
+	// Frozen tuning file: must be in the environment before libcamera starts
+	// (the IPA reads it when the camera is created). Recorded in every
+	// calibration phase's meta file so the fit can refuse mixed tunings.
+	if (!_tuningPath.empty())
+	{
+		std::error_code ec;
+		const std::filesystem::path abs = std::filesystem::absolute(_tuningPath, ec);
+		if (ec || !std::filesystem::exists(abs))
+		{
+			std::cout << "ERROR: --tuning file not found: " << _tuningPath << std::endl;
+			return EXIT_FAILURE;
+		}
+		setenv("LIBCAMERA_RPI_TUNING_FILE", abs.c_str(), 1);
+		std::cout << "INFO: tuning file " << abs.string() << std::endl;
+	}
+	if (const char *tf = std::getenv("LIBCAMERA_RPI_TUNING_FILE"))
+	{
+		_ledCalibCfg.tuningFile = tf;
+		_ledCalibCfg.tuningHash = fileHash(tf);
+	}
+	{
+		// -b is parsed into _rGain/_bGain only later; read the string here.
+		float rg = 0.0f, bg = 0.0f;
+		std::sscanf(_wbgainsStr.c_str(), "%f,%f", &rg, &bg);
+		std::ostringstream cj;
+		cj << "{\"shutter_us\": " << _shutter << ", \"analogue_gain\": " << _gain << ", \"colour_gains\": [" << rg
+		   << ", " << bg << "], \"saturation\": " << _saturation << ", \"contrast\": " << _contrast
+		   << ", \"width\": " << _width << ", \"height\": " << _height << ", \"crop\": \"" << _cropStr
+		   << "\", \"focus\": " << _focus << "}";
+		_ledCalibCfg.cameraJson = cj.str();
+	}
+
+	// --make-tuning with an explicit base needs no camera (the sensor model only
+	// selects the default base file).
+	if (!_makeTuningCfg.outPath.empty() && !_makeTuningCfg.basePath.empty())
+	{
+		_makeTuningCfg.verbose = _verbose;
+		return runMakeTuning(_makeTuningCfg);
 	}
 
 	_ledCalibMode = (vm.count("ledcalib") > 0);
@@ -3700,6 +3751,19 @@ int main(int argc, char *argv[])
 	std::string cameraId = cm->cameras()[0]->id();
 	_camera = cm->get(cameraId);
 	_camera->acquire();
+
+	if (!_makeTuningCfg.outPath.empty())
+	{
+		// Only the sensor model is needed (it names the stock tuning file).
+		auto model = _camera->properties().get(properties::Model);
+		_makeTuningCfg.sensorModel = model ? std::string(*model) : std::string();
+		_makeTuningCfg.verbose = _verbose;
+		const int rc = runMakeTuning(_makeTuningCfg);
+		_camera->release();
+		_camera.reset();
+		cm->stop();
+		return rc;
+	}
 
 	// For --imgout-crophelp, configure at requested resolution to see what sensor area is used
 	if (!_imgOutCropHelpPath.empty())
