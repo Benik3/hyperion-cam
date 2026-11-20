@@ -24,7 +24,19 @@ A PC on the **same TV HDMI input/picture-mode you normally watch** runs a fullsc
 - **Dark room.** The page keeps the display awake. If your TV still blanks on a static image,
   disable its screensaver. Also disable **eco/ambient auto-dimming** (corrupts sweeps).
 - HyperHDR running, grabber the only source, **HyperHDR color + white-balance settings final** —
-  they bake into the LUT; change later → recalibrate.
+  they bake into the LUT; change later → recalibrate. The settings the calibration expects:
+
+  | HyperHDR setting | Value | Why |
+  |---|---|---|
+  | Gamma (image processing) | **2.2** | HyperHDR averages each LED area in linear light and sends it sRGB-encoded; gamma 2.2 makes the drive linear light again, so a half-black/half-white area gets half the light (at 1 it got ~74%) |
+  | Temperature / white balance | eye-matched (Step 0a) | after the gamma change it lands roughly at R 1 / G 0.64 / B 0.49 for the white that was 1 / 0.38 / 0.22 at gamma 1 — the same light |
+  | Luminance gain, saturation gain, scale output, power limit | 1 | not separable — the LUT can't model them |
+  | Backlight threshold | 0 | it would put a floor under the darks |
+  | Colour calibration (primaries/8-colour) | identity | — |
+  | Flatbuffer HDR tone mapping | off | — |
+
+  Never eye-match with HyperHDR's own **colour picker**: that source skips the processing above.
+  `--ledcalib white` sends an image instead, which takes the real path.
 - **Disable HyperHDR LED smoothing for the calibration run** (the LEDs must jump instantly to each
   commanded colour). It doesn't affect the LUT — re-enable it for normal viewing afterwards.
 - Stop the service while calibrating, restart after:
@@ -37,20 +49,28 @@ A PC on the **same TV HDMI input/picture-mode you normally watch** runs a fullsc
   ```bash
   CAL=~/calib3
   GEO="-w 768 -h 432 --crop 1686,1014,1173,751 -t 0,22:765,0:0,403:768,432"   # production geometry
-  CAM="-b 2.632,1.626 -s 13600 --focus 0.93"                                   # production camera args
+  CAM="-b 1,1 -s 13600 --focus 0.93"                                           # camera args (-b 1,1!)
+  TI="--tuning $CAL/tuning-interim.json --saturation 1"                        # Step 1 only
   T="--tuning $CAL/tuning.json --saturation 1"                                 # from Step 2 on
   ```
 - **The same `$CAM` and (from Step 2) `$T` in every step and in production.** The tuning file's
   colour matrix already contains the saturation — `--saturation` must be **1** with it. The fit
   compares what each phase recorded (`meta_<phase>.json`) and warns on a mismatch.
+- **`-b 1,1` (no camera colour gains).** The ISP applies `-b` *before* its colour matrix and clips
+  there: with `-b 2.632,1.626` anything redder than white (the LED glow, TV reds) saturates red at
+  ~38% of the sensor range — invisible to every clip check. The TV-fitted matrix carries the gains
+  instead, so with `1,1` the ISP clips only where the sensor does.
+- **Too bright = shorter shutter (`-s`), not `--gain`:** the imx708's minimum gain is 1.12 and
+  `-g 1` is already clamped to it.
 
 ---
 
 ## Step 0 — Prep
 
 ### 0a. White balance (first; don't change after)
-Set white in **HyperHDR's white balance** so the LED glow matches the TV white by eye (this is
-where you fix bluish LEDs). `--ledcalib white` is an optional aid — it drives the LEDs white and
+Set HyperHDR **gamma to 2.2 first** (table above), then set white in **HyperHDR's white balance** so
+the LED glow matches the TV white by eye (this is where you fix bluish LEDs). Re-do it after a gamma
+change — the same white needs different temperature numbers. `--ledcalib white` is an optional aid — it drives the LEDs white and
 shows a matching full-screen white reference on the TV; `--ledcalib-white-level N` (1-255,
 **default 127** = mid-gray) sets the level for both. This same level is the fit's white anchor —
 eye-match WB at it. It takes no ROI, measures nothing, and writes no file (Enter/Accept exits).
@@ -76,16 +96,19 @@ centre (off the red border). For the **LED ROI**, capture a full-frame still (`-
 ---
 
 ## Step 1 — TV RAW probe (input of the TV colour matrix)
-Measures the TV's own colours on the camera's **RAW** frame (before any colour processing).
+Measures the TV's own colours on the camera's **RAW** frame (before any colour processing), plus
+the ISP's reading of the same frames — which is why it runs under an **interim frozen tuning**
+(stock matrix, but no adaptive contrast/lens shading): the matrix fit uses those ISP readings to
+measure the ISP's per-channel gain, and the stock (adaptive) tuning would bias it by a few %.
 
 ```bash
-sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain $GEO $CAM --calib-tv-web \
+./Release/hyperion-cam --make-tuning $CAL/tuning-interim.json        # offline, no --from-calib
+sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain $GEO $CAM $TI --calib-tv-web \
   --calib-tv-roi 278,165,214,104 --calib-out $CAL --ledcalib tv-raw
 ```
 Open page → **tap begin**. ~230 patches (colour cube, gray ramp, and a final 10% peak-white
-window), ~2 min → `$CAL/tv_raw.csv` + `meta_tv-raw.json`. No `--tuning` needed here (RAW doesn't
-depend on it). If it warns that the **peak-white window clips the SENSOR**, lower `--gain` (add it
-to `$CAM`) and rerun — the shutter stays fixed for latency.
+window), ~2 min → `$CAL/tv_raw.csv` + `meta_tv-raw.json`. If Step 2 then says the **peak-white
+window clips the SENSOR**, shorten the shutter (`-s`, in `$CAM`, for every step) and rerun.
 
 ## Step 2 — Frozen tuning file (offline)
 ```bash
@@ -94,7 +117,9 @@ to `$CAM`) and rerun — the shutter stays fixed for latency.
 Starts from the system tuning file for your sensor and writes `$CAL/tuning.json`: adaptive contrast
 and adaptive lens shading off, a power-2.2 tone curve, one colour matrix fitted to your TV (scaled so
 the peak-white window lands at 95%). It reports how many TV colours the stock matrix pushed to zero
-and prints the args to use — **from now on add `$T` to every command** (and keep `-b` as printed).
+and prints the args to use — **from now on add `$T` to every command** (and keep `-b` as printed:
+`1,1`). It warns if tv-raw ran under an adaptive tuning, with colour gains, or if any patch clipped
+the ISP's colour-gain stage — fix and rerun Step 1 if so.
 
 > Without `--from-calib` it freezes the stock tuning (keeps the stock colour matrix).
 > `--tuning-curve stock` keeps the stock tone curve. `--tuning-base FILE` picks another base.
@@ -116,8 +141,9 @@ Open page → **tap begin**. Fills the TV with gray 180, samples a 24×14 grid, 
 > screen. If your camera is aimed so the frame is **only the clean TV screen**, omit them.
 
 **Decide:** `X < ~2%` → skip shading (don't pass `--shading-map` anywhere). Larger → keep it.
-With the frozen tuning's power-law curve the map is exact at every brightness (with the stock curve
-it was exact only near gray 180).
+With the frozen tuning's power-law curve the map is exact from camera code ~38 up (with the stock
+curve it was exact only near gray 180); below that the hardware curve is linear, so the deepest
+shadows get a slightly weaker correction (a 0.9 gain acts as 0.9 instead of 0.79 in linear light).
 
 ---
 
@@ -131,7 +157,9 @@ sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain -w 1024 -h 576 $CAM $T --cal
 ```
 Open page → **tap begin**. Keep the room still. → `$CAL/camera_response.csv`. It prints the
 recovered curve's local exponents and must say **`consistent single curve: the ISP behaves as
-frozen`**. A `WARNING: ... NOT one consistent curve` means the tuning file isn't in effect (missing
+frozen`**. (The fit uses the tuning file's own curve as its prior and below the measured range,
+corrects each step for libcamera's exposure-rounding digital gain, and drops samples clipped at the
+ISP's colour-gain stage.) A `WARNING: ... NOT one consistent curve` means the tuning file isn't in effect (missing
 `$T`?) or something moved — fix before continuing.
 
 Optional second source: add `--calib-tv-roi x,y,w,h` **in full-frame (1024×576) coordinates** (this
@@ -163,6 +191,11 @@ sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain --ledcalib led --calib-tv-we
 Open page → **tap begin**. No `--crop`/`--shading-map` (the wall is outside the TV). Dark room.
 Writes `$CAL/led_sweep.csv`, `baseline.json`, `meta.json`.
 
+The sweep ends with a **low ramp**: every code 1..96 per channel (`--ledcalib-led-low-max`, ~300
+patches, a few minutes). From it the fit measures where HyperHDR + the LED driver switch from one
+whole drive step to the next — whatever HyperHDR's white balance and gamma are — for the
+round-off-aware dark end (Step 7). Keep the room dark and still for it.
+
 ---
 
 ## Step 7 — Build the LUTs (offline, no camera)
@@ -179,16 +212,26 @@ One measurement, three fits, so you can see what each change does:
 ```
 Each run rewrites `$CAL/fit_report.json` (so it describes the last fit, C). Check its output:
 `Camera response: measured curve`, `LED sweep on RAW ... relative RMS` (under ~5%), the knee line
-(`camera white needs N x full LED output`) and the dark floor. `gray_axis` in the report lists
-the drive the LUT sends for each measured TV gray.
+(`camera white needs N x full LED output`), the dark floor, and per channel
+`LED staircase r: first step at code X, N drive steps at full output` followed by
+**`Round-off-aware dark end: on`** (if a channel says `not resolved`, the dark end falls back to
+plain rounding — check the room was dark and the LED ROI lit). `gray_axis` in the report lists the
+drive the LUT sends for each measured TV gray.
+
+> Fit A is the "before" model, not a fair "frozen tuning alone": its pure power law is badly wrong
+> below camera code ~50 on the frozen curve (linear toe), so expect A to be worst in the darks.
 
 > **White anchor level / clipping.** The fit anchors the von-Kries white at the **white-anchor
 > neutral level** — the `--ledcalib-white-level` the sweeps ran with (default mid-gray **127**),
 > i.e. where you eye-matched WB. Override with `--calib-white-anchor-level N`. If that level clips,
 > the fit falls back to the nearest clean neutral and says so.
 
-> Tunables: `--calib-knee <start %>` (default 85; `off`), `--calib-dark-floor <camera luma>`
-> (default auto = TV black + 8 codes; `off`).
+> Tunables: `--calib-knee <start %>` (default 85; `off`), `--calib-dark-floor <camera level>`
+> (brightest channel; default auto = TV black + 8 codes; `off` — below it the glow fades to the
+> eye-matched white's colour), `--calib-dark-quant auto|on|off` (round-off-aware dark end: dark
+> LUT nodes snap to the whole drive-step triple that looks closest — no red-only glow near black),
+> `--lut-size` (default 65; costs the same as 33 on the GPU, halves the gray-axis interpolation
+> error).
 
 ## Step 8 — Eye check (the acceptance test)
 Run the normal production pipeline with a LUT plus the slider page:
@@ -230,7 +273,7 @@ Re-enable HyperHDR LED smoothing for normal viewing.
 
 | Phase | Command core | Tuning | Crop | Shading | ROIs |
 |---|---|---|---|---|---|
-| TV RAW probe | `--ledcalib tv-raw` | any | yes | no | `--calib-tv-roi` |
+| TV RAW probe | `--ledcalib tv-raw` | interim `$TI` | yes | no | `--calib-tv-roi` |
 | Frozen tuning | `--make-tuning F --from-calib D` | writes | — | — | offline |
 | Shading | `--ledcalib shading` | `$T` | yes | produces | none (uses quad) |
 | Response | `--ledcalib response` | `$T` | no | no | led (+ tv, full-frame coords) |
@@ -241,10 +284,10 @@ Re-enable HyperHDR LED smoothing for normal viewing.
 
 **Grids are edge-dense:** the TV/LED cube levels are clustered near 0 and 255 (cosine/Chebyshev
 nodes — e.g. 6 → `0,24,88,167,231,255`), since crush/clip live at the ends. The runtime LUT stays
-a uniform 33³ and interpolates the fitted model.
+a uniform 65³ and interpolates the fitted model.
 
 **Tunables:** `--calib-tv-grid` (216=6³), `--ledcalib-led-grid` (cube + gray ramp + axis ramps),
-`--lut-size` (33), `--patch-size`/`--patch-x`/`--patch-y`, `--shading-grid`, `--ledcalib-frames`,
+`--lut-size` (65), `--ledcalib-led-low-max` (96), `--patch-size`/`--patch-x`/`--patch-y`, `--shading-grid`, `--ledcalib-frames`,
 `--ledcalib-settle-ms`, `--response-led-level`, `--response-tv-level`.
 
 **Diagnostics:** `--ledcalib gamma [--gamma-raw]` (TV→camera transfer) + `tools/plot-gamma.py`;
@@ -252,5 +295,5 @@ a uniform 33³ and interpolates the fitted model.
 page); `HYPERCAM_CALIB_RAW_DUMP=<dir>` during any RAW phase dumps one ISP + RAW frame pair and the
 ISP→RAW mapping (`isp.ppm`, `raw.ppm`, `map.txt`) to check the geometry.
 
-**Recalibrate when:** HyperHDR color/WB changes, camera moves, TV picture-mode changes, or you
+**Recalibrate when:** HyperHDR color/WB/gamma changes, camera moves, TV picture-mode changes, or you
 regenerate the tuning file. (A libcamera update no longer matters: the frozen file is yours.)

@@ -34,7 +34,7 @@ three unknown nonlinear devices (TV, camera, LEDs); we never characterize any of
 |---|---|---|
 | Calibration target | LED glow matches TV, relative | absolute accuracy not the goal; cancels camera+TV unknowns |
 | LUT location | grabber GPU shader, per-pixel | lowest latency; per-LED (post-averaging) would be mathematically cleaner but needs a HyperHDR fork |
-| Interpolation | ~~tetrahedral~~ → **trilinear 33³** (measured 2026-06-12, see Runtime) | tetra costs +8 ms p50 on v3d; dense trilinear matches its accuracy at +1 ms |
+| Interpolation | ~~tetrahedral~~ → **trilinear**, fit default **65³** (2026-11; was 33³) (measured 2026-06-12 + 2026-11-20, see Runtime) | tetra costs +8 ms p50 on v3d; dense trilinear matches its accuracy at +1 ms; 65³ costs ≤0.1 ms over 33³ and halves the gray-axis interpolation error |
 | TV patch display | web page on a PC on the TV's HDMI (`--calib-tv-web`) | grabber commands each patch directly, page acks after paint; no decoder/video |
 | Measurement loop | open-loop sweeps + closed-loop verification pass | sweeps are fast and clean; verification catches model errors |
 | Eye anchor | white mandatory, extra colors optional | white is what users can match reliably |
@@ -43,6 +43,9 @@ three unknown nonlinear devices (TV, camera, LEDs); we never characterize any of
 | Measurement bit depth | TV side: ISP RGB (the LUT input domain). LED sweep, TV primaries and the response sweep: **RAW + ISP in the same request** (2026-11) | the LUT input must be runtime grabber space; the LED glow is read in the ISP's clip/shoulder (red at 246 of 255), where RAW (the clip is the ISP's WB gain, not the sensor) has ~3× headroom and is linear |
 | Camera model | **measured tone curve** (`--ledcalib response`), legacy self-estimated power law kept as fallback (2026-11) | the power law was the gray-drift cause — see "Camera model fix" |
 | ISP settings | **frozen tuning file** (`--make-tuning`): no adaptive contrast, no adaptive lens shading, power-2.2 tone curve, TV-fitted colour matrix (2026-11) | the stock ISP is scene-adaptive and clips saturated TV colours to 0 — see "Camera model fix" |
+| Camera colour gains | **`-b 1,1`** everywhere, the TV-fitted matrix carries the gains (2026-11) | the ISP applies `-b` before the matrix and clips there — see "Follow-up" |
+| HyperHDR gamma | **2.2** (2026-11; was 1) | HyperHDR averages LED areas in linear light and sends sRGB-encoded drive — see "Follow-up" |
+| Dark end | eye-matched-white dark floor + **round-off-aware** step snapping, measured staircase (2026-11) | equal drive is the eye white only at the anchor; plain rounding gives single-channel glows — see "Follow-up" |
 | Time budget | ~30–45 min full run, unattended except eye anchor | sparse sweeps + smooth model fit |
 
 ## Calibration procedure (`--ledcalib`)
@@ -189,11 +192,29 @@ reads the sweep files, writes `lut.cube` + `fit_report.json`, exits. Math (`src/
   hue is kept; driving it by luminance rather than by the brightest channel keeps it smooth across
   hue (no interpolation dips). `fit_report.json` `knee.white_needs` = how many times the LEDs'
   full output camera white would need (the real rig: ~2-3×).
-- **Dark fallback** (`--calib-dark-floor auto|off|<luma>`): below camera luma = TV black + 8 codes
-  (one LUT grid step) a dark colour spans only a few camera codes and its chroma is unresolvable;
-  the LUT fades (smoothstep from half the floor) to **equal R=G=B drive at the same luminance** —
-  HyperHDR's eye-matched white by construction. (The ROI's spatial std is not usable as a noise
-  measure: on the real rig it is ~20% of the mean at every level — panel structure, not noise.)
+- **Dark fallback** (`--calib-dark-floor auto|off|<level>`): where every camera channel is below
+  TV black + 8 codes a dark colour spans only a few camera codes and its chroma is unresolvable;
+  the LUT fades (smoothstep from half the floor) to the **eye-matched white's LED light colour**
+  (drive fractions `e(anchor drive)`, scaled to the same luminance). Gated on the brightest channel,
+  not luma, so a saturated dark colour (blue 40: luma 4.6) keeps its colour. (2026-11: it used to
+  fade to equal R=G=B drive, which is the eye white only *at* the anchor — HyperHDR v22 applies its
+  white balance in linear light, so equal drive turns red/orange near black at gamma 1. The ROI's
+  spatial std is not usable as a noise measure: ~20% of the mean at every level — panel structure.)
+- **Round-off-aware dark end** (`--calib-dark-quant auto|on|off`, 2026-11): HyperHDR + the LED driver
+  output whole drive steps, so near black only a few step triples exist and plain rounding gives
+  single-channel glows (red-only, yellow). The LED sweep's **low ramp** (every code 1..96 per
+  channel, darks interleaved) is used to *measure* each channel's staircase — the code where each
+  step starts and the light of one step (`z = A⁻¹·Y` in drive-fraction units, equal steps validated,
+  step/noise ≥ 8) — so nothing about HyperHDR's white balance or gamma is assumed. Two uses:
+  (1) each curve's bottom is **rebuilt** from the step boundaries (the continuous output crosses
+  `k − ½` where rounding switches to step k), replacing the power-law regularization, which fits a
+  noisy ISP floor but not HyperHDR's real dark-end shape (sRGB toe + linear-light white balance +
+  gamma); (2) dark nodes (≤ 14 steps) **snap** to the step triple that looks closest to the node's
+  intended light (chroma weighted 4× over brightness, in eye-white units), output at **plateau
+  centres** so the LUT's trilinear blend and the NV12 round trip (±1-2 codes) don't flip a channel.
+  Self-test (three white balance/gamma settings incl. a green-strongest one): off-white dark grays
+  1.5-2.5% (was ~5% with the power-law bottom + plain rounding at gamma 2.2), no brightness
+  reversals; the remainder is the blend between the black node and the first lit one.
 - **Self-test**: `--ledcalib-fit-selftest` simulates a known chain (different per-channel LED
   exponents, crosstalk matrix, ambient, RAW sensor matrix, measurement noise) whose camera encodes
   with the **stock imx708 tone curve** (not a power law), synthesizes all four input files incl. a
@@ -202,7 +223,9 @@ reads the sweep files, writes `lut.cube` + `fit_report.json`, exits. Math (`src/
   / max 1.6 encoded units, anchor round-trip 0.1 drive units; **legacy power-law model on the same
   data p95 30 / max 43** (the rig's drift, reproduced — the test checks the legacy model is worse,
   so it really exercises the failure); knee reaches full output at white with a monotone gray
-  axis; dark nodes neutral.
+  axis; faded dark nodes emit the eye-matched white's light (dark blue not faded). Plus a
+  quantizing HyperHDR-v22 chain at three settings (round-off-aware dark end, above) and the response
+  prior on the frozen curve (power prior 45% off in the toe, tuning-curve prior 1.5%).
 
 `.cube` contract: standard Resolve format, `LUT_3D_SIZE N`, domain [0,1], red index fastest;
 values = LED drive / 255. Header comments carry fit stats. `fit_report.json` holds `p`, `A`,
@@ -261,15 +284,19 @@ confirmed on films).
   can separate them again.
 - The shading map multiplies encoded values, which is exact at every level only for a pure power
   curve; with the stock curve a 0.95 gain is −7% light at level 40 but −15% at 220.
-- Not the cause: HyperHDR is linear (gamma 1, temperature R 1 / G 0.38 / B 0.22) and the TV's gray
-  is stable within ±5% as the camera sees it.
+- Not the cause of the drift: the TV's gray is stable within ±5% as the camera sees it. (HyperHDR
+  was believed linear at gamma 1 / temperature R 1 / G 0.38 / B 0.22 — **refuted** by the 2026-11
+  research: v22 applies the temperature in linear light and re-encodes, see "Follow-up". The LED
+  sweep measures that per channel, so it did not cause the drift either — but it broke the equal-
+  drive dark fallback.)
 
 **Decisions** (so the camera becomes a known, scene-independent comparator):
 1. **Frozen tuning file** (`--make-tuning OUT [--from-calib DIR]`, `--tuning FILE`; `src/tuning.cpp`,
    Boost.JSON): `ce_enable 0`, ALSC `n_iter 0`, tone curve = power 2.2 on the vc4 hardware knots
    (`--tuning-curve stock|<exponent>`). A power curve (not the stock one) because it gives the darks
    ~2× the codes (the hardware's first 1/64 segment is linear: slope 9.7 vs 4.9), makes the shading
-   map exact at every level, and spreads the LUT's grid evenly. Generated once and kept with the
+   map exact from code ~38 up (below, the linear first segment makes it slightly weak), and spreads
+   the LUT's grid evenly. Anything modelling it as a pure power is wrong below code ~38. Generated once and kept with the
    calibration, so a libcamera update can't silently change it. The non-LUT look is not a goal.
 2. **TV-fitted colour matrix** (`--from-calib`): from `--ledcalib tv-raw` (TV patches on RAW), one
    matrix with the TV's primaries on the axes and TV white neutral (WOLED white subpixel handled by
@@ -299,8 +326,38 @@ confirmed on films).
    only if the eye check still fails.
 
 **A/B from one measurement session:** fit A `--calib-response off --calib-knee off
---calib-dark-floor off` (the frozen tuning alone, legacy model), B `--calib-knee off
---calib-dark-floor off` (+ the camera model fix), C defaults (+ knee + dark fallback).
+--calib-dark-floor off` (the frozen tuning alone, legacy model — badly wrong below code ~50 on the
+frozen curve's linear toe, so expect it worst in the darks), B `--calib-knee off
+--calib-dark-floor off` (+ the camera model fix), C defaults (+ knee + dark fallback + round-off-
+aware dark end).
+
+### Follow-up (2026-11-20): primary-source research review
+
+`doc/camera-led-calibration-research.md` checked the whole chain against the libcamera
+(`v0.7.1+rpt20260609`) and HyperHDR (`v22.0.0.0beta1`) sources. Confirmed: RAW handling (CSI-2
+packing, `SensorBlackLevels`, ScalerCrop mapping, same frame as the ISP output), the freeze
+(`ce_enable 0`, ALSC `n_iter 0`, CT from manual gains, saturation on top of the matrix, tuning file
+read at `CameraManager::start`), HyperHDR's NV12 decode = our encoder (limited BT.601, ≤2 codes).
+Acted on:
+- **HyperHDR v22 is not linear**: temperature in linear light, sRGB re-encode, then user gamma;
+  each LED area is averaged **in linear light**. At gamma 1 a 10%-white area drove the LEDs at 35%
+  and equal drive was the eye white only at 127 (G/R 0.38 near black vs 0.63). → **HyperHDR gamma
+  2.2** (mixed areas get the right light; the white balance is nearly level-independent above the
+  first drive steps), the dark fallback fades to the eye white's light, and the round-off-aware dark end.
+- **Colour-gain clipping**: the ISP applies `-b` before its matrix and clips there (red at 38% of
+  the sensor range with `-b 2.632,1.626`) — invisible to the sensor-clip and post-matrix checks.
+  → `-b 1,1` (the TV-fitted matrix divides the gains out anyway), and pre-matrix clip checks:
+  make-tuning (`wb·dg·a·raw`), the RAW→ISP map and the response fit (`CCM⁻¹·lin(isp)` from the
+  matrix recorded in `meta_<phase>.json`).
+- **tv-raw under an interim frozen tuning** (`--make-tuning` without `--from-calib`): the matrix
+  fit's per-channel ISP gain comes from tv-raw's ISP readings, which the stock tuning makes
+  scene-adaptive (±5% ALSC). make-tuning warns otherwise.
+- **Response fit**: corrects each step for libcamera's exposure-rounding digital gain (up to a few
+  % at short shutters; the RAW doesn't see it, now recorded as `digital_gain`), uses the tuning
+  file's own tone curve as the smoothness prior and splices its shape below the measured range.
+- `-g` can't go lower (imx708 minimum 1.12): too bright → shorter shutter.
+Not acted on (yet): calibration solid frames as NV12 (±1-2 code round trip), TV side on RAW,
+exposure bracketing of the dark end, extra R/G/B eye anchors (3×3 metameric correction).
 
 ## Gamma ramp probe (`--ledcalib gamma`, implemented 2026-06-15)
 
@@ -414,6 +471,7 @@ earlier tetrahedral preference):**
 | trilinear 17³ | 2.91 ms | 17.45 ms |
 | trilinear 33³ | 3.00 ms | 17.55 ms |
 | trilinear 64³ | ~3.0 ms | 17.5 ms |
+| trilinear 33³ vs 65³ (+shading, 768×432, 2026-11-20) | — | 17.45 vs 17.58 ms |
 
 Tetrahedral is **rejected** on v3d: 16 dependent `texelFetch`es + branching per packed Y fragment
 → +8 ms p50. Chosen: **HW trilinear with a 33³ (or up to 64³) LUT** — trilinear's interpolation
@@ -429,7 +487,11 @@ accuracy at ~1/7 the cost. Net feature cost ~+1 ms p50, accepted. Test hooks (id
   extra anchors can reduce it.
 - **RAW for the LED dark end — resolved 2026-11.** The LED sweep is measured on RAW (dual stream)
   and mapped into the ISP-linear domain by the fit (see Phase 3), which also removes the bright
-  end's ISP clip/shoulder. `--calib-curve-floor` regularization still applies below 5% output.
+  end's ISP clip/shoulder. With a resolved staircase the curve bottom is rebuilt from the measured
+  drive steps; `--calib-curve-floor` regularization only remains for channels without one.
+- **LUT(avg) vs HyperHDR's linear-light averaging.** HyperHDR averages each LED area in linear
+  light; with gamma 2.2 a mixed area's LED light is the area's mean light, as the TV's. The LUT is
+  still applied per pixel before that average (the caveat above).
 - **Trilinear near white.** Interpolating between gray nodes and tinted neighbours that the gamut
   mapping had to adjust still dips the gray axis' brightness by up to ~1.6% between nodes near
   white (was ~4.5% before the near-neutral overflow change). Below visibility; a denser LUT would
