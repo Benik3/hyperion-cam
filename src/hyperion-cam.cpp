@@ -3083,6 +3083,9 @@ int main(int argc, char *argv[])
 		("tuning-base", po::value<std::string>(&_makeTuningCfg.basePath), "--make-tuning: stock tuning file to start from (default: the system file for the detected sensor)")								  //
 		("tuning-curve", po::value<std::string>(&_makeTuningCfg.curve)->default_value("2.2"), "--make-tuning: tone curve, a power-law exponent (default 2.2) or 'stock'")										  //
 		("from-calib", po::value<std::string>(&_makeTuningCfg.fromCalib), "--make-tuning: calib dir with tv_raw.csv (--ledcalib tv-raw) -> fit the colour matrix to the TV")								  //
+		("calib-response", po::value<std::string>(&_ledCalibFitCfg.response)->default_value("auto"), "--ledcalib-fit camera model: auto (measured tone curve from camera_response.csv + LEDs on RAW if present), on (require), off (legacy power law)")	  //
+		("calib-knee", po::value<std::string>(&_ledCalibFitCfg.knee)->default_value("auto"), "--ledcalib-fit soft knee: auto (start at 85% of full LED output), off, or the start in percent (50-99)")							  //
+		("calib-dark-floor", po::value<std::string>(&_ledCalibFitCfg.darkFloor)->default_value("auto"), "--ledcalib-fit dark fallback: below this camera luma blend to neutral equal drive; auto (TV black + 8 codes), off, or a level")		  //
 		("ledcalib-fit", po::bool_switch(&_ledCalibFit)->default_value(false), "Fit the --ledcalib measurements in --calib-out into a .cube LUT and exit (no camera needed)")										  //
 		("ledcalib-fit-selftest", po::bool_switch(&_ledCalibFitSelftest)->default_value(false), "Run the fit pipeline on a simulated LED/camera chain and verify closed-loop accuracy")								  //
 		("lut-out", po::value<std::string>(&_ledCalibFitCfg.lutOut), "Output .cube path for --ledcalib-fit (default <calib-out>/lut.cube)")																			  //

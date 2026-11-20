@@ -92,7 +92,7 @@ namespace
 	// kGamma0*ln(z) is smooth for both the stock (S-ish) and a power-law curve,
 	// whereas g itself has huge curvature near z -> 0.
 	constexpr double kGamma0 = 2.2;
-	constexpr double kLambda = 40.0; // smoothness weight vs data (hat weight <= 1.05)
+	constexpr double kLambda = 10.0; // smoothness weight vs data; 10 follows the ISP's hardware-knot corners (selftest: 40 rounds them off >4%, 4 fits noise)
 
 	double hat(double z) { return 0.05 + std::min(z, 255.0 - z) / 127.5; }
 }

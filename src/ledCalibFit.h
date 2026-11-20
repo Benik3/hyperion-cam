@@ -30,6 +30,14 @@ struct LedCalibFitConfig
 	// meta.json "white_level" (the --ledcalib-white-level the sweeps ran with),
 	// falling back to 127. Set >0 to override at fit time. doc/led-lut-calibration.md.
 	int whiteAnchorLevel = 0;
+	// Camera model: "auto" = the measured tone curve when camera_response.csv
+	// exists (and the LEDs on RAW when led_sweep.csv has RAW columns), else the
+	// legacy power law; "on" = require it; "off" = force the legacy model.
+	std::string response = "auto";
+	// Soft knee: "auto" (start at 85% of full LED output), "off", or the start in %.
+	std::string knee = "auto";
+	// Dark fallback floor (encoded camera luma): "auto" (TV black + one LUT step), "off", or a level.
+	std::string darkFloor = "auto";
 	bool verbose = false;
 };
 
