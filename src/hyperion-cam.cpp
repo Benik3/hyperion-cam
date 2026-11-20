@@ -682,10 +682,22 @@ static inline bool flatbufTryConnect()
 // In this mode camera frames are never streamed to HyperHDR; the only flatbuffer
 // traffic is small solid-color frames driving all LEDs to one color.
 static bool _ledCalibMode = false;
-static bool _ledCalibRaw = false;	   // --ledcalib gamma --gamma-raw: capture Bayer
-static uint32_t _ledCalibRawFourcc = 0; // negotiated raw pixel-format fourcc
+// Dual-stream capture (tv-raw, response, led, gamma --gamma-raw): a Raw-role
+// stream next to the ISP stream, in the SAME sensor mode production selects, so
+// every request carries the linear Bayer frame matching the ISP frame.
+static bool _ledCalibDual = false;
+static libcamera::Stream *_ledCalibRawStream = nullptr;
+static libcamera::Stream *_ledCalibIspStream = nullptr;
+static uint32_t _ledCalibRawFourcc = 0; // negotiated raw pixel-format fourcc (base, no modifier)
+static bool _ledCalibRawPacked = true;	// MIPI CSI2 packed
+static int _ledCalibRawBits = 10;
 static int _ledCalibRawW = 0;
 static int _ledCalibRawH = 0;
+static int _ledCalibRawStride = 0;
+static libcamera::Rectangle _ledCalibModeCrop; // ScalerCropMaximum of the configured mode
+// Per-frame exposure override requested by the calibration engine (response
+// shutter sweep); 0 = the base --shutter.
+static int _ledCalibExposureUs = 0;
 static LedCalib *_ledCalib = nullptr;
 static LedCalibWeb *_ledCalibWeb = nullptr;
 static int _ledCalibWebPort = 8080;
@@ -2472,6 +2484,142 @@ static void transformImgRgbGpuDmabuf(int fd, int offsetBytes, int64_t sensorTsNs
 
 static void processRequest(Request *request);
 
+// Hand one completed request to the calibration engine: the ISP frame, the
+// matching RAW frame (dual-stream phases) with its ISP->raw geometry, and the
+// request metadata (exposure/gains/CCM/black level).
+static void ledCalibFeed(Request *request)
+{
+	FrameBuffer *ispBuf = request->findBuffer(_ledCalibIspStream);
+	if (!ispBuf)
+		return;
+	auto ispIt = _mappedBuffers.find(ispBuf);
+	if (ispIt == _mappedBuffers.end() || ispIt->second.empty())
+		return;
+
+	const ControlList &md = request->metadata();
+	LedCalibFrameMeta meta;
+	if (auto v = md.get(controls::ExposureTime))
+		meta.exposureUs = *v;
+	if (auto v = md.get(controls::AnalogueGain))
+		meta.analogueGain = *v;
+	if (auto v = md.get(controls::DigitalGain))
+		meta.digitalGain = *v;
+	if (auto v = md.get(controls::ColourGains))
+	{
+		meta.colourGains[0] = (*v)[0];
+		meta.colourGains[1] = (*v)[1];
+	}
+	if (auto v = md.get(controls::ColourCorrectionMatrix))
+	{
+		for (int i = 0; i < 9; i++)
+			meta.ccm[i] = (*v)[i];
+		meta.haveCcm = true;
+	}
+
+	LedCalibRawFrame raw;
+	const LedCalibRawFrame *rawPtr = nullptr;
+	if (_ledCalibDual && _ledCalibRawStream)
+	{
+		FrameBuffer *rawBuf = request->findBuffer(_ledCalibRawStream);
+		auto rawIt = rawBuf ? _mappedBuffers.find(rawBuf) : _mappedBuffers.end();
+		if (rawIt != _mappedBuffers.end() && !rawIt->second.empty())
+		{
+			raw.data = rawIt->second[0].data();
+			raw.width = _ledCalibRawW;
+			raw.height = _ledCalibRawH;
+			raw.stride = _ledCalibRawStride;
+			raw.fourcc = _ledCalibRawFourcc;
+			raw.packed = _ledCalibRawPacked;
+			raw.bits = _ledCalibRawBits;
+			// Black levels are reported at 16-bit scale, order R, Gr, Gb, B.
+			if (auto bl = md.get(controls::SensorBlackLevels))
+			{
+				const double sc = static_cast<double>(1 << (16 - _ledCalibRawBits));
+				raw.black[0] = (*bl)[0] / sc;
+				raw.black[1] = 0.5 * ((*bl)[1] + (*bl)[2]) / sc;
+				raw.black[2] = (*bl)[3] / sc;
+			}
+			// ISP pixel -> raw pixel: the ISP shows the ScalerCrop rectangle
+			// (pixel-array coords) scaled to its output; the raw frame is the
+			// sensor mode's crop (ScalerCropMaximum) binned to the raw size.
+			libcamera::Rectangle sc = _ledCalibModeCrop;
+			if (auto v = md.get(controls::ScalerCrop))
+				sc = *v;
+			const libcamera::Rectangle &mc = _ledCalibModeCrop;
+			if (mc.width > 0 && mc.height > 0 && _imgWidthToSend > 0 && _imgHeightToSend > 0)
+			{
+				const double kx = static_cast<double>(_ledCalibRawW) / mc.width;
+				const double ky = static_cast<double>(_ledCalibRawH) / mc.height;
+				raw.ax = (static_cast<double>(sc.x) - mc.x) * kx;
+				raw.bx = static_cast<double>(sc.width) / _imgWidthToSend * kx;
+				raw.ay = (static_cast<double>(sc.y) - mc.y) * ky;
+				raw.by = static_cast<double>(sc.height) / _imgHeightToSend * ky;
+			}
+			rawPtr = &raw;
+		}
+	}
+
+	// Diagnostics: HYPERCAM_CALIB_RAW_DUMP=<dir> writes one ISP frame (isp.ppm)
+	// and the RAW frame as a half-res RGB image (raw.ppm, 2x2 Bayer quad -> one
+	// pixel, black-subtracted, scaled) plus the ISP->raw mapping, after 30
+	// frames, to verify the geometry offline (doc/led-lut-calibration.md).
+	static const char *dumpDir = std::getenv("HYPERCAM_CALIB_RAW_DUMP");
+	static int dumpCount = 0;
+	if (dumpDir && rawPtr && ++dumpCount == 30)
+	{
+		const std::string d(dumpDir);
+		{
+			std::ofstream f(d + "/isp.ppm", std::ios::binary);
+			f << "P6\n" << _imgWidthToSend << " " << _imgHeightToSend << "\n255\n";
+			const uint8_t *img = ispIt->second[0].data();
+			for (int y = 0; y < _imgHeightToSend; y++)
+				for (int x = 0; x < _imgWidthToSend; x++)
+				{
+					const uint8_t *px = img + static_cast<size_t>(y) * _strideBgr + static_cast<size_t>(x) * _bppBgr;
+					// BGR888 = B,G,R in memory; XBGR8888 = R,G,B,X; XRGB8888 = B,G,R,X
+					const bool bgr = (_bppBgr == 3) || _swapRb4;
+					const char rgb[3] = {static_cast<char>(bgr ? px[2] : px[0]), static_cast<char>(px[1]),
+										 static_cast<char>(bgr ? px[0] : px[2])};
+					f.write(rgb, 3);
+				}
+		}
+		{
+			const int hw = raw.width / 2, hh = raw.height / 2;
+			std::vector<double> plane(static_cast<size_t>(hw) * hh * 3, 0.0);
+			double mx = 1e-9;
+			for (int y = 0; y < hh * 2; y++)
+			{
+				const uint8_t *row = raw.data + static_cast<size_t>(y) * raw.stride;
+				for (int x = 0; x < hw * 2; x++)
+				{
+					const int grp = (x >> 2) * 5, within = x & 3;
+					const int v = raw.packed ? ((row[grp + within] << 2) | ((row[grp + 4] >> (within * 2)) & 3))
+											 : (row[2 * x] | (row[2 * x + 1] << 8));
+					// BGGR: (0,0)=B (0,1)=G (1,0)=G (1,1)=R  (dump assumes the production order)
+					const int c = ((y & 1) == 0) ? ((x & 1) == 0 ? 2 : 1) : ((x & 1) == 0 ? 1 : 0);
+					double &p = plane[(static_cast<size_t>(y / 2) * hw + x / 2) * 3 + c];
+					p += (c == 1 ? 0.5 : 1.0) * (v - raw.black[c]);
+				}
+			}
+			for (double v : plane)
+				mx = std::max(mx, v);
+			std::ofstream f(d + "/raw.ppm", std::ios::binary);
+			f << "P6\n" << hw << " " << hh << "\n255\n";
+			for (double v : plane)
+			{
+				const char c = static_cast<char>(std::clamp(255.0 * std::pow(std::max(v, 0.0) / mx, 1.0 / 2.2), 0.0, 255.0));
+				f.write(&c, 1);
+			}
+		}
+		std::ofstream m(d + "/map.txt");
+		m << raw.ax << " " << raw.bx << " " << raw.ay << " " << raw.by << " " << raw.width << " " << raw.height << "\n";
+		std::cout << "INFO: HYPERCAM_CALIB_RAW_DUMP wrote isp.ppm raw.ppm map.txt to " << d << std::endl;
+	}
+
+	_ledCalib->processFrame(ispIt->second[0].data(), _imgWidthToSend, _imgHeightToSend, _strideBgr, _bppBgr,
+							_swapRb4, rawPtr, &meta);
+}
+
 static void requestComplete(Request *request)
 {
 	if (request->status() == Request::RequestCancelled)
@@ -2518,14 +2666,8 @@ static void processRequest(Request *request)
 			// this mode (the calibration engine drives the LEDs with synthetic
 			// solid frames instead).
 			if (_ledCalib)
-			{
-				uint8_t *img = it->second[0].data();
-				if (_ledCalibRaw)
-					_ledCalib->processRawFrame(img, _ledCalibRawW, _ledCalibRawH, _strideBgr, _ledCalibRawFourcc);
-				else
-					_ledCalib->processFrame(img, _imgWidthToSend, _imgHeightToSend, _strideBgr, _bppBgr, _swapRb4);
-			}
-			continue;
+				ledCalibFeed(request);
+			break; // one call per request: both streams' buffers are handled there
 		}
 
 		if (autoCalibEnabled())
@@ -2843,7 +2985,7 @@ static void processRequest(Request *request)
 			// locked: the camera must be a consistent comparator across all phases.
 			c.set(controls::AeEnable, false);
 			c.set(controls::AwbEnable, false);
-			c.set(controls::ExposureTime, _shutter);
+			c.set(controls::ExposureTime, (_ledCalibMode && _ledCalibExposureUs > 0) ? _ledCalibExposureUs : _shutter);
 			c.set(controls::AnalogueGain, _gain);
 			c.set(controls::ColourGains, libcamera::Span<const float, 2>({_rGain, _bGain}));
 		}
@@ -2906,7 +3048,7 @@ int main(int argc, char *argv[])
 		("shading-map", po::value<std::string>(&_shadingMapPath), "Apply an ALSC shading-correction map (shading.csv from --ledcalib shading) in the NV12 warp shader")								  //
 		("lut", po::value<std::string>(&_lutPath), "Apply a 3D color LUT (.cube from --ledcalib-fit) in the NV12 warp shader; composes with --shading-map")									  //
 		("no-direct-dispatch", po::bool_switch(&_noDirectDispatch)->default_value(false), "Dispatch frames via the capture event loop instead of directly from the camera thread")														  //
-		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value(""), "One-shot LED 3D-LUT calibration measurement and exit. Phase: tv | led | shading | gamma | gamma_leds | white (run tv+led separately; see doc/calibration-guide.md)")									  //
+		("ledcalib", po::value<std::string>(&_ledCalibPhase)->implicit_value(""), "One-shot LED 3D-LUT calibration measurement and exit. Phase: tv-raw | response | tv | led | shading | gamma | gamma_leds | white (run each separately; see doc/calibration-guide.md)")									  //
 		("calib-tv-roi", po::value<std::string>(&_calibTvRoiStr), "LED calib: ROI inside the TV picture, x,y,w,h; tv/gamma keep the production --crop, so pick it from an --imgout taken WITH the same --crop (see doc/calibration-guide.md)")																	  //
 		("calib-led-roi", po::value<std::string>(&_calibLedRoiStr), "LED calib: ROI on the LED-lit wall, x,y,w,h in raw full-frame coords")																										  //
 		("calib-out", po::value<std::string>(&_ledCalibCfg.outDir)->default_value("ledcalib-out"), "LED calib: output directory for measurement files")																							  //
@@ -2922,6 +3064,8 @@ int main(int argc, char *argv[])
 		("gamma-step", po::value<int>(&_ledCalibCfg.gammaStep)->default_value(1), "LED calib (phase gamma): ramp step in code values (1=every level, 1-64)")											  //
 		("ledcalib-white-level", po::value<int>(&_ledCalibCfg.whiteLevel)->default_value(127), "LED calib: reference white level (1-255). In phase white it drives both the full-screen TV reference and the LEDs; in the tv/led sweeps it is injected as a guaranteed neutral patch and becomes the fit's von-Kries white-anchor level. Default 127 (mid-gray, where the WB eye-match is most trustworthy); 255=full white")					  //
 		("shading-level", po::value<int>(&_ledCalibCfg.shadingLevel)->default_value(180), "LED calib (phase shading): safe gray code value for the full-TV field (avoid clip/ABL)")					  //
+		("response-led-level", po::value<int>(&_ledCalibCfg.responseLedLevel)->default_value(255), "LED calib (phase response): LED drive held during the shutter sweep (0-255)")					  //
+		("response-tv-level", po::value<int>(&_ledCalibCfg.responseTvLevel)->default_value(180), "LED calib (phase response): TV gray patch level held during the shutter sweep (needs --calib-tv-web + --calib-tv-roi in full-frame coords)") //
 		("shading-grid", po::value<std::string>(&_shadingGridStr)->default_value("24x14"), "LED calib (phase shading): sample grid across the TV as UxV")											  //
 		("ledcalib-gamma-selftest", po::bool_switch(&_ledCalibGammaSelftest)->default_value(false), "Unit-test the RAW10 Bayer unpack/averaging and exit (no camera)")								  //
 		("ledcalib-web-dryrun", po::bool_switch(&_ledCalibWebDryrun)->default_value(false), "Start only the TV web page and cycle demo patches (no camera) to test it; uses --calib-tv-port")		  //
@@ -3236,10 +3380,10 @@ int main(int argc, char *argv[])
 		}
 		if (_ledCalibPhase != "white" && _ledCalibPhase != "tv" &&
 			_ledCalibPhase != "led" && _ledCalibPhase != "gamma" && _ledCalibPhase != "gamma_leds" &&
-			_ledCalibPhase != "shading")
+			_ledCalibPhase != "shading" && _ledCalibPhase != "tv-raw" && _ledCalibPhase != "response")
 		{
-			std::cout << "ERROR: --ledcalib needs a phase: tv | led | shading | gamma | gamma_leds | white\n"
-						 "       (run tv and led separately; the fit derives white from their white points)" << std::endl;
+			std::cout << "ERROR: --ledcalib needs a phase: tv-raw | response | tv | led | shading | gamma | gamma_leds | white\n"
+						 "       (run each separately; the fit derives white from the tv/led white points)" << std::endl;
 			return EXIT_FAILURE;
 		}
 		const bool gammaMode = (_ledCalibPhase == "gamma");
@@ -3247,6 +3391,8 @@ int main(int argc, char *argv[])
 		const bool shadingMode = (_ledCalibPhase == "shading");
 		const bool tvMode = (_ledCalibPhase == "tv");
 		const bool ledMode = (_ledCalibPhase == "led");
+		const bool tvRawMode = (_ledCalibPhase == "tv-raw");
+		const bool responseMode = (_ledCalibPhase == "response");
 		auto parseRoi = [](const std::string &s, LedCalibRoi &roi)
 		{
 			return sscanf(s.c_str(), "%d,%d,%d,%d", &roi.x, &roi.y, &roi.w, &roi.h) == 4 && roi.w > 0 && roi.h > 0;
@@ -3257,12 +3403,12 @@ int main(int argc, char *argv[])
 		// white is a manual eye-match (HyperHDR white balance) — neither needs a ROI.
 		bool roiOk = true;
 		const char *roiNeed = nullptr;
-		if (tvMode || gammaMode)
+		if (tvMode || gammaMode || tvRawMode)
 		{
 			roiNeed = "--calib-tv-roi";
 			roiOk = parseRoi(_calibTvRoiStr, _ledCalibCfg.tvRoi);
 		}
-		else if (ledMode || gammaLedsMode)
+		else if (ledMode || gammaLedsMode || responseMode)
 		{
 			roiNeed = "--calib-led-roi";
 			roiOk = parseRoi(_calibLedRoiStr, _ledCalibCfg.ledRoi);
@@ -3276,6 +3422,11 @@ int main(int argc, char *argv[])
 			std::cout << "ERROR: --ledcalib " << _ledCalibPhase << " requires " << roiNeed
 					  << " as x,y,w,h" << std::endl;
 			return EXIT_FAILURE;
+		}
+		if (responseMode && !_ledCalibCfg.tvWeb && _ledCalibCfg.tvRoi.w > 0)
+		{
+			std::cout << "INFO: --ledcalib response without --calib-tv-web: TV ROI ignored (LED-only sweep)" << std::endl;
+			_ledCalibCfg.tvRoi = LedCalibRoi{};
 		}
 		if (shadingMode)
 		{
@@ -3296,6 +3447,7 @@ int main(int argc, char *argv[])
 			{
 				// Inverse homography: unit square (u,v in [0,1]) -> input pixels,
 				// matching the production warp's quad ordering (TL,TR,BL,BR).
+				// (Also computed for tv-raw below: it places the peak-white window.)
 				cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
 				cv::Mat Huv = cv::getPerspectiveTransform(_imgQuad, dstUnit);
 				cv::Mat invUv;
@@ -3336,7 +3488,18 @@ int main(int argc, char *argv[])
 		_ledCalibCfg.whiteLevel = std::clamp(_ledCalibCfg.whiteLevel, 1, 255);
 		// tv/gamma/shading show full-screen TV fields and are always web-driven.
 		// Check this first so the missing-web error wins over the tty error below.
-		if ((gammaMode || shadingMode || tvMode) && !_ledCalibCfg.tvWeb)
+		if (tvRawMode && _transformEn)
+		{
+			cv::Point2f dstUnit[4] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
+			cv::Mat Huv = cv::getPerspectiveTransform(_imgQuad, dstUnit);
+			cv::Mat invUv;
+			cv::invert(Huv, invUv);
+			for (int r = 0; r < 3; r++)
+				for (int c = 0; c < 3; c++)
+					_ledCalibCfg.invHomography[r * 3 + c] = invUv.at<double>(r, c);
+			_ledCalibCfg.haveHomography = true;
+		}
+		if ((gammaMode || shadingMode || tvMode || tvRawMode) && !_ledCalibCfg.tvWeb)
 		{
 			std::cout << "ERROR: --ledcalib " << _ledCalibPhase << " requires --calib-tv-web" << std::endl;
 			return EXIT_FAILURE;
@@ -3351,14 +3514,16 @@ int main(int argc, char *argv[])
 		// All checks passed and the run will start: create --calib-out now (white
 		// writes no files) so a bad/unwritable path fails here, not after a
 		// multi-minute sweep.
-		if ((gammaMode || gammaLedsMode || shadingMode || tvMode || ledMode) && !LedCalib::ensureDir(_ledCalibCfg.outDir))
+		if ((gammaMode || gammaLedsMode || shadingMode || tvMode || ledMode || tvRawMode || responseMode) &&
+			!LedCalib::ensureDir(_ledCalibCfg.outDir))
 			return EXIT_FAILURE;
 		_ledCalibCfg.phase = _ledCalibPhase;
 		_ledCalibCfg.verbose = _verbose;
-		// Raw ROI scaling reference = the resolution the ROI was picked at.
-		_ledCalibCfg.gammaRefW = _width;
-		_ledCalibCfg.gammaRefH = _height;
-		_ledCalibRaw = gammaMode && _ledCalibCfg.gammaRaw;
+		// RAW next to the ISP stream: the TV RAW probe, the response sweep, the
+		// LED sweep (LEDs measured on RAW: no ISP clip/shoulder) and --gamma-raw.
+		_ledCalibDual = tvRawMode || responseMode || ledMode || (gammaMode && _ledCalibCfg.gammaRaw);
+		_ledCalibCfg.captureRaw = _ledCalibDual;
+		_ledCalibCfg.baseExposureUs = _shutter;
 		if (gammaLedsMode && _ledCalibCfg.gammaRaw)
 			std::cout << "WARNING: --gamma-raw ignored for --ledcalib gamma_leds (LED-wall ISP RGB only)" << std::endl;
 		// Configured sweep window geometry (Phase 0 overrides to fullscreen).
@@ -3375,7 +3540,7 @@ int main(int argc, char *argv[])
 		// TV-side phases (tv/gamma/shading) keep the production --crop so their
 		// geometry matches runtime; phases that measure the LED wall (led/white)
 		// need the full frame.
-		const bool keepCrop = shadingMode || gammaMode || tvMode;
+		const bool keepCrop = shadingMode || gammaMode || tvMode || tvRawMode;
 		_transformEn = false; // we sample the frame directly; no GPU warp
 		if (!keepCrop && _cropEn)
 		{
@@ -3391,7 +3556,7 @@ int main(int argc, char *argv[])
 		// uncorrected). Raw gamma is diagnostic and not shaded.
 		if (!_shadeGains.empty())
 		{
-			if ((tvMode || (gammaMode && !_ledCalibCfg.gammaRaw)))
+			if (tvMode || (gammaMode && !_ledCalibCfg.gammaRaw))
 			{
 				const double cx = _ledCalibCfg.tvRoi.x + _ledCalibCfg.tvRoi.w / 2.0;
 				const double cy = _ledCalibCfg.tvRoi.y + _ledCalibCfg.tvRoi.h / 2.0;
@@ -3450,6 +3615,8 @@ int main(int argc, char *argv[])
 			[](int code)
 			{ imgOutExit(code); },
 			_ledCalibWeb);
+		_ledCalib->setExposureFn([](int us)
+								 { _ledCalibExposureUs = us; });
 	}
 
 	// Validate mutually exclusive options
@@ -3590,10 +3757,16 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	// Stream. The --gamma-raw probe needs the sensor's Bayer stream; everything
-	// else uses the processed Viewfinder stream.
+	// Stream: the processed Viewfinder stream; the RAW calibration phases add a
+	// Raw-role stream as config->at(1) (same requests, same sensor mode).
 	std::unique_ptr<CameraConfiguration> config =
-		_camera->generateConfiguration({_ledCalibRaw ? StreamRole::Raw : StreamRole::Viewfinder});
+		_ledCalibDual ? _camera->generateConfiguration({StreamRole::Viewfinder, StreamRole::Raw})
+					  : _camera->generateConfiguration({StreamRole::Viewfinder});
+	if (!config || config->empty() || (_ledCalibDual && config->size() < 2))
+	{
+		std::cout << "ERROR: camera stream configuration not available" << std::endl;
+		return EXIT_FAILURE;
+	}
 
 	// Apply native libcamera transform (rotation + horizontal/vertical flip)
 	if (_rotate != 0 || _hflip || _vflip)
@@ -3673,15 +3846,7 @@ int main(int argc, char *argv[])
 		std::cout << std::endl;
 	}
 
-	if (_ledCalibRaw)
-	{
-		// Keep the Raw role's negotiated Bayer format (e.g. SRGGB10_CSI2P);
-		// _bppBgr is irrelevant for the packed raw path.
-		if (_verbose)
-			std::cout << "INFO: --gamma-raw using raw stream format "
-					  << streamConfig.pixelFormat.toString() << std::endl;
-	}
-	else if (_useNv12)
+	if (_useNv12)
 	{
 		streamConfig.pixelFormat = libcamera::formats::NV12;
 	}
@@ -3756,6 +3921,51 @@ int main(int argc, char *argv[])
 				  << ", output scaled to " << _width << "x" << _height << std::endl;
 	}
 
+	// Dual stream: pick the RAW size whose sensor mode is the one an ISP-only
+	// configuration (= production) selects. The pipeline chooses the mode from
+	// the RAW size when one is present, so a wrong size would silently change
+	// binning / field of view. Identify the mode by its ScalerCropMaximum.
+	if (_ledCalibDual)
+	{
+		std::unique_ptr<CameraConfiguration> probe = _camera->generateConfiguration({StreamRole::Viewfinder});
+		StreamConfiguration &pc = probe->at(0);
+		pc.pixelFormat = streamConfig.pixelFormat;
+		pc.size = streamConfig.size;
+		pc.colorSpace = streamConfig.colorSpace;
+		probe->validate();
+		if (_camera->configure(probe.get()) < 0)
+		{
+			std::cout << "ERROR: probe configuration failed" << std::endl;
+			return EXIT_FAILURE;
+		}
+		const auto wantCrop = _camera->properties().get(properties::ScalerCropMaximum);
+		StreamConfiguration &rc = config->at(1);
+		std::vector<libcamera::Size> sizes = rc.formats().sizes(rc.pixelFormat);
+		std::sort(sizes.begin(), sizes.end(), [](const libcamera::Size &a, const libcamera::Size &b)
+				  { return a.width * a.height < b.width * b.height; });
+		bool found = false;
+		for (const libcamera::Size &sz : sizes)
+		{
+			rc.size = sz;
+			if (config->validate() == CameraConfiguration::Status::Invalid || _camera->configure(config.get()) < 0)
+				continue;
+			const auto crop = _camera->properties().get(properties::ScalerCropMaximum);
+			if (wantCrop && crop && *crop == *wantCrop)
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+		{
+			std::cout << "ERROR: no RAW stream size reproduces the production sensor mode "
+					  << (wantCrop ? wantCrop->toString() : std::string("?")) << std::endl;
+			return EXIT_FAILURE;
+		}
+		std::cout << "INFO: RAW stream " << rc.size.toString() << " " << rc.pixelFormat.toString()
+				  << " (sensor mode area " << wantCrop->toString() << ", same as production)" << std::endl;
+	}
+
 	// Store original configuration string for comparison if adjusted
 	std::string requestedConfig = streamConfig.toString();
 
@@ -3773,16 +3983,28 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if (_ledCalibRaw)
+	if (_ledCalibDual)
 	{
-		_ledCalibRawFourcc = streamConfig.pixelFormat.fourcc();
-		_ledCalibRawW = static_cast<int>(streamConfig.size.width);
-		_ledCalibRawH = static_cast<int>(streamConfig.size.height);
-		_strideBgr = static_cast<int>(streamConfig.stride);
-		std::cout << "INFO: --gamma-raw stream " << _ledCalibRawW << "x" << _ledCalibRawH
-				  << " " << streamConfig.pixelFormat.toString() << " stride=" << _strideBgr << std::endl;
+		const StreamConfiguration &rc = config->at(1);
+		_ledCalibRawFourcc = rc.pixelFormat.fourcc();
+		// MIPI_FORMAT_MOD_CSI2_PACKED = fourcc_mod_code(MIPI, 1); vendor MIPI = 0x0b.
+		constexpr uint64_t kCsi2Packed = (static_cast<uint64_t>(0x0b) << 56) | 1;
+		_ledCalibRawPacked = (rc.pixelFormat.modifier() == kCsi2Packed);
+		const std::string fn = rc.pixelFormat.toString();
+		_ledCalibRawBits = (fn.find("12") != std::string::npos) ? 12 : (fn.find("16") != std::string::npos) ? 16 : 10;
+		_ledCalibRawW = static_cast<int>(rc.size.width);
+		_ledCalibRawH = static_cast<int>(rc.size.height);
+		_ledCalibRawStride = static_cast<int>(rc.stride);
+		if (_ledCalibRawPacked && _ledCalibRawBits != 10)
+		{
+			std::cout << "ERROR: RAW format " << fn << " not supported (packed RAW10 or 16-bit only)" << std::endl;
+			return EXIT_FAILURE;
+		}
+		if (_verbose)
+			std::cout << "INFO: RAW " << fn << " " << _ledCalibRawW << "x" << _ledCalibRawH
+					  << " stride=" << _ledCalibRawStride << (_ledCalibRawPacked ? " packed" : " unpacked") << std::endl;
 	}
-	else if (_useNv12)
+	if (_useNv12)
 	{
 		if (streamConfig.pixelFormat != libcamera::formats::NV12)
 		{
@@ -3928,6 +4150,19 @@ int main(int argc, char *argv[])
 
 	_camera->configure(config.get());
 
+	if (_ledCalibMode)
+	{
+		_ledCalibIspStream = streamConfig.stream();
+		_ledCalibRawStream = _ledCalibDual ? config->at(1).stream() : nullptr;
+		if (auto mc = _camera->properties().get(properties::ScalerCropMaximum))
+			_ledCalibModeCrop = *mc;
+		else if (_ledCalibDual)
+		{
+			std::cout << "ERROR: ScalerCropMaximum unknown: cannot map ROIs into the RAW frame" << std::endl;
+			return EXIT_FAILURE;
+		}
+	}
+
 	// Show ScalerCropMaximum property after configuration (required by libcamera)
 	if (_verbose || _cropEn)
 	{
@@ -3973,8 +4208,14 @@ int main(int argc, char *argv[])
 	// Frame Capture
 	Stream *stream = streamConfig.stream();
 	const std::vector<std::unique_ptr<FrameBuffer>> &buffers = allocator->buffers(stream);
+	// Dual stream: every request carries one ISP and one RAW buffer.
+	Stream *rawStream = _ledCalibDual ? config->at(1).stream() : nullptr;
+	static const std::vector<std::unique_ptr<FrameBuffer>> kNoBuffers;
+	const std::vector<std::unique_ptr<FrameBuffer>> &rawBuffers = rawStream ? allocator->buffers(rawStream) : kNoBuffers;
+	const unsigned int nRequests =
+		rawStream ? static_cast<unsigned int>(std::min(buffers.size(), rawBuffers.size())) : static_cast<unsigned int>(buffers.size());
 	std::vector<std::unique_ptr<Request>> requests;
-	for (unsigned int i = 0; i < buffers.size(); ++i)
+	for (unsigned int i = 0; i < nRequests; ++i)
 	{
 		std::unique_ptr<Request> request = _camera->createRequest();
 		if (!request)
@@ -3985,6 +4226,8 @@ int main(int argc, char *argv[])
 
 		const std::unique_ptr<FrameBuffer> &buffer = buffers[i];
 		int ret = request->addBuffer(stream, buffer.get());
+		if (ret >= 0 && rawStream)
+			ret = request->addBuffer(rawStream, rawBuffers[i].get());
 		if (ret < 0)
 		{
 			std::cout << "ERROR: Can't set buffer for request"
@@ -4004,8 +4247,13 @@ int main(int argc, char *argv[])
 
 	_camera->requestCompleted.connect(requestComplete);
 
-	// Buffers memory mapping
-	for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : buffers)
+	// Buffers memory mapping (ISP stream, plus the RAW stream when dual)
+	std::vector<const libcamera::FrameBuffer *> toMap;
+	for (const auto &b : buffers)
+		toMap.push_back(b.get());
+	for (const auto &b : rawBuffers)
+		toMap.push_back(b.get());
+	for (const libcamera::FrameBuffer *buffer : toMap)
 	{
 		for (const FrameBuffer::Plane &plane : buffer->planes())
 		{
@@ -4017,7 +4265,7 @@ int main(int argc, char *argv[])
 				return EXIT_FAILURE;
 			}
 			uint8_t *planePtr = static_cast<uint8_t *>(memory) + plane.offset;
-			_mappedBuffers[buffer.get()].push_back(libcamera::Span<uint8_t>(planePtr, plane.length));
+			_mappedBuffers[const_cast<libcamera::FrameBuffer *>(buffer)].push_back(libcamera::Span<uint8_t>(planePtr, plane.length));
 		}
 	}
 
@@ -4106,6 +4354,8 @@ int main(int argc, char *argv[])
 		_ledCalibWeb = nullptr;
 	}
 	allocator->free(stream);
+	if (rawStream)
+		allocator->free(rawStream);
 	delete allocator;
 	if (_transformation)
 	{

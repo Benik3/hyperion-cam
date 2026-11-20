@@ -1,5 +1,6 @@
 #include "ledCalib.h"
 #include "ledCalibWeb.h"
+#include "cameraResponse.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,10 @@ namespace
 	constexpr int64_t kResendIntervalMs = 100;	  // keep HyperHDR fed while a color is held
 	constexpr int64_t kWebAckTimeoutMs = 8000;	  // page must ack a patch within this or we abort
 	constexpr int kMinSettleFrames = 3;			  // fresh camera frames to discard after a web-patch ack
+	// tv-raw peak-white patch: a small centered window, because OLED panels dim
+	// full-field white (ABL) and real highlights are brighter than any full-field
+	// patch. --make-tuning scales the colour matrix so THIS reading sits at ~95%.
+	constexpr double kPeakWindowPct = 10.0;
 
 	// Edge-dense grid level: Chebyshev/cosine nodes -> samples clustered near 0
 	// and 255 (where crush/clip live), sparse in the middle. i in [0,n-1].
@@ -65,14 +70,23 @@ void LedCalib::Measurement::start(int frames)
 	std::memset(sum, 0, sizeof(sum));
 	std::memset(sumSq, 0, sizeof(sumSq));
 	std::memset(sstdSum, 0, sizeof(sstdSum));
+	std::memset(satSum, 0, sizeof(satSum));
+	expSum = 0.0;
+	gainSum = 0.0;
 }
 
 void LedCalib::Measurement::add(const RoiSample &tv, const RoiSample &led)
 {
+	add(tv, led, RoiSample{}, RoiSample{}, nullptr);
+}
+
+void LedCalib::Measurement::add(const RoiSample &tv, const RoiSample &led, const RoiSample &tvRaw,
+								const RoiSample &ledRaw, const LedCalibFrameMeta *meta)
+{
 	if (!active || n >= target)
 		return;
-	const RoiSample *rois[2] = {&tv, &led};
-	for (int roi = 0; roi < 2; roi++)
+	const RoiSample *rois[kSlots] = {&tv, &led, &tvRaw, &ledRaw};
+	for (int roi = 0; roi < kSlots; roi++)
 	{
 		for (int c = 0; c < 3; c++)
 		{
@@ -80,15 +94,22 @@ void LedCalib::Measurement::add(const RoiSample &tv, const RoiSample &led)
 			sum[roi][c] += m;
 			sumSq[roi][c] += m * m;
 			sstdSum[roi][c] += rois[roi]->sstd[c];
+			satSum[roi][c] += rois[roi]->sat[c];
 		}
+	}
+	if (meta)
+	{
+		expSum += static_cast<double>(meta->exposureUs);
+		gainSum += meta->analogueGain;
 	}
 	n++;
 }
 
-void LedCalib::Measurement::finish(double mean[2][3], double tstd[2][3], double sstd[2][3])
+void LedCalib::Measurement::finish(double mean[kSlots][3], double tstd[kSlots][3], double sstd[kSlots][3],
+								   double sat[kSlots][3])
 {
 	const double cnt = std::max(1, n);
-	for (int roi = 0; roi < 2; roi++)
+	for (int roi = 0; roi < kSlots; roi++)
 	{
 		for (int c = 0; c < 3; c++)
 		{
@@ -97,6 +118,8 @@ void LedCalib::Measurement::finish(double mean[2][3], double tstd[2][3], double 
 			const double var = sumSq[roi][c] / cnt - m * m;
 			tstd[roi][c] = std::sqrt(std::max(0.0, var));
 			sstd[roi][c] = sstdSum[roi][c] / cnt;
+			if (sat)
+				sat[roi][c] = satSum[roi][c] / cnt;
 		}
 	}
 	active = false;
@@ -117,6 +140,10 @@ LedCalib::LedCalib(const LedCalibConfig &cfg, SendLedFn sendLed, ExitFn exitFn, 
 		_phase = Phase::GammaLedsWait;
 	else if (_cfg.phase == "shading")
 		_phase = Phase::ShadingWait;
+	else if (_cfg.phase == "tv-raw")
+		_phase = Phase::TvRawWait;
+	else if (_cfg.phase == "response")
+		_phase = Phase::ResponseWait;
 	else
 		_phase = Phase::Done; // validated upstream; never reached
 
@@ -173,31 +200,50 @@ void LedCalib::keyboardLoop()
 	tcsetattr(STDIN_FILENO, TCSANOW, &orig);
 }
 
-void LedCalib::processFrame(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb)
+void LedCalib::processFrame(const uint8_t *img, int width, int height, int strideBytes, int bpp, bool swapRb,
+							const LedCalibRawFrame *raw, const LedCalibFrameMeta *meta)
 {
 	if (_finished)
 		return;
 
 	const int64_t nowMs = steadyMs();
+	if (meta)
+	{
+		_lastMeta = *meta;
+		_haveMeta = true;
+	}
 
+	// RAW phases need the matching Bayer frame; a request that came back
+	// without it is skipped rather than measured half-blind.
+	if (_cfg.captureRaw && !raw)
+	{
+		if (!_rawWarned)
+		{
+			_rawWarned = true;
+			std::cout << "WARNING: frame without its RAW buffer skipped (dual-stream capture)" << std::endl;
+		}
+		return;
+	}
+
+	const bool tvWanted = _cfg.tvRoi.w > 0 && _cfg.tvRoi.h > 0;
 	if (!_roiChecked)
 	{
 		_roiChecked = true;
-		auto inFrame = [&](const LedCalibRoi &r)
+		auto inFrame = [&](const LedCalibRoi &r, int w, int h)
 		{
-			return r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= width && r.y + r.h <= height;
+			return r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= w && r.y + r.h <= h;
 		};
-		// tv/gamma need the TV ROI; led/gamma_leds need the LED ROI (the TV ROI is
-		// an optional sanity column); shading samples the whole TV quad and white is
-		// a manual eye-match — neither uses a fixed ROI.
-		const bool gamma = (_cfg.phase == "gamma");
-		const bool tvOnly = gamma || _cfg.phase == "tv";
-		const bool ledPhase = (_cfg.phase == "led" || _cfg.phase == "gamma_leds");
+		// tv/gamma/tv-raw need the TV ROI; led/gamma_leds/response need the LED ROI
+		// (the TV ROI is optional there: a sanity column / second response source);
+		// shading samples the whole TV quad and white is a manual eye-match —
+		// neither uses a fixed ROI.
+		const bool tvOnly = _cfg.phase == "gamma" || _cfg.phase == "tv" || _cfg.phase == "tv-raw";
+		const bool ledPhase = (_cfg.phase == "led" || _cfg.phase == "gamma_leds" || _cfg.phase == "response");
 		bool roiBad = false;
 		if (tvOnly)
-			roiBad = !inFrame(_cfg.tvRoi);
+			roiBad = !inFrame(_cfg.tvRoi, width, height);
 		else if (ledPhase)
-			roiBad = !inFrame(_cfg.ledRoi) || (_cfg.tvRoi.w > 0 && !inFrame(_cfg.tvRoi));
+			roiBad = !inFrame(_cfg.ledRoi, width, height) || (tvWanted && !inFrame(_cfg.tvRoi, width, height));
 		if (roiBad)
 		{
 			std::cout << "ERROR: LedCalib ROI outside the " << width << "x" << height
@@ -207,6 +253,32 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 			finishAll(EXIT_FAILURE);
 			return;
 		}
+		if (raw)
+		{
+			// The same scene areas on the RAW frame (ScalerCrop + sensor-mode crop
+			// + binning). Report them so a misplaced mapping is visible.
+			const bool ledUsed = ledPhase || _cfg.ledRoi.w > 0;
+			const LedCalibRoi rt = mapRoiToRaw(_cfg.tvRoi, *raw);
+			const LedCalibRoi rl = mapRoiToRaw(_cfg.ledRoi, *raw);
+			std::cout << "RAW stream " << raw->width << "x" << raw->height << " fourcc=0x" << std::hex << raw->fourcc
+					  << std::dec << (raw->packed ? " (CSI2 packed)" : " (16-bit)") << ", black "
+					  << raw->black[0] << "/" << raw->black[1] << "/" << raw->black[2] << "; ROI in raw coords:";
+			if (tvWanted)
+				std::cout << " tv " << rt.x << "," << rt.y << "," << rt.w << "," << rt.h;
+			if (ledUsed && _cfg.ledRoi.w > 0)
+				std::cout << " led " << rl.x << "," << rl.y << "," << rl.w << "," << rl.h;
+			std::cout << std::endl;
+			if ((tvWanted && !inFrame(rt, raw->width, raw->height)) ||
+				(ledUsed && _cfg.ledRoi.w > 0 && !inFrame(rl, raw->width, raw->height)))
+			{
+				std::cout << "ERROR: a ROI maps outside the RAW frame (sensor mode crops less than the "
+							 "ISP view?)" << std::endl;
+				finishAll(EXIT_FAILURE);
+				return;
+			}
+		}
+		if (_cfg.phase == "tv-raw")
+			_peakRoiOk = computePeakRoi(width, height, raw);
 		enterPhase(_phase, nowMs);
 	}
 
@@ -226,7 +298,10 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		return;
 	}
 
-	RoiSample tv = sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.tvRoi);
+	// tv-raw's peak-white patch is a small centered window: sample its own ROI.
+	const bool peakNow = _phase == Phase::TvRaw && _tvRawPos < _tvRawPlan.size() && _tvRawPlan[_tvRawPos].peak;
+	const LedCalibRoi &tvRoiNow = (peakNow && _peakRoiOk) ? _peakRoi : _cfg.tvRoi;
+	RoiSample tv = sampleRoi(img, width, height, strideBytes, bpp, swapRb, tvRoiNow);
 	// Match the shaded production output: scale the TV reading by the shading
 	// gain at this ROI's position (identity unless --shading-map was given).
 	for (int c = 0; c < 3; c++)
@@ -234,9 +309,18 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		tv.mean[c] *= _cfg.tvShadeGain[c];
 		tv.sstd[c] *= _cfg.tvShadeGain[c];
 	}
-	const RoiSample led = (_cfg.phase == "gamma" || _cfg.phase == "tv")
+	const bool tvSide = (_cfg.phase == "gamma" || _cfg.phase == "tv" || _cfg.phase == "tv-raw");
+	const RoiSample led = (tvSide || _cfg.ledRoi.w <= 0)
 							  ? RoiSample{}
 							  : sampleRoi(img, width, height, strideBytes, bpp, swapRb, _cfg.ledRoi);
+	RoiSample tvRaw, ledRaw;
+	if (raw)
+	{
+		if (tvWanted)
+			tvRaw = sampleRoiBayer(*raw, mapRoiToRaw(tvRoiNow, *raw));
+		if (!tvSide && _cfg.ledRoi.w > 0)
+			ledRaw = sampleRoiBayer(*raw, mapRoiToRaw(_cfg.ledRoi, *raw));
+	}
 
 	handleKeys(nowMs);
 	if (_finished)
@@ -252,7 +336,8 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 		// above) while the user tunes HyperHDR's white balance or nudges.
 		break;
 	case Phase::Gamma:
-		runGamma(tv, nowMs);
+		// --gamma-raw measures the TV ROI on the Bayer frame (black-subtracted).
+		runGamma(_cfg.gammaRaw ? tvRaw : tv, nowMs);
 		break;
 	case Phase::GammaLeds:
 		runGammaLeds(led, nowMs);
@@ -260,9 +345,15 @@ void LedCalib::processFrame(const uint8_t *img, int width, int height, int strid
 	case Phase::Tv:
 		runTvWeb(tv, led, nowMs);
 		break;
+	case Phase::TvRaw:
+		runTvRaw(tv, tvRaw, meta, nowMs);
+		break;
+	case Phase::Response:
+		runResponse(tv, led, tvRaw, ledRaw, meta, nowMs);
+		break;
 	case Phase::LedBaseline:
 	case Phase::LedSweep:
-		runLed(tv, led, nowMs);
+		runLed(tv, led, tvRaw, ledRaw, meta, nowMs);
 		break;
 	default:
 		// Web wait phases: re-print the URL every few seconds until the user starts.
@@ -290,6 +381,7 @@ LedCalib::RoiSample LedCalib::sampleRoi(const uint8_t *img, int width, int heigh
 
 	uint64_t sum[3] = {0, 0, 0};
 	uint64_t sumSq[3] = {0, 0, 0};
+	uint64_t nsat[3] = {0, 0, 0}; // pixels at the 8-bit ceiling (ISP clip)
 	for (int y = y0; y < y1; y++)
 	{
 		const uint8_t *p = img + static_cast<size_t>(y) * static_cast<size_t>(strideBytes) +
@@ -305,6 +397,9 @@ LedCalib::RoiSample LedCalib::sampleRoi(const uint8_t *img, int width, int heigh
 			sumSq[0] += static_cast<uint64_t>(r) * r;
 			sumSq[1] += static_cast<uint64_t>(g) * g;
 			sumSq[2] += static_cast<uint64_t>(b) * b;
+			nsat[0] += (r >= 254);
+			nsat[1] += (g >= 254);
+			nsat[2] += (b >= 254);
 		}
 	}
 
@@ -315,6 +410,7 @@ LedCalib::RoiSample LedCalib::sampleRoi(const uint8_t *img, int width, int heigh
 		out.mean[c] = m;
 		const double var = static_cast<double>(sumSq[c]) / cnt - m * m;
 		out.sstd[c] = std::sqrt(std::max(0.0, var));
+		out.sat[c] = static_cast<double>(nsat[c]) / cnt;
 	}
 	return out;
 }
@@ -573,6 +669,73 @@ void LedCalib::enterPhase(Phase p, int64_t nowMs)
 				  << " grid across the TV, gray " << _cfg.shadingLevel << "; settling..." << std::endl;
 		break;
 	}
+	case Phase::TvRawWait:
+		setLed(0, 0, 0, nowMs); // LEDs off: the TV alone lights the TV ROI
+		if (_webStarted)
+		{
+			enterPhase(Phase::TvRaw, nowMs);
+			return;
+		}
+		std::cout << "\nLedCalib TV RAW probe (input of --make-tuning's TV colour matrix): open  http://<this-pi>:"
+				  << _web->port() << "/  fullscreen on the TV PC and tap 'begin'." << std::endl;
+		_lastUrlPrintMs = nowMs;
+		break;
+	case Phase::TvRaw:
+		buildTvRawPlan();
+		_tvRawPos = 0;
+		_tvRawRecords.clear();
+		std::cout << "TV RAW probe: " << _tvRawPlan.size() << " patches (colour cube " << _cfg.tvGrid
+				  << "^3, gray ramp, " << kPeakWindowPct << "% peak-white window)." << std::endl;
+		showTvRawPatch(nowMs);
+		break;
+	case Phase::ResponseWait:
+		setLed(0, 0, 0, nowMs);
+		if (_web)
+		{
+			_webSeq++;
+			_web->setState(0, 0, 0, false, 0, 0, 0, _webSeq);
+		}
+		if (_webStarted)
+		{
+			enterPhase(Phase::Response, nowMs);
+			return;
+		}
+		if (_web)
+			std::cout << "\nLedCalib camera response (shutter sweep): open  http://<this-pi>:" << _web->port()
+					  << "/  fullscreen on the TV PC and tap 'begin'." << std::endl;
+		else
+			std::cout << "\nLedCalib camera response (shutter sweep, LEDs only): press Enter to start\n"
+						 "(keep the scene still: the camera steps its shutter over a fixed LED white)." << std::endl;
+		_lastUrlPrintMs = nowMs;
+		break;
+	case Phase::Response:
+	{
+		buildResponsePlan();
+		_respPos = 0;
+		_respRecords.clear();
+		_respStartMs = nowMs;
+		const uint8_t L = static_cast<uint8_t>(std::clamp(_cfg.responseLedLevel, 0, 255));
+		setLed(L, L, L, nowMs);
+		if (_web)
+		{
+			// A fixed TV patch (second, independent response source when the TV ROI is
+			// given); otherwise the page just stays black.
+			const bool tvUsed = _cfg.tvRoi.w > 0;
+			const uint8_t t = tvUsed ? static_cast<uint8_t>(std::clamp(_cfg.responseTvLevel, 0, 255)) : 0;
+			_web->setPatchGeometry(_cfg.patchPct, _cfg.patchX, _cfg.patchY);
+			_tvSeq = ++_webSeq;
+			_web->setState(t, t, t, false, L, L, L, _tvSeq);
+			_tvAckWaitStartMs = nowMs;
+		}
+		std::cout << "Camera response: " << _respPlan.size() << " shutter steps around " << _cfg.baseExposureUs
+				  << " us (1/64x .. 4x, reference steps interleaved), LED " << static_cast<int>(L)
+				  << (_cfg.tvRoi.w > 0 ? ", TV gray " + std::to_string(_cfg.responseTvLevel) : std::string())
+				  << "." << std::endl;
+		startResponseStep(nowMs);
+		// The first step also lets the LEDs + TV settle.
+		_respStepStartMs = nowMs + 1500;
+		break;
+	}
 	case Phase::Done:
 		break;
 	}
@@ -608,10 +771,19 @@ void LedCalib::handleKeys(int64_t nowMs)
 		const bool begin = (c == '\n' || c == '\r' || c == kCalibBeginKey);
 		if (_web && begin && (_phase == Phase::WhiteWait || _phase == Phase::TvWait ||
 							  _phase == Phase::LedWait || _phase == Phase::GammaWait ||
-							  _phase == Phase::GammaLedsWait || _phase == Phase::ShadingWait))
+							  _phase == Phase::GammaLedsWait || _phase == Phase::ShadingWait ||
+							  _phase == Phase::TvRawWait || _phase == Phase::ResponseWait))
 			_webStarted = true;
 		switch (_phase)
 		{
+		case Phase::TvRawWait:
+			if (begin)
+				beginActivePhase(Phase::TvRaw, nowMs);
+			break;
+		case Phase::ResponseWait:
+			if (begin)
+				beginActivePhase(Phase::Response, nowMs);
+			break;
 		case Phase::WhiteWait:
 			if (begin)
 				beginActivePhase(Phase::White, nowMs);
@@ -898,7 +1070,7 @@ void LedCalib::showGammaPatch(int64_t nowMs)
 // 1 = LED wall), advance the plan and print progress.
 void LedCalib::pushGammaRecord(int roi, const char *label)
 {
-	double mean[2][3], tstd[2][3], sstd[2][3];
+	double mean[kSlots][3], tstd[kSlots][3], sstd[kSlots][3];
 	_meas.finish(mean, tstd, sstd);
 	GammaRecord rec;
 	rec.chan = _gammaPlan[_gammaPos][0];
@@ -971,7 +1143,8 @@ void LedCalib::writeGammaCsv()
 		_cfg.outDir + "/" + (leds ? "gamma_leds.csv" : (_cfg.gammaRaw ? "raw_gamma.csv" : "gamma.csv"));
 	std::ofstream f(path);
 	f << "# " << (leds ? "LED-driven (LED-ROI, ISP RGB)" : (_cfg.gammaRaw ? "RAW Bayer-plane" : "ISP RGB"))
-	  << " gamma ramp; mean units " << ((!leds && _cfg.gammaRaw) ? "0..1023 (10-bit)" : "0..255 (8-bit)") << "\n";
+	  << " gamma ramp; mean units "
+	  << ((!leds && _cfg.gammaRaw) ? "0..1023 (10-bit, black-subtracted)" : "0..255 (8-bit)") << "\n";
 	f << "channel,level,meas_r,meas_g,meas_b,tstd_r,tstd_g,tstd_b,sstd_r,sstd_g,sstd_b,frames\n";
 	const char *names[4] = {"R", "G", "B", "gray"};
 	for (const auto &r : _gammaRecords)
@@ -1055,31 +1228,40 @@ void LedCalib::reportGammaLimits()
 				  << std::endl;
 }
 
-// RAW10 CSI2P Bayer-plane ROI averaging. fourcc selects the 2x2 phase.
+// ---- RAW Bayer sampling ----
+//
+// RAW frames come from a second (Raw-role) stream in the SAME request as the
+// ISP frame, at the production sensor mode. Sample values are black-subtracted
+// (SensorBlackLevels metadata) so they are linear in light from 0; the
+// fraction of pixels at the sensor ceiling is kept for clip detection.
 namespace
 {
 	// color at (row,col): 0=R 1=G 2=B. libcamera PixelFormat::fourcc() returns
 	// the V4L2 base fourcc (the CSI2P packing is a modifier, not in the fourcc),
-	// so we key on 'RG10'/'BG10'/'GB10'/'BA10' rather than the packed names.
-	// This sensor negotiates SBGGR10_CSI2P ('BG10', BGGR).
+	// so we key on 'RG10'/'BG10'/'GB10'/'BA10' (and the 12/16-bit variants'
+	// first two letters are the same Bayer order, so match on the low 16 bits).
+	// This sensor negotiates SBGGR10_CSI2P ('BG10', BGGR) with the module's
+	// default 180-degree orientation.
 	inline int bayerColor(uint32_t fourcc, int y, int x)
 	{
 		const int yo = y & 1, xo = x & 1;
-		switch (fourcc)
+		switch (fourcc & 0xffffu)
 		{
-		case 0x30314752: // 'RG10' SRGGB10: RGGB
+		case 0x4752: // 'RG..' RGGB
 			return (yo == 0) ? (xo == 0 ? 0 : 1) : (xo == 0 ? 1 : 2);
-		case 0x30314742: // 'BG10' SBGGR10: BGGR
+		case 0x4742: // 'BG..' BGGR
 			return (yo == 0) ? (xo == 0 ? 2 : 1) : (xo == 0 ? 1 : 0);
-		case 0x30314142: // 'BA10' SGRBG10: GRBG
+		case 0x4142: // 'BA..' GRBG
 			return (yo == 0) ? (xo == 0 ? 1 : 0) : (xo == 0 ? 2 : 1);
-		case 0x30314247: // 'GB10' SGBRG10: GBRG
+		case 0x4247: // 'GB..' GBRG
 			return (yo == 0) ? (xo == 0 ? 1 : 2) : (xo == 0 ? 0 : 1);
 		default:
 			return (yo == 0) ? (xo == 0 ? 2 : 1) : (xo == 0 ? 1 : 0); // assume BGGR (this sensor)
 		}
 	}
 
+	// MIPI CSI2 packed RAW10: 4 pixels in 5 bytes (4 MSB bytes, then one byte of
+	// 2-bit LSBs, pixel 0 in bits 1:0).
 	inline uint16_t raw10p(const uint8_t *row, int x)
 	{
 		const int grp = (x >> 2) * 5;
@@ -1088,33 +1270,60 @@ namespace
 		return static_cast<uint16_t>((static_cast<uint16_t>(row[grp + within]) << 2) |
 									 ((lo >> (within * 2)) & 0x3));
 	}
+
+	inline uint16_t raw16le(const uint8_t *row, int x)
+	{
+		return static_cast<uint16_t>(row[2 * x] | (static_cast<uint16_t>(row[2 * x + 1]) << 8));
+	}
 }
 
-LedCalib::RoiSample LedCalib::sampleRoiBayer(const uint8_t *img, int width, int height, int strideBytes,
-											 uint32_t fourcc, const LedCalibRoi &roi) const
+LedCalibRoi LedCalib::mapRoiToRaw(const LedCalibRoi &roi, const LedCalibRawFrame &raw)
+{
+	// Map the ROI corners, then snap to whole 2x2 Bayer quads (even origin and
+	// size) so every colour plane is sampled over exactly the same area.
+	const double fx0 = raw.ax + raw.bx * roi.x;
+	const double fx1 = raw.ax + raw.bx * (roi.x + roi.w);
+	const double fy0 = raw.ay + raw.by * roi.y;
+	const double fy1 = raw.ay + raw.by * (roi.y + roi.h);
+	LedCalibRoi out;
+	out.x = (static_cast<int>(std::ceil(std::min(fx0, fx1))) + 1) & ~1; // round UP to even: stay inside
+	out.y = (static_cast<int>(std::ceil(std::min(fy0, fy1))) + 1) & ~1;
+	const int x1 = static_cast<int>(std::floor(std::max(fx0, fx1)));
+	const int y1 = static_cast<int>(std::floor(std::max(fy0, fy1)));
+	out.w = std::max(2, (x1 - out.x) & ~1);
+	out.h = std::max(2, (y1 - out.y) & ~1);
+	return out;
+}
+
+LedCalib::RoiSample LedCalib::sampleRoiBayer(const LedCalibRawFrame &raw, const LedCalibRoi &roi)
 {
 	RoiSample out;
-	// raw10p reads up to byte (x>>2)*5+4; cap x at the last pixel whose 5-byte
-	// group fits the row stride, so a width that is not a multiple of 4 with a
-	// tight (unpadded) stride can't over-read past the row.
-	const int safeW = std::min(width, (strideBytes / 5) * 4);
+	if (!raw.data || raw.width <= 0 || raw.height <= 0)
+		return out;
+	// Cap x at the last pixel whose bytes fit the row stride, so a width that is
+	// not a multiple of 4 with a tight (unpadded) stride can't over-read.
+	const int safeW = raw.packed ? std::min(raw.width, (raw.stride / 5) * 4) : std::min(raw.width, raw.stride / 2);
 	const int x0 = std::clamp(roi.x, 0, std::max(0, safeW - 1));
-	const int y0 = std::clamp(roi.y, 0, height - 1);
+	const int y0 = std::clamp(roi.y, 0, raw.height - 1);
 	const int x1 = std::clamp(roi.x + roi.w, x0 + 1, std::max(x0 + 1, safeW));
-	const int y1 = std::clamp(roi.y + roi.h, y0 + 1, height);
+	const int y1 = std::clamp(roi.y + roi.h, y0 + 1, raw.height);
+	const uint16_t ceil = static_cast<uint16_t>((1 << raw.bits) - 2); // within 1 code of full scale
 
 	double sum[3] = {0, 0, 0}, sumSq[3] = {0, 0, 0};
-	uint64_t cnt[3] = {0, 0, 0};
+	uint64_t cnt[3] = {0, 0, 0}, nsat[3] = {0, 0, 0};
 	for (int y = y0; y < y1; y++)
 	{
-		const uint8_t *row = img + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
+		const uint8_t *row = raw.data + static_cast<size_t>(y) * static_cast<size_t>(raw.stride);
 		for (int x = x0; x < x1; x++)
 		{
-			const int c = bayerColor(fourcc, y, x);
-			const double v = raw10p(row, x);
+			const int c = bayerColor(raw.fourcc, y, x);
+			const uint16_t s = raw.packed ? raw10p(row, x) : raw16le(row, x);
+			const double v = static_cast<double>(s) - raw.black[c];
 			sum[c] += v;
 			sumSq[c] += v * v;
 			cnt[c]++;
+			if (s >= ceil)
+				nsat[c]++;
 		}
 	}
 	for (int c = 0; c < 3; c++)
@@ -1123,65 +1332,24 @@ LedCalib::RoiSample LedCalib::sampleRoiBayer(const uint8_t *img, int width, int 
 		const double m = sum[c] / n;
 		out.mean[c] = m;
 		out.sstd[c] = std::sqrt(std::max(0.0, sumSq[c] / n - m * m));
+		out.sat[c] = static_cast<double>(nsat[c]) / n;
 	}
 	return out;
 }
 
-void LedCalib::processRawFrame(const uint8_t *img, int width, int height, int strideBytes, uint32_t fourcc)
-{
-	if (_finished)
-		return;
-	const int64_t nowMs = steadyMs();
-
-	if (!_roiChecked)
-	{
-		_roiChecked = true;
-		// Scale the (processed-resolution) TV ROI into raw-stream coords. The TV
-		// patch is uniform, so landing inside the TV region is all that matters.
-		const int refW = _cfg.gammaRefW > 0 ? _cfg.gammaRefW : width;
-		const int refH = _cfg.gammaRefH > 0 ? _cfg.gammaRefH : height;
-		_rawRoi.x = static_cast<int>(static_cast<int64_t>(_cfg.tvRoi.x) * width / refW) & ~1;
-		_rawRoi.y = static_cast<int>(static_cast<int64_t>(_cfg.tvRoi.y) * height / refH) & ~1;
-		_rawRoi.w = std::max(2, static_cast<int>(static_cast<int64_t>(_cfg.tvRoi.w) * width / refW));
-		_rawRoi.h = std::max(2, static_cast<int>(static_cast<int64_t>(_cfg.tvRoi.h) * height / refH));
-		std::cout << "Gamma RAW: stream " << width << "x" << height << " fourcc=0x" << std::hex << fourcc
-				  << std::dec << "; TV ROI scaled to raw " << _rawRoi.x << "," << _rawRoi.y << ","
-				  << _rawRoi.w << "," << _rawRoi.h << " (verify it sits on the TV)" << std::endl;
-		if (_rawRoi.x + _rawRoi.w > width || _rawRoi.y + _rawRoi.h > height)
-		{
-			std::cout << "ERROR: scaled raw ROI outside the frame" << std::endl;
-			finishAll(EXIT_FAILURE);
-			return;
-		}
-		enterPhase(_phase, nowMs);
-	}
-
-	// Release a deferred first-patch start (begin-tap fullscreen grace), same as
-	// processFrame — the raw stream is the only frame source in --gamma-raw, so
-	// without this tick the deferred Gamma phase would never fire.
-	tickStartDelay(nowMs);
-
-	const RoiSample meas = sampleRoiBayer(img, width, height, strideBytes, fourcc, _rawRoi);
-
-	handleKeys(nowMs);
-	if (_finished)
-		return;
-
-	if (_phase == Phase::Gamma)
-		runGamma(meas, nowMs);
-}
-
 bool LedCalib::gammaRawSelftest()
 {
-	// Synthesize a RAW10 CSI2P frame with known per-plane values for a given Bayer
-	// layout, pack it, then verify sampleRoiBayer recovers the plane means. Covers
-	// RGGB and the production BGGR ('BG10', this sensor) so an R/B swap in either
-	// mapping is caught.
+	// Synthesize RAW frames with known per-plane values for a given Bayer layout
+	// (CSI2 packed and 16-bit), then verify sampleRoiBayer recovers the
+	// black-subtracted plane means and the saturation fraction. Covers RGGB and
+	// the production BGGR ('BG10', this sensor) so an R/B swap in either mapping
+	// is caught; then checks the ISP->raw ROI mapping.
 	const int w = 64, h = 48;
-	const int stride = (w / 4) * 5; // packed, no extra padding
-	const uint16_t valR = 900, valG = 500, valB = 120; // 10-bit
-	auto run = [&](const char *name, uint32_t fourcc, auto colorAt) -> bool
+	const uint16_t valR = 900, valG = 500, valB = 1023; // 10-bit; B at full scale (saturated)
+	const double black = 64.0;
+	auto run = [&](const char *name, uint32_t fourcc, bool packed, auto colorAt) -> bool
 	{
+		const int stride = packed ? (w / 4) * 5 : w * 2;
 		std::vector<uint8_t> buf(static_cast<size_t>(stride) * h, 0);
 		for (int y = 0; y < h; y++)
 		{
@@ -1190,29 +1358,59 @@ bool LedCalib::gammaRawSelftest()
 			{
 				const int c = colorAt(y, x);
 				const uint16_t v = (c == 0) ? valR : (c == 1) ? valG : valB;
-				const int grp = (x >> 2) * 5, within = x & 3;
-				row[grp + within] = static_cast<uint8_t>(v >> 2);
-				row[grp + 4] |= static_cast<uint8_t>((v & 0x3) << (within * 2));
+				if (packed)
+				{
+					const int grp = (x >> 2) * 5, within = x & 3;
+					row[grp + within] = static_cast<uint8_t>(v >> 2);
+					row[grp + 4] |= static_cast<uint8_t>((v & 0x3) << (within * 2));
+				}
+				else
+				{
+					row[2 * x] = static_cast<uint8_t>(v & 0xff);
+					row[2 * x + 1] = static_cast<uint8_t>(v >> 8);
+				}
 			}
 		}
-		LedCalibConfig cfg;
-		LedCalib probe(cfg, nullptr, nullptr, nullptr);
-		LedCalibRoi roi{4, 4, 40, 32};
-		const RoiSample s = probe.sampleRoiBayer(buf.data(), w, h, stride, fourcc, roi);
-		const bool ok = std::fabs(s.mean[0] - valR) < 0.5 && std::fabs(s.mean[1] - valG) < 0.5 &&
-						std::fabs(s.mean[2] - valB) < 0.5;
-		std::cout << "gammaRawSelftest " << name << ": R=" << s.mean[0] << " G=" << s.mean[1]
-				  << " B=" << s.mean[2] << " (expect " << valR << "," << valG << "," << valB << ") -> "
+		LedCalibRawFrame raw;
+		raw.data = buf.data();
+		raw.width = w;
+		raw.height = h;
+		raw.stride = stride;
+		raw.fourcc = fourcc;
+		raw.packed = packed;
+		raw.black[0] = raw.black[1] = raw.black[2] = black;
+		const LedCalibRoi roi{4, 4, 40, 32};
+		const RoiSample s = sampleRoiBayer(raw, roi);
+		const bool ok = std::fabs(s.mean[0] - (valR - black)) < 0.5 && std::fabs(s.mean[1] - (valG - black)) < 0.5 &&
+						std::fabs(s.mean[2] - (valB - black)) < 0.5 && s.sat[2] > 0.99 && s.sat[0] < 0.01;
+		std::cout << "gammaRawSelftest " << name << (packed ? " packed" : " 16bit") << ": R=" << s.mean[0]
+				  << " G=" << s.mean[1] << " B=" << s.mean[2] << " satB=" << s.sat[2] << " (expect "
+				  << valR - black << "," << valG - black << "," << valB - black << ", satB 1) -> "
 				  << (ok ? "PASS" : "FAIL") << std::endl;
 		return ok;
 	};
-	// RGGB: row0 = R G, row1 = G B
-	const bool okRggb = run("RGGB", 0x30314752, [](int y, int x)
-							{ return (y & 1) == 0 ? ((x & 1) == 0 ? 0 : 1) : ((x & 1) == 0 ? 1 : 2); });
-	// BGGR ('BG10', this sensor): row0 = B G, row1 = G R
-	const bool okBggr = run("BGGR", 0x30314742, [](int y, int x)
-							{ return (y & 1) == 0 ? ((x & 1) == 0 ? 2 : 1) : ((x & 1) == 0 ? 1 : 0); });
-	return okRggb && okBggr;
+	auto rggb = [](int y, int x) { return (y & 1) == 0 ? ((x & 1) == 0 ? 0 : 1) : ((x & 1) == 0 ? 1 : 2); };
+	auto bggr = [](int y, int x) { return (y & 1) == 0 ? ((x & 1) == 0 ? 2 : 1) : ((x & 1) == 0 ? 1 : 0); };
+	bool ok = run("RGGB", 0x30314752, true, rggb);
+	ok = run("BGGR", 0x30314742, true, bggr) && ok;
+	ok = run("BGGR", 0x30314742, false, bggr) && ok;
+
+	// ROI mapping: production geometry — ISP 768x432 from ScalerCrop
+	// (1686,1014)/1173x751 on the 1536x864 mode that bins the (768,432)/3072x1728
+	// sensor area 2x. ISP pixel (0,0) must land on raw ((1686-768)/2, (1014-432)/2).
+	LedCalibRawFrame m;
+	m.width = 1536;
+	m.height = 864;
+	m.ax = (1686.0 - 768.0) * 1536.0 / 3072.0;
+	m.bx = (1173.0 / 768.0) * 1536.0 / 3072.0;
+	m.ay = (1014.0 - 432.0) * 864.0 / 1728.0;
+	m.by = (751.0 / 432.0) * 864.0 / 1728.0;
+	const LedCalibRoi r = mapRoiToRaw(LedCalibRoi{0, 0, 768, 432}, m);
+	const bool mapOk = r.x == 460 && r.y == 292 && std::abs(r.w - 586) <= 2 && std::abs(r.h - 374) <= 2 &&
+					   (r.x & 1) == 0 && (r.y & 1) == 0 && (r.w & 1) == 0 && (r.h & 1) == 0;
+	std::cout << "gammaRawSelftest roi-map: " << r.x << "," << r.y << "," << r.w << "," << r.h
+			  << " (expect 460,292,~586,~374, even) -> " << (mapOk ? "PASS" : "FAIL") << std::endl;
+	return ok && mapOk;
 }
 
 // ---- Shading (ALSC) calibration ----
@@ -1362,17 +1560,20 @@ void LedCalib::writeShadingMap()
 				 "<~2% = skip, larger = worth applying." << std::endl;
 }
 
-void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
+void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, const RoiSample &tvRaw, const RoiSample &ledRaw,
+					  const LedCalibFrameMeta *meta, int64_t nowMs)
 {
 	if (!ledPatchReady(nowMs))
 		return;
-	_meas.add(tv, led);
+	_meas.add(tv, led, tvRaw, ledRaw, meta);
 	if (!_meas.done())
 		return;
 
 	SweepRecord rec;
 	rec.frames = _meas.target;
-	_meas.finish(rec.mean, rec.tstd, rec.sstd);
+	rec.exposureUs = _meas.exposureUs();
+	rec.analogueGain = _meas.analogueGain();
+	_meas.finish(rec.mean, rec.tstd, rec.sstd, rec.sat);
 
 	if (_phase == Phase::LedBaseline)
 	{
@@ -1401,6 +1602,7 @@ void LedCalib::runLed(const RoiSample &tv, const RoiSample &led, int64_t nowMs)
 		writeBaseline();
 		writeLedSweep();
 		writeMeta();
+		writePhaseMeta(_haveMeta ? &_lastMeta : nullptr);
 		std::cout << "LED sweep complete: " << _ledRecords.size() << " measurements." << std::endl;
 		finishAll(EXIT_SUCCESS);
 		return;
@@ -1456,19 +1658,41 @@ void LedCalib::writeLedSweep()
 {
 	const std::string path = _cfg.outDir + "/led_sweep.csv";
 	std::ofstream f(path);
+	// RAW columns (black-subtracted sensor means at the LED ROI, same request as
+	// the ISP reading) are appended when the RAW stream was captured; the fit
+	// then measures the LEDs on RAW (no ISP clip / tone-curve shoulder) and maps
+	// RAW -> ISP-linear from the unclipped samples.
+	const bool raw = _cfg.captureRaw;
 	f << "drive_r,drive_g,drive_b,led_r,led_g,led_b,led_r_tstd,led_g_tstd,led_b_tstd,"
-		 "led_r_sstd,led_g_sstd,led_b_sstd,frames\n";
+		 "led_r_sstd,led_g_sstd,led_b_sstd,frames";
+	if (raw)
+		f << ",led_r_sat,led_g_sat,led_b_sat,raw_r,raw_g,raw_b,raw_r_tstd,raw_g_tstd,raw_b_tstd,"
+			 "raw_r_sat,raw_g_sat,raw_b_sat,exposure_us,analogue_gain";
+	f << "\n";
 	for (const auto &r : _ledRecords)
 	{
 		f << static_cast<int>(r.drive[0]) << "," << static_cast<int>(r.drive[1]) << ","
 		  << static_cast<int>(r.drive[2]);
 		for (int c = 0; c < 3; c++)
-			f << "," << r.mean[1][c];
+			f << "," << r.mean[kLed][c];
 		for (int c = 0; c < 3; c++)
-			f << "," << r.tstd[1][c];
+			f << "," << r.tstd[kLed][c];
 		for (int c = 0; c < 3; c++)
-			f << "," << r.sstd[1][c];
-		f << "," << r.frames << "\n";
+			f << "," << r.sstd[kLed][c];
+		f << "," << r.frames;
+		if (raw)
+		{
+			for (int c = 0; c < 3; c++)
+				f << "," << r.sat[kLed][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.mean[kLedRaw][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.tstd[kLedRaw][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.sat[kLedRaw][c];
+			f << "," << r.exposureUs << "," << r.analogueGain;
+		}
+		f << "\n";
 	}
 	std::cout << "Wrote " << path << " (" << _ledRecords.size() << " drive values)" << std::endl;
 }
@@ -1484,6 +1708,11 @@ void LedCalib::writeBaseline()
 	jsonTriple(f, "led_mean", _baseline.mean[1]);
 	jsonTriple(f, "led_tstd", _baseline.tstd[1]);
 	jsonTriple(f, "led_sstd", _baseline.sstd[1]);
+	if (_cfg.captureRaw)
+	{
+		jsonTriple(f, "led_raw_mean", _baseline.mean[kLedRaw]);
+		jsonTriple(f, "led_raw_tstd", _baseline.tstd[kLedRaw]);
+	}
 	f << "  \"frames\": " << _baseline.frames << "\n";
 	f << "}\n";
 	std::cout << "Wrote " << _cfg.outDir << "/baseline.json" << std::endl;
@@ -1506,6 +1735,365 @@ void LedCalib::writeMeta()
 	f << "  \"timestamp\": " << static_cast<long long>(::time(nullptr)) << "\n";
 	f << "}\n";
 	std::cout << "Wrote " << _cfg.outDir << "/meta.json" << std::endl;
+}
+
+// ---- TV RAW probe (phase "tv-raw") ----
+//
+// The TV patches measured on the RAW frame: the TV's own primaries/white as
+// the sensor sees them, before the ISP's colour matrix can push saturated
+// colours below zero. --make-tuning --from-calib fits the frozen tuning file's
+// colour matrix from this (doc/led-lut-calibration.md, "TV-fitted colour matrix").
+
+bool LedCalib::computePeakRoi(int width, int height, const LedCalibRawFrame *raw)
+{
+	// The peak window is centered on the screen; take the central 60% of it so
+	// panel edge falloff / homography error can't put the ROI on the black surround.
+	const double half = 0.5 * std::sqrt(kPeakWindowPct / 100.0) * 0.6;
+	const double us[2] = {0.5 - half, 0.5 + half};
+	double xs[2][2], ys[2][2]; // [u][v]
+	for (int i = 0; i < 2; i++)
+		for (int j = 0; j < 2; j++)
+		{
+			const double u = us[i], v = us[j];
+			if (_cfg.haveHomography)
+			{
+				const double *H = _cfg.invHomography;
+				const double w = H[6] * u + H[7] * v + H[8];
+				xs[i][j] = (H[0] * u + H[1] * v + H[2]) / w;
+				ys[i][j] = (H[3] * u + H[4] * v + H[5]) / w;
+			}
+			else
+			{
+				// No --transform: the camera frame is the clean TV screen.
+				xs[i][j] = u * width;
+				ys[i][j] = v * height;
+			}
+		}
+	// Inner bounding box of the (perspective) quad.
+	const double x0 = std::max(xs[0][0], xs[0][1]), x1 = std::min(xs[1][0], xs[1][1]);
+	const double y0 = std::max(ys[0][0], ys[1][0]), y1 = std::min(ys[0][1], ys[1][1]);
+	LedCalibRoi r;
+	r.x = static_cast<int>(std::ceil(x0));
+	r.y = static_cast<int>(std::ceil(y0));
+	r.w = static_cast<int>(std::floor(x1)) - r.x;
+	r.h = static_cast<int>(std::floor(y1)) - r.y;
+	bool ok = r.w >= 4 && r.h >= 4 && r.x >= 0 && r.y >= 0 && r.x + r.w <= width && r.y + r.h <= height;
+	if (ok && raw)
+	{
+		const LedCalibRoi rr = mapRoiToRaw(r, *raw);
+		ok = rr.x >= 0 && rr.y >= 0 && rr.x + rr.w <= raw->width && rr.y + rr.h <= raw->height;
+	}
+	if (!ok)
+	{
+		std::cout << "WARNING: cannot place the " << kPeakWindowPct << "% peak-white window ROI "
+				  << (_cfg.haveHomography ? "via --transform" : "(no --transform)")
+				  << "; measuring it on --calib-tv-roi instead (keep that ROI near the TV centre)." << std::endl;
+		return false;
+	}
+	_peakRoi = r;
+	std::cout << "TV RAW probe: peak-white window ROI " << r.x << "," << r.y << "," << r.w << "," << r.h << std::endl;
+	return true;
+}
+
+void LedCalib::buildTvRawPlan()
+{
+	_tvRawPlan.clear();
+	const double win = _cfg.patchPct;
+	const int g = std::max(2, _cfg.tvGrid);
+	for (int r = 0; r < g; r++)
+		for (int gg = 0; gg < g; gg++)
+			for (int b = 0; b < g; b++)
+				_tvRawPlan.push_back({{edgeLevel(r, g), edgeLevel(gg, g), edgeLevel(b, g)}, win, false});
+	// Gray ramp: the gray axis is what the matrix normalises (TV white -> neutral).
+	for (int i = 1; i < 17; i++)
+	{
+		const uint8_t v = edgeLevel(i, 17);
+		bool dup = false;
+		for (const auto &p : _tvRawPlan)
+			dup = dup || (p.rgb[0] == v && p.rgb[1] == v && p.rgb[2] == v);
+		if (!dup)
+			_tvRawPlan.push_back({{v, v, v}, win, false});
+	}
+	// Peak white last (window geometry switch), measured on the peak ROI.
+	_tvRawPlan.push_back({{255, 255, 255}, kPeakWindowPct, true});
+}
+
+void LedCalib::showTvRawPatch(int64_t nowMs)
+{
+	const TvRawPatch &p = _tvRawPlan[_tvRawPos];
+	// Centered window for the peak patch; the configured geometry otherwise.
+	if (p.peak)
+		_web->setPatchGeometry(p.windowPct, -1.0, -1.0);
+	else
+		_web->setPatchGeometry(_cfg.patchPct, _cfg.patchX, _cfg.patchY);
+	_tvSeq = ++_webSeq;
+	_web->setState(p.rgb[0], p.rgb[1], p.rgb[2], false, 0, 0, 0, _tvSeq);
+	_tvSettleUntilMs = -1;
+	_tvAckWaitStartMs = nowMs;
+}
+
+void LedCalib::runTvRaw(const RoiSample &tv, const RoiSample &tvRaw, const LedCalibFrameMeta *meta, int64_t nowMs)
+{
+	if (!webPatchReady("tv-raw patch", _tvRawPos, _tvRawPlan.size(), nowMs))
+		return;
+	_meas.add(tv, RoiSample{}, tvRaw, RoiSample{}, meta);
+	if (!_meas.done())
+		return;
+
+	SweepRecord rec;
+	rec.idx = static_cast<int>(_tvRawPos);
+	rec.frames = _meas.target;
+	for (int c = 0; c < 3; c++)
+		rec.drive[c] = _tvRawPlan[_tvRawPos].rgb[c];
+	rec.windowPct = _tvRawPlan[_tvRawPos].windowPct;
+	rec.exposureUs = _meas.exposureUs();
+	rec.analogueGain = _meas.analogueGain();
+	_meas.finish(rec.mean, rec.tstd, rec.sstd, rec.sat);
+	_tvRawRecords.push_back(rec);
+	const size_t done = _tvRawRecords.size();
+	if ((done % 20) == 0 || done == _tvRawPlan.size() || _cfg.verbose)
+		std::cout << "TV RAW probe: " << done << "/" << _tvRawPlan.size() << " patches" << std::endl;
+
+	_tvRawPos++;
+	if (_tvRawPos < _tvRawPlan.size())
+	{
+		showTvRawPatch(nowMs);
+		return;
+	}
+
+	if (!ensureOutDir())
+	{
+		finishAll(EXIT_FAILURE);
+		return;
+	}
+	writeTvRaw();
+	writePhaseMeta(_haveMeta ? &_lastMeta : nullptr);
+	// Sensor-side headroom check (Q17): if even RAW clips at the peak window the
+	// colour matrix can't rescue it — only exposure (analogue gain) can.
+	const SweepRecord &pk = _tvRawRecords.back();
+	const double satMax = std::max({pk.sat[kTvRaw][0], pk.sat[kTvRaw][1], pk.sat[kTvRaw][2]});
+	if (satMax > 0.01)
+		std::cout << "WARNING: the " << kPeakWindowPct << "% peak-white window CLIPS THE SENSOR ("
+				  << (100.0 * satMax) << "% of RAW pixels at full scale). Lower --gain (the shutter stays fixed "
+				  << "for latency) and rerun tv-raw." << std::endl;
+	finishAll(EXIT_SUCCESS);
+}
+
+void LedCalib::writeTvRaw()
+{
+	const std::string path = _cfg.outDir + "/tv_raw.csv";
+	std::ofstream f(path);
+	f << "# hyperion-cam TV RAW probe: TV-ROI means; raw = black-subtracted sensor samples (0.."
+	  << ((1 << 10) - 1) << " minus black), isp = ISP RGB 0..255 (current tuning)\n";
+	f << "index,patch_r,patch_g,patch_b,window_pct,peak,raw_r,raw_g,raw_b,raw_r_tstd,raw_g_tstd,raw_b_tstd,"
+		 "raw_r_sat,raw_g_sat,raw_b_sat,isp_r,isp_g,isp_b,isp_r_sat,isp_g_sat,isp_b_sat,exposure_us,analogue_gain,frames\n";
+	for (const auto &r : _tvRawRecords)
+	{
+		f << r.idx << "," << static_cast<int>(r.drive[0]) << "," << static_cast<int>(r.drive[1]) << ","
+		  << static_cast<int>(r.drive[2]) << "," << r.windowPct << "," << (_tvRawPlan[r.idx].peak ? 1 : 0);
+		for (int c = 0; c < 3; c++)
+			f << "," << r.mean[kTvRaw][c];
+		for (int c = 0; c < 3; c++)
+			f << "," << r.tstd[kTvRaw][c];
+		for (int c = 0; c < 3; c++)
+			f << "," << r.sat[kTvRaw][c];
+		for (int c = 0; c < 3; c++)
+			f << "," << r.mean[kTv][c];
+		for (int c = 0; c < 3; c++)
+			f << "," << r.sat[kTv][c];
+		f << "," << r.exposureUs << "," << r.analogueGain << "," << r.frames << "\n";
+	}
+	std::cout << "Wrote " << path << " (" << _tvRawRecords.size() << " patches)" << std::endl;
+}
+
+// ---- Camera response (phase "response") ----
+//
+// Shutter sweep over a FIXED scene (LED white, optional TV gray). Light is
+// exactly proportional to exposure time, and the RAW frame of the same request
+// measures that light directly (linear, drift-proof), so ISP reading vs RAW
+// light IS the camera's tone curve. The fit recovers it (ledCalibFit.cpp
+// fitCameraResponse); recovering it right here also flags a tuning file that
+// is not actually frozen (adaptive contrast/shading would make the curve
+// scene-dependent) BEFORE the long sweeps.
+
+void LedCalib::buildResponsePlan()
+{
+	_respPlan.clear();
+	const int base = std::max(100, _cfg.baseExposureUs);
+	// Quarter-stop steps from 1/64x to 4x; a reference step (the base exposure)
+	// every 6 steps exposes any drift of the sources over the sweep.
+	int n = 0;
+	for (int k = -24; k <= 8; k++, n++)
+	{
+		if (n % 6 == 0)
+			_respPlan.push_back(base);
+		_respPlan.push_back(std::max(30, static_cast<int>(std::lround(base * std::pow(2.0, k / 4.0)))));
+	}
+	_respPlan.push_back(base);
+}
+
+void LedCalib::startResponseStep(int64_t nowMs)
+{
+	if (_setExposure)
+		_setExposure(_respPlan[_respPos]);
+	_respStepStartMs = nowMs;
+	_respGoodFrames = 0;
+}
+
+void LedCalib::runResponse(const RoiSample &tv, const RoiSample &led, const RoiSample &tvRaw,
+						   const RoiSample &ledRaw, const LedCalibFrameMeta *meta, int64_t nowMs)
+{
+	// Wait for the page to paint the fixed TV patch (first step only).
+	if (_web && _web->ackedSeq() < _tvSeq)
+	{
+		if (_tvAckWaitStartMs >= 0 && nowMs - _tvAckWaitStartMs > kWebAckTimeoutMs)
+		{
+			std::cout << "ERROR: web page did not acknowledge the response patch within "
+					  << (kWebAckTimeoutMs / 1000) << "s" << std::endl;
+			finishAll(EXIT_FAILURE);
+		}
+		return;
+	}
+	const int target = _respPlan[_respPos];
+	// Accept frames once the sensor reports the commanded exposure (it lands on
+	// whole sensor lines, so allow a small tolerance) and a few fresh frames
+	// have passed. If the exact value is never reported (very short exposures
+	// quantise coarsely), take whatever it settled to after 2 s.
+	const int64_t exp = meta ? meta->exposureUs : 0;
+	const bool atTarget = exp > 0 && std::llabs(exp - target) <= std::max<int64_t>(60, target * 4 / 100);
+	const bool timedOut = nowMs - _respStepStartMs > 2000;
+	if (!_meas.active)
+	{
+		if (nowMs < _respStepStartMs || (!atTarget && !timedOut))
+			return;
+		if (++_respGoodFrames <= kMinSettleFrames)
+			return;
+		_meas.start(_cfg.measureFrames);
+	}
+	else if (!atTarget && !timedOut)
+		return; // exposure moved mid-measurement: skip the frame
+	_meas.add(tv, led, tvRaw, ledRaw, meta);
+	if (!_meas.done())
+		return;
+
+	SweepRecord rec;
+	rec.idx = static_cast<int>(_respPos);
+	rec.frames = _meas.target;
+	rec.targetExposureUs = target;
+	rec.exposureUs = _meas.exposureUs();
+	rec.analogueGain = _meas.analogueGain();
+	rec.tMs = nowMs - _respStartMs;
+	_meas.finish(rec.mean, rec.tstd, rec.sstd, rec.sat);
+	if (!atTarget && rec.exposureUs > 0)
+		std::cout << "  note: exposure " << target << " us not reported exactly; measured at "
+				  << rec.exposureUs << " us" << std::endl;
+	_respRecords.push_back(rec);
+	if (_cfg.verbose || (_respRecords.size() % 8) == 0)
+		std::cout << "Camera response: " << _respRecords.size() << "/" << _respPlan.size() << " (exposure "
+				  << rec.exposureUs << " us, LED ISP " << rec.mean[kLed][0] << "," << rec.mean[kLed][1] << ","
+				  << rec.mean[kLed][2] << ")" << std::endl;
+
+	_respPos++;
+	if (_respPos < _respPlan.size())
+	{
+		startResponseStep(nowMs);
+		return;
+	}
+
+	if (_setExposure)
+		_setExposure(0); // back to the base shutter
+	if (!ensureOutDir())
+	{
+		finishAll(EXIT_FAILURE);
+		return;
+	}
+	writeResponse();
+	writePhaseMeta(_haveMeta ? &_lastMeta : nullptr);
+	// Recover the curve now: a non-frozen ISP shows up as a poor fit here,
+	// before the long sweeps are wasted on it.
+	const bool ok = ledCalibCheckResponse(_cfg.outDir + "/camera_response.csv", true);
+	finishAll(ok ? EXIT_SUCCESS : EXIT_FAILURE);
+}
+
+void LedCalib::writeResponse()
+{
+	const std::string path = _cfg.outDir + "/camera_response.csv";
+	std::ofstream f(path);
+	const bool tvUsed = _cfg.tvRoi.w > 0;
+	f << "# hyperion-cam camera response (shutter sweep over a fixed scene): isp = ISP RGB 0..255, raw = "
+		 "black-subtracted sensor samples (10-bit); rois: "
+	  << (tvUsed ? "tv,led" : "led") << "\n";
+	f << "step,t_ms,target_exposure_us,exposure_us,analogue_gain,frames";
+	const char *rois[2] = {"led", "tv"};
+	const int ispSlot[2] = {kLed, kTv}, rawSlot[2] = {kLedRaw, kTvRaw};
+	const int nRoi = tvUsed ? 2 : 1;
+	for (int k = 0; k < nRoi; k++)
+		for (const char *what : {"isp", "isp_tstd", "isp_sat", "raw", "raw_tstd", "raw_sat"})
+			for (const char *c : {"r", "g", "b"})
+				f << "," << rois[k] << "_" << what << "_" << c;
+	f << "\n";
+	for (const auto &r : _respRecords)
+	{
+		f << r.idx << "," << r.tMs << "," << r.targetExposureUs << "," << r.exposureUs << "," << r.analogueGain
+		  << "," << r.frames;
+		for (int k = 0; k < nRoi; k++)
+		{
+			const int is = ispSlot[k], rs = rawSlot[k];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.mean[is][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.tstd[is][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.sat[is][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.mean[rs][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.tstd[rs][c];
+			for (int c = 0; c < 3; c++)
+				f << "," << r.sat[rs][c];
+		}
+		f << "\n";
+	}
+	std::cout << "Wrote " << path << " (" << _respRecords.size() << " steps)" << std::endl;
+}
+
+void LedCalib::writePhaseMeta(const LedCalibFrameMeta *meta)
+{
+	const std::string path = _cfg.outDir + "/meta_" + _cfg.phase + ".json";
+	std::ofstream f(path);
+	auto str = [](const std::string &s)
+	{
+		std::string o = "\"";
+		for (char c : s)
+			o += (c == '"' || c == '\\') ? std::string("\\") + c : std::string(1, c);
+		return o + "\"";
+	};
+	f << "{\n";
+	f << "  \"phase\": " << str(_cfg.phase) << ",\n";
+	f << "  \"tv_roi\": [" << _cfg.tvRoi.x << ", " << _cfg.tvRoi.y << ", " << _cfg.tvRoi.w << ", " << _cfg.tvRoi.h << "],\n";
+	f << "  \"led_roi\": [" << _cfg.ledRoi.x << ", " << _cfg.ledRoi.y << ", " << _cfg.ledRoi.w << ", " << _cfg.ledRoi.h << "],\n";
+	f << "  \"white_level\": " << _cfg.whiteLevel << ",\n";
+	f << "  \"raw\": " << (_cfg.captureRaw ? "true" : "false") << ",\n";
+	f << "  \"tuning_file\": " << str(_cfg.tuningFile) << ",\n";
+	f << "  \"tuning_hash\": " << str(_cfg.tuningHash) << ",\n";
+	f << "  \"camera\": " << (_cfg.cameraJson.empty() ? std::string("{}") : _cfg.cameraJson) << ",\n";
+	if (meta)
+	{
+		f << "  \"frame\": {\"exposure_us\": " << meta->exposureUs << ", \"analogue_gain\": " << meta->analogueGain
+		  << ", \"digital_gain\": " << meta->digitalGain << ", \"colour_gains\": [" << meta->colourGains[0] << ", "
+		  << meta->colourGains[1] << "]";
+		if (meta->haveCcm)
+		{
+			f << ", \"ccm\": [";
+			for (int i = 0; i < 9; i++)
+				f << (i ? ", " : "") << meta->ccm[i];
+			f << "]";
+		}
+		f << "},\n";
+	}
+	f << "  \"timestamp\": " << static_cast<long long>(::time(nullptr)) << "\n";
+	f << "}\n";
+	std::cout << "Wrote " << path << std::endl;
 }
 
 void LedCalib::finishAll(int code)
