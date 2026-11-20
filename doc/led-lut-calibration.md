@@ -38,9 +38,11 @@ three unknown nonlinear devices (TV, camera, LEDs); we never characterize any of
 | TV patch display | web page on a PC on the TV's HDMI (`--calib-tv-web`) | grabber commands each patch directly, page acks after paint; no decoder/video |
 | Measurement loop | open-loop sweeps + closed-loop verification pass | sweeps are fast and clean; verification catches model errors |
 | Eye anchor | white mandatory, extra colors optional | white is what users can match reliably |
-| Luminance policy | proportional, anchored at matched white | eye adapts to dimmer glow; white anchor sets scale |
+| Luminance policy | proportional, anchored at matched white, **soft knee above 85% of full LED output** so the brightest camera input reaches full output (2026-11) | eye adapts to dimmer glow; white anchor sets scale; the TV gets ~2-3× brighter from mid-gray to white than the LEDs can, so a hard ceiling flattened every bright tone |
 | Gamut overflow | clip hue-true (preserve hue, reduce sat/lum) | artifact-free |
-| Measurement bit depth | 8-bit NV12-path RGB + frame/ROI averaging; **RAW only if measured variance proves insufficient** | LUT input domain must be runtime grabber space; averaging beats quantization; calib logs variance stats to settle this with evidence |
+| Measurement bit depth | TV side: ISP RGB (the LUT input domain). LED sweep, TV primaries and the response sweep: **RAW + ISP in the same request** (2026-11) | the LUT input must be runtime grabber space; the LED glow is read in the ISP's clip/shoulder (red at 246 of 255), where RAW (the clip is the ISP's WB gain, not the sensor) has ~3× headroom and is linear |
+| Camera model | **measured tone curve** (`--ledcalib response`), legacy self-estimated power law kept as fallback (2026-11) | the power law was the gray-drift cause — see "Camera model fix" |
+| ISP settings | **frozen tuning file** (`--make-tuning`): no adaptive contrast, no adaptive lens shading, power-2.2 tone curve, TV-fitted colour matrix (2026-11) | the stock ISP is scene-adaptive and clips saturated TV colours to 0 — see "Camera model fix" |
 | Time budget | ~30–45 min full run, unattended except eye anchor | sparse sweeps + smooth model fit |
 
 ## Calibration procedure (`--ledcalib`)
@@ -143,9 +145,17 @@ reads the sweep files, writes `lut.cube` + `fit_report.json`, exits. Math (`src/
 
 - **Model**: LED light adds linearly → `lin(reading) − lin(baseline) = A · [e_R(S_r), e_G(S_g),
   e_B(S_b)]` with a 3×3 mixing matrix `A` and monotone per-channel drive curves `e_c`.
-- **Linearization**: camera response treated as a pure power law `x^p`; `p` is self-estimated
-  from the sweep's own additivity (single-channel axis readings must sum to mixed readings in
-  linear space) — no gamma assumption, no TV data needed.
+- **Linearization** (`--calib-response auto|on|off`): the camera tone curve measured by the
+  response phase (`camera_response.csv`, see "Camera model fix"), applied to every camera reading
+  (LUT input, white anchor). Without it (old calibration dirs, or `off` for A/B) the legacy model:
+  a pure power law `x^p` with `p` self-estimated from the sweep's additivity — which the
+  near-diagonal mixing matrix barely constrains, so it is only right for a camera that really is a
+  power law.
+- **LEDs on RAW** (automatic with the measured curve + RAW columns in `led_sweep.csv`): LED light
+  = RAW means at the LED ROI mapped to ISP-linear units by a 3×3 fitted on the sweep's own clean
+  samples (`lin(isp_r) = Σ M[r][c]·raw_c`, ISP reading 12..245 and unclipped). The map absorbs the
+  colour matrix, WB, lens shading at the LED ROI and the ISP's black/scale handling. Only a
+  saturated *sensor* excludes a sample; `raw_map_resid` in the report is the RAW-vs-ISP agreement.
 - **Fit**: alternating least squares — `z = A⁻¹·Y` bucketed by drive level rebuilds the curves,
   then `A` refit by normal equations; 6 iterations, curves monotonized, `e(255)=1` normalized.
 - **Dark-end curve regularization** (`--calib-curve-floor`, default 0.05): the camera can't
@@ -167,12 +177,32 @@ reads the sweep files, writes `lut.cube` + `fit_report.json`, exits. Math (`src/
   Targets below the ambient floor → LEDs off (the glow cannot be darker than the room).
 - **Gamut (hue-true)**: negative `e*` components → blend toward the luminance-matched gray until
   feasible (desaturation, hue kept); overflow → scale the whole vector (chromaticity kept,
-  luminance reduced); then invert the monotone curves into drive values.
+  luminance reduced) for saturated colours, while near-neutral colours (<10% saturation relative to
+  the eye-matched white, blended up to 30%) keep their luminance and give up a little saturation
+  toward the eye-matched white instead. With the plain scale-down, a slightly tinted node next to
+  white was dimmed as a whole and trilinear interpolation dipped the gray axis' brightness ~4.5%
+  near white; now ~1.6%. Then invert the monotone curves into drive values.
+- **Soft knee** (`--calib-knee auto|off|<start %>`, default 85%): the required brightness,
+  expressed as the max-drive fraction white would need at that luminance (`m*`), maps through a
+  C1 roll-off (identity up to the start, `1-exp` above, slope 1 at the start) that reaches full
+  output exactly at camera white (LUT input 255,255,255). All channels are scaled by one factor, so
+  hue is kept; driving it by luminance rather than by the brightest channel keeps it smooth across
+  hue (no interpolation dips). `fit_report.json` `knee.white_needs` = how many times the LEDs'
+  full output camera white would need (the real rig: ~2-3×).
+- **Dark fallback** (`--calib-dark-floor auto|off|<luma>`): below camera luma = TV black + 8 codes
+  (one LUT grid step) a dark colour spans only a few camera codes and its chroma is unresolvable;
+  the LUT fades (smoothstep from half the floor) to **equal R=G=B drive at the same luminance** —
+  HyperHDR's eye-matched white by construction. (The ROI's spatial std is not usable as a noise
+  measure: on the real rig it is ~20% of the mean at every level — panel structure, not noise.)
 - **Self-test**: `--ledcalib-fit-selftest` simulates a known chain (different per-channel LED
-  exponents, crosstalk matrix, ambient, measurement noise, encode gamma 2.2), runs the whole
-  pipeline, and closes the loop through the truth chain. Result 2026-06-12: exponent recovered
-  exactly, closed-loop error median 0.10 / p95 0.45 / max 1.9 encoded units at 33³ (max 1.04 at
-  65³), anchor round-trip error 0.05 drive units.
+  exponents, crosstalk matrix, ambient, RAW sensor matrix, measurement noise) whose camera encodes
+  with the **stock imx708 tone curve** (not a power law), synthesizes all four input files incl. a
+  response sweep, runs the whole pipeline and closes the loop through the truth chain. Result
+  2026-11-20: response recovered within 1.6% (codes 16..250); measured model closed loop p95 0.96
+  / max 1.6 encoded units, anchor round-trip 0.1 drive units; **legacy power-law model on the same
+  data p95 30 / max 43** (the rig's drift, reproduced — the test checks the legacy model is worse,
+  so it really exercises the failure); knee reaches full output at white with a monotone gray
+  axis; dark nodes neutral.
 
 `.cube` contract: standard Resolve format, `LUT_3D_SIZE N`, domain [0,1], red index fastest;
 values = LED drive / 255. Header comments carry fit stats. `fit_report.json` holds `p`, `A`,
@@ -209,6 +239,69 @@ that HyperHDR white balance: it drives the LEDs full white and sends a white fra
 can eye-match in HyperHDR's settings. It takes no ROI, measures nothing, and writes no file — the
 white correction always comes from the sweeps, never from this phase.
 
+## Camera model fix (2026-11): why the white drifted with level
+
+**Symptom (real rig, with `--lut`):** grays matched the 127 eye-match but drifted toward the ends
+— brights pink/magenta, mid-darks (64-114) greenish, ~42 yellow-green (predicted from the data,
+confirmed on films).
+
+**Diagnosis (from the July sweeps + the stock `imx708.json`):**
+- The fit linearized every camera reading with one power law (`p=2.21`), but the ISP tone curve's
+  local exponent runs **1.6 (shadows) → 4.2 (highlights)**. TV and LEDs are read at different points
+  of it: TV gray 127 reads ~130, LED drive 127 already reads R 204 (the shoulder). A per-channel
+  ratio that is right at the anchor is wrong everywhere else — exactly the symptom. Re-linearizing
+  the sweep neutrals with the true curve flattens the TV/LED ratio above ~114.
+- `p` was self-estimated from LED additivity, but the mixing matrix is nearly diagonal (each camera
+  channel sees mostly one LED), so additivity hardly constrains the curve shape.
+- Two ISP stages adapt to the scene: contrast enhancement (`ce_enable: 1`) and adaptive lens/colour
+  shading (ALSC `n_iter: 100`) — calibration scenes (TV lit / wall dark, TV black / wall lit) and
+  films get different camera responses.
+- The stock colour matrix (+ `--saturation 0.73`) has negative coefficients: **867 of 4097** bright
+  TV patches read 0 in some channel (TV blue reads R 0 / G 0.1) — those colours collapse and no LUT
+  can separate them again.
+- The shading map multiplies encoded values, which is exact at every level only for a pure power
+  curve; with the stock curve a 0.95 gain is −7% light at level 40 but −15% at 220.
+- Not the cause: HyperHDR is linear (gamma 1, temperature R 1 / G 0.38 / B 0.22) and the TV's gray
+  is stable within ±5% as the camera sees it.
+
+**Decisions** (so the camera becomes a known, scene-independent comparator):
+1. **Frozen tuning file** (`--make-tuning OUT [--from-calib DIR]`, `--tuning FILE`; `src/tuning.cpp`,
+   Boost.JSON): `ce_enable 0`, ALSC `n_iter 0`, tone curve = power 2.2 on the vc4 hardware knots
+   (`--tuning-curve stock|<exponent>`). A power curve (not the stock one) because it gives the darks
+   ~2× the codes (the hardware's first 1/64 segment is linear: slope 9.7 vs 4.9), makes the shading
+   map exact at every level, and spreads the LUT's grid evenly. Generated once and kept with the
+   calibration, so a libcamera update can't silently change it. The non-LUT look is not a goal.
+2. **TV-fitted colour matrix** (`--from-calib`): from `--ledcalib tv-raw` (TV patches on RAW), one
+   matrix with the TV's primaries on the axes and TV white neutral (WOLED white subpixel handled by
+   the white normalisation), a small safety desaturation (≥5%, raised until every measured bright
+   patch stays ≥0.5% of its brightest channel), the per-raw-channel ISP gain at the TV ROI (lens
+   shading, black/scale) measured from the probe's own ISP/RAW pairs, and scaled so the **10%
+   peak-white window lands at 95%** of the ISP range (OLED highlights outshine any full-field patch).
+   `-b` stays as measured, `--saturation 1` (the matrix contains everything). Verified: libcamera
+   applies the single-entry matrix as written (metadata); on a synthetic WOLED-like TV the fit
+   recovers the shading gains exactly.
+3. **Measured tone curve** (`--ledcalib response`): shutter sweep 1/64×..4× (quarter stops, a
+   reference step every 6) over a fixed LED white (+ optional TV gray), RAW captured in the same
+   requests. Light per sample = the RAW sum (linear, drift-proof); the curve is a Debevec-style
+   least-squares fit of `ln f⁻¹(z)` with per-series scales and a smoothness prior relative to a
+   2.2 power (λ=10: follows the hardware knots' corners; 40 rounds them off >4%, 4 fits noise). A
+   frozen ISP gives one consistent curve; a residual >4% in any series is flagged right after the
+   sweep (adaptive ISP / moving scene) — before the long sweeps.
+4. **LEDs on RAW** (dual stream in the LED sweep), the RAW→ISP-linear map fitted by `--ledcalib-fit`.
+5. **Dual-stream infrastructure**: the RAW size is chosen by probing which one reproduces the sensor
+   mode an ISP-only (production) configuration selects (ScalerCropMaximum match — on this camera the
+   1536×864 mode, sensor area (768,432)/3072×1728); ROIs map ISP→RAW via ScalerCrop metadata + mode
+   crop + binning (verified: ISP vs mapped-RAW correlation peaks at zero offset / scale 1.00);
+   black levels from `SensorBlackLevels`.
+6. **Soft knee + dark fallback** in the fit (Phase 3).
+7. **Eye check** (`--eyecheck-web`): production pipeline + a client-side gray-slider/colour-picker
+   page — the acceptance test. Multi-point eye calibration of the white curve stays the fallback,
+   only if the eye check still fails.
+
+**A/B from one measurement session:** fit A `--calib-response off --calib-knee off
+--calib-dark-floor off` (the frozen tuning alone, legacy model), B `--calib-knee off
+--calib-dark-floor off` (+ the camera model fix), C defaults (+ knee + dark fallback).
+
 ## Gamma ramp probe (`--ledcalib gamma`, implemented 2026-06-15)
 
 A standalone feasibility/diagnostic step, separate from the full calib: characterize the
@@ -227,8 +320,9 @@ ramp by **Bayer-plane ROI averaging** (no demosaic): unpacks MIPI RAW10 (4 px / 
 averages the R / (Gr+Gb) / B sites. This sensor negotiates `SBGGR10_CSI2P` 1536×864 (BGGR);
 `libcamera`'s `fourcc()` returns the base `'BG10'`-style code (packing is a modifier), so the
 Bayer-phase table keys on those, defaulting to BGGR. The TV ROI (picked at the processed
-resolution) is scaled into raw coords per-axis — fine because the patch is uniform; the run prints
-the scaled raw ROI to sanity-check it lands on the TV. RAW is 10-bit (0..1023). Purpose: see
+resolution) is mapped into raw coords via the ScalerCrop metadata, the sensor mode's crop and the
+binning (fixed 2026-11: it used to be scaled proportionally, which is wrong with `--crop` because
+the RAW frame is the whole sensor mode); the run prints the raw ROI. RAW is 10-bit, black-subtracted. Purpose: see
 whether RAW preserves gradation at the ends where the ISP crushes/clips — the evidence for the
 still-open "RAW for measurement precision" question. `--ledcalib-gamma-selftest` unit-tests the
 RAW10 unpack + plane averaging on a synthetic frame (no camera).
@@ -279,10 +373,16 @@ space.
 
 ## Outputs (`--calib-out` dir, default `ledcalib-out/`)
 
-- `meta.json` — config echo, camera settings, timestamps
-- `tv_sweep.csv` — `index, commanded patch RGB, TV-ROI stats, LED-ROI stats, frames`
-- `led_sweep.csv` — `drive RGB, led-ROI stats, tv-ROI mean (sanity), frames`
-- `baseline.json` — LEDs-off / TV-black readings
+- `meta.json` — LED-sweep config echo (white level etc.; read by the fit)
+- `meta_<phase>.json` — every phase: ROIs, camera args, tuning file + hash, frame metadata
+  (exposure, gains, CCM); the fit cross-checks them
+- `tv_raw.csv` — TV RAW probe: patch, window %, RAW means/sat (black-subtracted), ISP means/sat
+- `tuning.json` (suggested name) — the frozen tuning file written by `--make-tuning`
+- `camera_response.csv` — response shutter sweep: per step exposure, ISP + RAW per ROI
+- `tv_sweep.csv` — `index, commanded patch RGB, TV-ROI stats, frames`
+- `led_sweep.csv` — `drive RGB, led-ROI ISP stats, frames` (+ ISP sat, RAW means/stds/sat,
+  exposure when captured dual-stream)
+- `baseline.json` — LEDs-off / TV-black readings (+ RAW)
 - `lut.cube`, `fit_report.json` — written by `--ledcalib-fit` (Phase 3)
 
 ## Runtime (later milestone)
@@ -327,14 +427,16 @@ accuracy at ~1/7 the cost. Net feature cost ~+1 ms p50, accepted. Test hooks (id
   acceptable for glow.
 - Saturated colors keep residual hue error after a white-only anchor (metamerism); optional
   extra anchors can reduce it.
-- **RAW for the LED dark end (open).** The locked exposure that keeps the bright LED glow from
-  clipping leaves the dim low-drive glow below the 8-bit ISP noise floor, worst on a
-  white-balance-attenuated channel — so the dark end of the drive curves is unmeasurable and is
-  reconstructed by `--calib-curve-floor` regularization, not measured. Measuring the LED sweep on
-  the 10-bit RAW Bayer stream (the machinery exists for `--gamma-raw`) would recover real low-end
-  data; the cost is mapping RAW back into the ISP-RGB LUT-input domain. Note the *gamma probe*
-  (`--ledcalib gamma`) characterizes the TV→camera transfer (the LUT **input**), not these
-  LED→camera curves (the **output** mapping), so it does not address this directly.
+- **RAW for the LED dark end — resolved 2026-11.** The LED sweep is measured on RAW (dual stream)
+  and mapped into the ISP-linear domain by the fit (see Phase 3), which also removes the bright
+  end's ISP clip/shoulder. `--calib-curve-floor` regularization still applies below 5% output.
+- **Trilinear near white.** Interpolating between gray nodes and tinted neighbours that the gamut
+  mapping had to adjust still dips the gray axis' brightness by up to ~1.6% between nodes near
+  white (was ~4.5% before the near-neutral overflow change). Below visibility; a denser LUT would
+  shrink it further.
+- **One tuning file everywhere.** The frozen tuning file, `-b` and `--saturation 1` must be
+  identical in every phase and in production; the fit compares the `meta_<phase>.json` records and
+  warns on a mismatch.
 - LED heat drift over long runs and OLED burn-in risk are why the run is 30–45 min, not hours.
 - HyperHDR settings and camera color controls are baked into the LUT; changing either means
   recalibrating.
