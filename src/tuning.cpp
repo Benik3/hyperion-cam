@@ -317,6 +317,13 @@ namespace
 			std::cout << "ERROR: tv_raw.csv lacks the full-level primaries / white" << std::endl;
 			return false;
 		}
+		if (std::max({pW->raw[0], pW->raw[1], pW->raw[2]}) < 30.0 / 1023.0)
+		{
+			std::cout << "ERROR: the TV white patch is too dark in RAW (" << pW->raw[0] * 1023 << ","
+					  << pW->raw[1] * 1023 << "," << pW->raw[2] * 1023
+					  << " counts): is the TV on and showing the page, and the TV ROI on the patch?" << std::endl;
+			return false;
+		}
 		for (const TvPatch *p : {pR, pG, pB, pW})
 			for (int c = 0; c < 3; c++)
 				if (p->rawSat[c] > 0.01)

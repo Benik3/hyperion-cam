@@ -886,6 +886,7 @@ void LedCalib::finishTvPhase()
 		return;
 	}
 	writeTvSweep();
+	writePhaseMeta(_haveMeta ? &_lastMeta : nullptr);
 
 	finishAll(EXIT_SUCCESS);
 }
@@ -1475,6 +1476,7 @@ void LedCalib::runShading(const uint8_t *img, int width, int height, int strideB
 			return;
 		}
 		writeShadingMap();
+		writePhaseMeta(_haveMeta ? &_lastMeta : nullptr);
 		finishAll(EXIT_SUCCESS);
 	}
 }
