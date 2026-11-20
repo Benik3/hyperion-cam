@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 // Key the page's 'begin' tap is delivered as (via popKey). Distinct from
 // Enter/'\n' ('accept') so that reloading the page mid-phase and tapping
@@ -34,6 +35,13 @@ public:
 	bool start();
 
 	int port() const;
+
+	/// Serve the --eyecheck-web slider page at "/" instead of the calibration
+	/// page (purely client-side; the grabber keeps streaming). Before start().
+	void setEyecheckPage(bool on);
+
+	/// Pin the server thread to these CPUs (empty = inherit). Before start().
+	void setCpuAffinity(const std::vector<int> &cpus);
 
 	/// Hide the corner keep-alive square + status text (they'd corrupt a
 	/// full-frame measurement like shading). Off by default.

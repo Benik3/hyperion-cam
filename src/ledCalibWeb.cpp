@@ -9,6 +9,9 @@
 #include <string>
 #include <thread>
 
+#include <pthread.h>
+#include <sched.h>
+
 #include <event2/buffer.h>
 #include <event2/event.h>
 #include <event2/http.h>
@@ -192,6 +195,113 @@ es.onmessage=ev=>{
 </body></html>
 )HTML";
 
+	// --eyecheck-web: the end-to-end eye check (doc/calibration-guide.md). The
+	// grabber runs its normal production pipeline (camera -> warp -> shading ->
+	// LUT -> HyperHDR); this page only paints the TV, entirely client-side: a
+	// full-screen gray from a 0..255 slider, or a hue/saturation colour at that
+	// brightness. Compare the LED glow with the TV by eye across the whole range.
+	// The control panel auto-hides so it doesn't sit in the picture the LEDs follow.
+	const char *kEyecheckHtml = R"HTML(<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hyperion-cam eye check</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;font-family:sans-serif;background:#7f7f7f}
+  #panel{position:fixed;left:50%;bottom:3vh;transform:translateX(-50%);z-index:2;min-width:60vw;
+         background:rgba(0,0,0,.6);color:#eee;padding:1.6vh 2.4vh;border-radius:1vh;font-size:2vh;
+         transition:opacity .4s}
+  #panel.hidden{opacity:0;pointer-events:none}
+  #panel .row{display:flex;align-items:center;gap:1.2vh;margin:.6vh 0}
+  #panel label{width:9em}
+  #panel input[type=range]{flex:1}
+  #panel .val{width:6em;text-align:right;font-variant-numeric:tabular-nums}
+  #panel button{font-size:1.9vh;padding:.3em .7em}
+  #panel button.on{background:#2a7;color:#fff;border:none}
+  #panel .hint{color:#aaa;font-size:1.5vh}
+  #keep{position:fixed;left:0;top:0;width:32px;height:32px;z-index:0;pointer-events:none;opacity:0}
+</style></head>
+<body>
+<video id="keep" muted playsinline></video>
+<div id="panel">
+  <div class="row"><b>hyperion-cam eye check</b>&nbsp;- compare the LED glow with the TV
+    <span style="flex:1"></span>
+    <button id="mGray" onclick="setMode('gray')">gray</button>
+    <button id="mCol" onclick="setMode('colour')">colour</button>
+    <button onclick="fs()">fullscreen</button></div>
+  <div class="row"><label>brightness</label><input id="v" type="range" min="0" max="255" value="127">
+    <span class="val" id="vv"></span></div>
+  <div class="row" id="presets"></div>
+  <div class="row col"><label>hue</label><input id="h" type="range" min="0" max="359" value="0">
+    <span class="val" id="hv"></span></div>
+  <div class="row col"><label>saturation</label><input id="s" type="range" min="0" max="100" value="100">
+    <span class="val" id="sv"></span></div>
+  <div class="row"><span class="val" style="width:auto" id="rgb"></span><span style="flex:1"></span>
+    <span class="hint">&larr;/&rarr; &plusmn;1 &nbsp; &darr;/&uarr; &plusmn;16 &nbsp; shift+&larr;/&rarr; hue &nbsp;
+      shift+&darr;/&uarr; saturation &nbsp; g/c mode &nbsp; f fullscreen &nbsp; h hide</span></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let mode='gray';
+const st={v:127,h:0,s:100};
+try{ const j=JSON.parse(localStorage.getItem('eyecheck')||'{}'); Object.assign(st,j.st||{}); mode=j.mode||mode; }catch(e){}
+function save(){ try{ localStorage.setItem('eyecheck',JSON.stringify({st,mode})); }catch(e){} }
+function hsv(h,s,v){ // h 0..360, s,v 0..1 -> [r,g,b] 0..255
+  const c=v*s, x=c*(1-Math.abs((h/60)%2-1)), m=v-c; let r=0,g=0,b=0;
+  if(h<60){r=c;g=x;} else if(h<120){r=x;g=c;} else if(h<180){g=c;b=x;}
+  else if(h<240){g=x;b=c;} else if(h<300){r=x;b=c;} else {r=c;b=x;}
+  return [r+m,g+m,b+m].map(t=>Math.round(t*255));
+}
+function paint(){
+  st.v=Math.max(0,Math.min(255,st.v)); st.h=((st.h%360)+360)%360; st.s=Math.max(0,Math.min(100,st.s));
+  const rgb = mode==='gray' ? [st.v,st.v,st.v] : hsv(st.h, st.s/100, st.v/255);
+  document.body.style.background='rgb('+rgb.join(',')+')';
+  $('v').value=st.v; $('h').value=st.h; $('s').value=st.s;
+  $('vv').textContent=st.v; $('hv').textContent=st.h+'°'; $('sv').textContent=st.s+'%';
+  $('rgb').textContent='RGB '+rgb.join(', ');
+  for(const el of document.querySelectorAll('.col')) el.style.display = mode==='colour' ? '' : 'none';
+  $('mGray').classList.toggle('on',mode==='gray'); $('mCol').classList.toggle('on',mode==='colour');
+  save();
+}
+function setMode(m){ mode=m; paint(); }
+for(const p of [0,8,16,32,48,64,96,127,160,192,224,255]){
+  const b=document.createElement('button'); b.textContent=p; b.onclick=()=>{st.v=p;paint();}; $('presets').appendChild(b);
+}
+$('v').oninput=e=>{st.v=+e.target.value;paint();};
+$('h').oninput=e=>{st.h=+e.target.value;paint();};
+$('s').oninput=e=>{st.s=+e.target.value;paint();};
+// Auto-hide the panel: it would otherwise sit in the picture the LEDs follow.
+let hideT=null;
+function show(){ $('panel').classList.remove('hidden'); clearTimeout(hideT);
+  hideT=setTimeout(()=>$('panel').classList.add('hidden'),4000); }
+document.addEventListener('mousemove',show); document.addEventListener('touchstart',show);
+document.addEventListener('keydown',e=>{
+  const big=16; let used=true;
+  if(e.key==='ArrowRight'){ if(e.shiftKey) st.h+=10; else st.v+=1; }
+  else if(e.key==='ArrowLeft'){ if(e.shiftKey) st.h-=10; else st.v-=1; }
+  else if(e.key==='ArrowUp'){ if(e.shiftKey) st.s+=10; else st.v+=big; }
+  else if(e.key==='ArrowDown'){ if(e.shiftKey) st.s-=10; else st.v-=big; }
+  else if(e.key==='Home') st.v=0; else if(e.key==='End') st.v=255;
+  else if(e.key==='g') mode='gray'; else if(e.key==='c') mode='colour';
+  else if(e.key==='f') fs();
+  else if(e.key==='h'){ $('panel').classList.add('hidden'); return; }
+  else used=false;
+  if(used){ e.preventDefault(); paint(); show(); }
+});
+// Keep the display awake (same approach as the calibration page): a muted,
+// invisible <video> playing a tiny low-rate canvas-capture MediaStream.
+let keepInit=false;
+function keepAwake(){ const keep=$('keep');
+  try{ if(!keepInit){ keepInit=true; const c=document.createElement('canvas'); c.width=c.height=16;
+      const g=c.getContext('2d'); let n=0; const draw=()=>{const v=8+(n++&3); g.fillStyle='rgb('+v+','+v+','+v+')'; g.fillRect(0,0,16,16);};
+      draw(); keep.srcObject=c.captureStream(4); setInterval(draw,250); }
+    keep.play().catch(()=>{}); }catch(e){} }
+document.addEventListener('visibilitychange',()=>{ if(keepInit && document.visibilityState==='visible') $('keep').play().catch(()=>{}); });
+function fs(){ const el=document.documentElement; if(!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen().catch(()=>{}); keepAwake(); }
+document.addEventListener('click',keepAwake,{once:true});
+paint(); show();
+</script>
+</body></html>
+)HTML";
+
 	char keyToken(const std::string &c)
 	{
 		// Map page tokens to the characters the stdin reader / whiteKey expect.
@@ -238,6 +348,8 @@ struct LedCalibWeb::Impl
 	bool dirty = true;
 	double wp = 100.0, wx = -1.0, wy = -1.0; // window-patch geometry (% / %pos)
 	bool clean = false;						 // hide keep-alive + status (shading)
+	bool eyecheck = false;					 // serve the --eyecheck-web page at "/"
+	std::vector<int> cpus;					 // server thread affinity (empty = inherit)
 
 	std::atomic<uint32_t> acked{0};
 	std::atomic<bool> hasClient{false};
@@ -281,9 +393,11 @@ namespace
 	void cbRoot(evhttp_request *req, void *arg)
 	{
 		(void)arg;
+		auto *d = static_cast<LedCalibWeb::Impl *>(arg);
 		evbuffer *out = evhttp_request_get_output_buffer(req);
 		evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Type", "text/html; charset=utf-8");
-		evbuffer_add(out, kPageHtml, std::strlen(kPageHtml));
+		const char *page = d->eyecheck ? kEyecheckHtml : kPageHtml;
+		evbuffer_add(out, page, std::strlen(page));
 		evhttp_send_reply(req, 200, "OK", out);
 	}
 
@@ -454,11 +568,26 @@ bool LedCalibWeb::start()
 
 	_d->running.store(true, std::memory_order_release);
 	_d->th = std::thread([this]
-						 { event_base_dispatch(_d->base); _d->running.store(false, std::memory_order_release); });
+						 {
+							 if (!_d->cpus.empty())
+							 {
+								 // Keep the server off the RT capture/transform cores.
+								 cpu_set_t set;
+								 CPU_ZERO(&set);
+								 for (int c : _d->cpus)
+									 CPU_SET(c, &set);
+								 pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+							 }
+							 event_base_dispatch(_d->base);
+							 _d->running.store(false, std::memory_order_release); });
 	return true;
 }
 
 int LedCalibWeb::port() const { return _d->port; }
+
+void LedCalibWeb::setEyecheckPage(bool on) { _d->eyecheck = on; }
+
+void LedCalibWeb::setCpuAffinity(const std::vector<int> &cpus) { _d->cpus = cpus; }
 
 void LedCalibWeb::setCleanField(bool clean)
 {

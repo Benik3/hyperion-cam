@@ -725,6 +725,8 @@ static LedCalibFitConfig _ledCalibFitCfg;
 // --make-tuning / --tuning: frozen libcamera tuning file (src/tuning.cpp).
 static MakeTuningConfig _makeTuningCfg;
 static std::string _tuningPath;
+// --eyecheck-web: serve the end-to-end eye-check slider page while streaming.
+static bool _eyecheckWeb = false;
 
 // Allocate _ledCalibWeb, set its patch geometry, optionally hide the corner
 // keep-alive/status UI, and start it. Returns false (error printed) if the
@@ -3078,6 +3080,7 @@ int main(int argc, char *argv[])
 		("patch-size", po::value<double>(&_patchSize)->default_value(10.0), "TV patch window size as % of screen area (default 10; 100=fullscreen) to avoid TV auto-dimming")						  //
 		("patch-x", po::value<double>(&_patchX)->default_value(-1.0), "TV patch top-left X in screen-% (<0 = centered)")																			  //
 		("patch-y", po::value<double>(&_patchY)->default_value(-1.0), "TV patch top-left Y in screen-% (<0 = centered)")																			  //
+		("eyecheck-web", po::bool_switch(&_eyecheckWeb)->default_value(false), "While streaming normally, serve the eye-check page (gray slider + colour picker) on --calib-tv-port: open it fullscreen on the TV PC and compare the LED glow with the TV across the whole range")	  //
 		("tuning", po::value<std::string>(&_tuningPath), "Use this libcamera tuning file (sets LIBCAMERA_RPI_TUNING_FILE); use the --make-tuning frozen file for the production service AND every calibration phase")	  //
 		("make-tuning", po::value<std::string>(&_makeTuningCfg.outPath), "Write a frozen tuning file (no adaptive contrast/lens shading, power-law tone curve; with --from-calib a TV-fitted colour matrix) and exit")	  //
 		("tuning-base", po::value<std::string>(&_makeTuningCfg.basePath), "--make-tuning: stock tuning file to start from (default: the system file for the detected sensor)")								  //
@@ -3671,6 +3674,27 @@ int main(int argc, char *argv[])
 			_ledCalibWeb);
 		_ledCalib->setExposureFn([](int us)
 								 { _ledCalibExposureUs = us; });
+	}
+
+	// End-to-end eye check: the normal production pipeline plus a purely
+	// client-side slider page. The server thread is pinned off the RT capture
+	// (1) and transform (2) cores; it never touches the hot path.
+	if (_eyecheckWeb)
+	{
+		if (_ledCalibMode || autoCalibEnabled() || !_imgOutPath.empty())
+		{
+			std::cout << "ERROR: --eyecheck-web is for normal streaming (not with --ledcalib/--autocalib/--imgout)"
+					  << std::endl;
+			return EXIT_FAILURE;
+		}
+		_ledCalibWeb = new LedCalibWeb(_ledCalibWebPort);
+		_ledCalibWeb->setEyecheckPage(true);
+		if (std::thread::hardware_concurrency() >= 4)
+			_ledCalibWeb->setCpuAffinity({0, 3});
+		if (!_ledCalibWeb->start())
+			return EXIT_FAILURE;
+		std::cout << "INFO: eye check page on  http://<this-pi>:" << _ledCalibWebPort
+				  << "/  (open it fullscreen on the PC on the TV's HDMI input)" << std::endl;
 	}
 
 	// Validate mutually exclusive options
