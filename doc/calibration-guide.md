@@ -213,7 +213,8 @@ One measurement, three fits, so you can see what each change does:
 Each run rewrites `$CAL/fit_report.json` (so it describes the last fit, C). Check its output:
 `Camera response: measured curve`, `LED sweep on RAW ... relative RMS` (under ~5%), the knee line
 (`camera white needs N x full LED output`), the dark floor, and per channel
-`LED staircase r: first step at code X, N drive steps at full output` followed by
+`LED staircase r: first light at code X (… % of full), N light levels resolved, steps …x the median`
+(a WS2812 strip reads `uneven LED PWM - measured, handled` — expected) followed by
 **`Round-off-aware dark end: on`** (if a channel says `not resolved`, the dark end falls back to
 plain rounding — check the room was dark and the LED ROI lit). `gray_axis` in the report lists the
 drive the LUT sends for each measured TV gray.

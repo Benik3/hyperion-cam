@@ -203,18 +203,37 @@ reads the sweep files, writes `lut.cube` + `fit_report.json`, exits. Math (`src/
 - **Round-off-aware dark end** (`--calib-dark-quant auto|on|off`, 2026-11): HyperHDR + the LED driver
   output whole drive steps, so near black only a few step triples exist and plain rounding gives
   single-channel glows (red-only, yellow). The LED sweep's **low ramp** (every code 1..96 per
-  channel, darks interleaved) is used to *measure* each channel's staircase — the code where each
-  step starts and the light of one step (`z = A⁻¹·Y` in drive-fraction units, equal steps validated,
-  step/noise ≥ 8) — so nothing about HyperHDR's white balance or gamma is assumed. Two uses:
-  (1) each curve's bottom is **rebuilt** from the step boundaries (the continuous output crosses
-  `k − ½` where rounding switches to step k), replacing the power-law regularization, which fits a
-  noisy ISP floor but not HyperHDR's real dark-end shape (sRGB toe + linear-light white balance +
-  gamma); (2) dark nodes (≤ 14 steps) **snap** to the step triple that looks closest to the node's
-  intended light (chroma weighted 4× over brightness, in eye-white units), output at **plateau
-  centres** so the LUT's trilinear blend and the NV12 round trip (±1-2 codes) don't flip a channel.
-  Self-test (three white balance/gamma settings incl. a green-strongest one): off-white dark grays
-  1.5-2.5% (was ~5% with the power-law bottom + plain rounding at gamma 2.2), no brightness
-  reversals; the remainder is the blend between the black node and the first lit one.
+  channel, darks interleaved) is used to *measure* each channel's staircase as light **plateaus** —
+  the code where each plateau starts and its **measured** light (`z = A⁻¹·Y` in drive-fraction
+  units; a code joins the current plateau unless it lifts clear by 6σ of the dark noise + 3% of the
+  plateau's light; validated: changes are sharp (one code), light never falls, ≤ 3 single-code
+  settle glitches) — so nothing about HyperHDR's white balance or gamma, **nor about the LED PWM**,
+  is assumed. Two uses: (1) each curve's bottom is **rebuilt** from the plateau boundaries (at the
+  code where plateau k−1 switches to k the continuous output sits halfway between their lights),
+  replacing the power-law regularization, which fits a noisy ISP floor but not the real dark-end
+  shape (sRGB toe + linear-light white balance + gamma + the PWM's dead zone); (2) dark nodes (≤ 14
+  plateaus) **snap** to the plateau triple that looks closest to the node's intended light, output
+  at **plateau centres** so the LUT's trilinear blend and the NV12 round trip (±1-2 codes) don't
+  flip a channel. Cost = 4 × chromaticity error² + brightness error², where chromaticity compares
+  output and target each scaled to unit brightness (a light's colour is seen relative to *its own*
+  brightness, so a faint red+green glimmer without blue reads fully orange — black beats it); every
+  channel can always go off.
+  - **Real LEDs are not linear PWM (2026-11-21).** `--ledcalib gamma_leds` on the WS2812 strip
+    (`ws2812spi`, HyperHDR gamma 2.2, white balance 1/0.7/0.5): HyperHDR's drive steps land on the
+    model to the code, but the strip gives **no light at drive 1-3** on any channel, a glimmer at 4,
+    **half-size steps** up to drive ~9 (R, G), and blue moves only every second drive at 4-7
+    (4 = 5, 6 = 7), regular above. First real light at input 41 (R) / 54 (G) / 65 (B). The first
+    version of this feature assumed equal steps (`k × step`) and would have switched itself off on
+    every channel of this strip; hence measured plateau lights. Gamma 2.2 is not the cause (at
+    gamma 1 the same dead drives sit at inputs 1-3, the light levels are the same hardware ones) and
+    it helps: each dark plateau spans 3-10 input codes instead of 1, robust to the NV12 rounding.
+  - Self-test (three linear-PWM white balance/gamma settings incl. a green-strongest one, plus this
+    strip's measured PWM at its settings): off-white dark grays 2.5-3.2% → 1.2-2.5% (linear),
+    7.7% → 4.0% (strip: blue's 6-drive dead zone then a 0.9-step jump means a balanced white exists
+    only from ~1.6% red, so the transition from black can't be neutral). At most one one-step
+    brightness dip per case: a neighbour node that legitimately takes one red step less (crosstalk)
+    makes the interpolation linger on a step boundary — the size of the flicker camera noise already
+    causes at any boundary. A floor colour inside the PWM dead zone is not renderable and not scored.
 - **Self-test**: `--ledcalib-fit-selftest` simulates a known chain (different per-channel LED
   exponents, crosstalk matrix, ambient, RAW sensor matrix, measurement noise) whose camera encodes
   with the **stock imx708 tone curve** (not a power law), synthesizes all four input files incl. a

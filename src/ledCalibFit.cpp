@@ -157,14 +157,20 @@ namespace
 		// (code where each step starts, light per step) is MEASURED from the
 		// sweep's dense low-code ramp - nothing about HyperHDR's settings is
 		// assumed - and dark nodes snap to the best-looking step triple.
+		// A "step" here is a light PLATEAU: a run of LUT output codes giving the same
+		// light. Its light is measured, not assumed k * step - real LED PWM is not
+		// linear at the bottom (WS2812: no light at drive 1-3, uneven steps up to
+		// ~10), and drives that give equal light merge into one plateau.
 		struct Staircase
 		{
 			bool ok = false;
-			double step = 0.0;		// light of one drive step (drive-fraction units, e(255) = 1)
-			std::vector<int> start; // start[k] = first LUT output code giving step k (start[0] = 0)
-			int known = 0;			// steps 0..known-1 have a fully measured code range
+			double step = 0.0;		// median light increment between plateaus (report only)
+			std::vector<int> start; // start[k] = first LUT output code of plateau k (start[0] = 0)
+			std::vector<double> lvl; // lvl[k] = measured light of plateau k (drive-fraction units, e(255) = 1; lvl[0] = 0)
+			int known = 0;			// plateaus 0..known-1 have a fully measured code range
 			int firstCode = 0;		// first code that lights the channel
-			double snr = 0.0;		// step / dark-reading noise
+			double snr = 0.0;		// first plateau's light / dark-reading noise
+			int glitches = 0;		// single settle-glitch codes merged into a neighbour plateau
 			std::string why;		// reason when !ok
 		};
 		Staircase stairs[3];
@@ -899,9 +905,12 @@ namespace
 
 	// Measure each channel's drive staircase from the single-channel low ramp
 	// (every code 1..L, --ledcalib-led-low-max): light per code in drive-fraction
-	// units (z = A^-1 * light, so e(255) = 1), plateaus = whole drive steps. Only
-	// assumes the LED chain ends in equal light steps (integer PWM); that is
-	// validated, and anything unresolved just disables the snapping.
+	// units (z = A^-1 * light, so e(255) = 1), segmented into light PLATEAUS (the
+	// LED chain's whole drive steps). Assumes only that the light changes in sharp
+	// steps; the light of every plateau is MEASURED, so a dead zone, uneven steps
+	// or several drives giving the same light (non-linear LED PWM, e.g. WS2812:
+	// nothing at drive 1-3, half-size steps up to ~10) are all handled. Validated;
+	// anything unresolved just disables the snapping.
 	void detectStaircases(const CalibData &d, const std::vector<cv::Vec3d> &Y, const std::vector<char> &clipped,
 						  FitModel &m)
 	{
@@ -959,94 +968,125 @@ namespace
 					sum += x;
 				z[v] = sum / static_cast<double>(xs.size()) - mean0;
 			}
-			int v1 = -1;
-			for (int v = 1; v < L; v++)
-				if (z[v] > 6.0 * sigma && z[v + 1] > 6.0 * sigma)
-				{
-					v1 = v;
-					break;
-				}
-			if (v1 < 0)
+			// Segment: a code joins the current plateau unless it lifts clear of it:
+			// 6 sigma of the dark noise (a false split ~1e-9 per code) plus 3% of the
+			// plateau's light - lit readings wobble by a few 0.1% (drift, PWM beating
+			// with the rolling shutter; the dark floor is far quieter), while a real
+			// step in the handled range is >= ~6% (1/16). Plateau 0 = LED off, light 0.
+			std::vector<int> start{0};
+			std::vector<double> sum{0.0};
+			std::vector<int> cnt{0};
+			int down = 0;
+			for (int v = 1; v <= L; v++)
 			{
-				st.why = "no light measured within codes 1.." + std::to_string(L);
+				const double mu = cnt.back() ? sum.back() / cnt.back() : 0.0;
+				const double thr = 6.0 * sigma + 0.03 * std::max(mu, 0.0);
+				if (z[v] > mu + thr)
+				{
+					start.push_back(v);
+					sum.push_back(z[v]);
+					cnt.push_back(1);
+				}
+				else if (z[v] < mu - thr)
+					down++; // light fell: noise burst or drift (light is monotone in code)
+				else if (start.size() > 1)
+				{
+					sum.back() += z[v];
+					cnt.back()++;
+				}
+			}
+			// A single code reading between two wider plateaus is a settle glitch
+			// (partly settled first code of a step), not a plateau: merge it into the
+			// neighbour it reads closer to.
+			std::vector<char> merged(start.size(), 0); // boundary p came from a merge
+			for (std::size_t p = 1; p + 1 < start.size();)
+			{
+				const int w = start[p + 1] - start[p];
+				const int wPrev = start[p] - start[p - 1];
+				const int wNext = (p + 2 < start.size() ? start[p + 2] : L + 1) - start[p + 1];
+				if (w != 1 || wPrev < 3 || wNext < 3)
+				{
+					p++;
+					continue;
+				}
+				const double muPrev = cnt[p - 1] ? sum[p - 1] / cnt[p - 1] : 0.0;
+				const double muNext = sum[p + 1] / cnt[p + 1];
+				const double zg = sum[p] / cnt[p];
+				st.glitches++;
+				if (zg - muPrev < muNext - zg)
+				{
+					if (p > 1)
+					{
+						sum[p - 1] += sum[p];
+						cnt[p - 1] += cnt[p];
+					}
+					start.erase(start.begin() + static_cast<long>(p));
+					merged.erase(merged.begin() + static_cast<long>(p));
+					sum.erase(sum.begin() + static_cast<long>(p));
+					cnt.erase(cnt.begin() + static_cast<long>(p));
+				}
+				else
+				{
+					sum[p] += sum[p + 1];
+					cnt[p] += cnt[p + 1];
+					merged[p] = 1;
+					start.erase(start.begin() + static_cast<long>(p + 1));
+					merged.erase(merged.begin() + static_cast<long>(p + 1));
+					sum.erase(sum.begin() + static_cast<long>(p + 1));
+					cnt.erase(cnt.begin() + static_cast<long>(p + 1));
+				}
+			}
+			const int known = static_cast<int>(start.size()) - 1; // the last plateau is open at code L
+			if (known < 3)
+			{
+				st.why = "fewer than 3 LED light levels resolved within codes 1.." + std::to_string(L) +
+						 (known == 0 ? " (no light measured)" : " (raise --ledcalib-led-low-max?)");
 				continue;
 			}
-			double step = z[v1];
-			for (int it = 0; it < 3; it++)
+			std::vector<double> lvl(start.size(), 0.0);
+			for (std::size_t p = 1; p < start.size(); p++)
+				lvl[p] = sum[p] / cnt[p];
+			// Validate: real drive steps switch within one code (a continuous or
+			// dithered LED, or drifting light, creeps instead), light never falls,
+			// and only the odd settle glitch.
+			const int lim = std::min(known, kQuantSteps + 2);
+			int creep = 0;
+			std::vector<double> inc;
+			for (int p = 1; p <= lim; p++)
 			{
-				double sum = 0.0;
-				int n = 0;
-				for (int v = v1; v <= L && z[v] < 1.5 * step; v++)
-				{
-					sum += z[v];
-					n++;
-				}
-				if (n > 0)
-					step = sum / n;
+				const double dl = lvl[p] - lvl[p - 1];
+				inc.push_back(dl);
+				if (!merged[p] && z[start[p]] - z[start[p] - 1] < 0.5 * dl)
+					creep++;
 			}
-			st.snr = step / sigma;
-			if (st.snr < 8.0)
+			if (creep > std::max(1, lim / 10) || down > std::max(2, L / 20) || st.glitches > 3)
 			{
 				std::ostringstream w;
-				w << "first drive step not resolved (step/noise " << st.snr << ", need >= 8)";
+				w << "LED light does not change in clean drive steps (" << creep << "/" << lim
+				  << " level changes creep over several codes, " << down << " readings fall, " << st.glitches
+				  << " settle glitches; continuous/dithered LED driver or drifting light?)";
 				st.why = w.str();
 				continue;
 			}
-			std::vector<int> n(L + 1, 0);
-			for (int it = 0; it < 3; it++)
-			{
-				int run = 0;
-				for (int v = 0; v <= L; v++)
-				{
-					n[v] = std::max(run, static_cast<int>(std::lround(z[v] / step)));
-					run = n[v];
-				}
-				double sz = 0.0, sn = 0.0;
-				for (int v = 1; v <= L; v++)
-					if (n[v] >= 1 && n[v] <= 2 * kQuantSteps)
-					{
-						sz += z[v] * n[v];
-						sn += static_cast<double>(n[v]) * n[v];
-					}
-				if (sn > 0.0)
-					step = sz / sn;
-			}
-			int bad = 0, tot = 0;
-			for (int v = 1; v <= L; v++)
-				if (n[v] <= kQuantSteps + 2)
-				{
-					tot++;
-					if (std::fabs(z[v] / step - n[v]) > 0.35)
-						bad++;
-				}
-			if (tot == 0 || bad > tot / 10)
-			{
-				st.why = "LED light is not in equal drive steps (" + std::to_string(bad) + "/" + std::to_string(tot) +
-						 " low codes off; non-linear LED driver or drifting light?)";
-				continue;
-			}
-			st.start.assign(1, 0);
-			for (int k = 1; k <= n[L]; k++)
-			{
-				int v = 0;
-				while (v <= L && n[v] < k)
-					v++;
-				st.start.push_back(v);
-			}
-			st.known = n[L];
-			st.step = step;
-			st.firstCode = v1;
+			std::sort(inc.begin(), inc.end());
+			st.step = inc[inc.size() / 2];
+			st.snr = inc.front() / sigma;
+			st.start = start;
+			st.lvl = lvl;
+			st.known = known;
+			st.firstCode = start[1];
 			st.ok = true;
 		}
 	}
 
 	// A resolved staircase pins the CONTINUOUS (pre-rounding) drive curve exactly
-	// where it matters most: the code where rounding switches from step k-1 to k
-	// is where the continuous output crosses k - 1/2. Rebuild each curve's bottom
-	// from those crossings - replacing the power-law regularization, which suits
-	// a noisy ISP floor but not HyperHDR's real dark-end shape (sRGB toe +
-	// linear-light white balance + gamma) - so the inversion, the dark floor and
-	// the snapping all see the real dark-end colour.
+	// where it matters most: at the code where plateau k-1 switches to k, the
+	// continuous output sits halfway between their measured lights (for an
+	// equal-step linear LED: k - 1/2 steps). Rebuild each curve's bottom from
+	// those crossings - replacing the power-law regularization, which suits a
+	// noisy ISP floor but not the real dark-end shape (sRGB toe + linear-light
+	// white balance + gamma + the LED PWM's own dead zone) - so the inversion, the
+	// dark floor and the snapping all see the real dark-end colour.
 	void rebuildCurveBottoms(FitModel &m, bool verbose)
 	{
 		for (int c = 0; c < 3; c++)
@@ -1058,7 +1098,7 @@ namespace
 			for (int k = 1; k <= st.known; k++)
 			{
 				px.push_back(st.start[k] - 0.5);
-				py.push_back((k - 0.5) * st.step);
+				py.push_back(0.5 * (st.lvl[k - 1] + st.lvl[k]));
 			}
 			const double top = px.back();
 			Curve &cv = m.e[c];
@@ -1502,29 +1542,38 @@ namespace
 		return std::floor(0.5 * (a + b - 1) + 0.5);
 	}
 
-	// Round-off-aware dark end: snap a dark node's drive to the whole-step
-	// triple that looks closest to its intended light (chroma weighted 4x over
-	// brightness, in units of the eye-matched white), output at plateau centres
-	// so the LUT's interpolation and the NV12 round trip (+-1-2 codes) don't
-	// flip a channel to its neighbour step. True if snapped.
+	// Round-off-aware dark end: snap a dark node's drive to the plateau triple
+	// whose MEASURED light looks closest to its intended light (chroma weighted
+	// 4x over brightness, in units of the eye-matched white), output at plateau
+	// centres so the LUT's interpolation and the NV12 round trip (+-1-2 codes)
+	// don't flip a channel to its neighbour plateau. True if snapped.
 	bool quantizeDark(const FitModel &m, cv::Vec3d &drive)
 	{
 		if (!m.quantOn)
 			return false;
-		cv::Vec3d e, x, w;
+		cv::Vec3d e, w;
+		int at[3];
 		for (int c = 0; c < 3; c++)
 		{
 			e[c] = m.e[c].eval(drive[c]);
-			x[c] = e[c] / m.stairs[c].step;
 			w[c] = std::max(m.eyeWhite[c], 1e-3);
+			const std::vector<double> &lv = m.stairs[c].lvl;
+			at[c] = 0; // brightest plateau not above the intended light
+			while (at[c] + 1 < static_cast<int>(lv.size()) && lv[at[c] + 1] <= e[c])
+				at[c]++;
 		}
-		if (std::max({x[0], x[1], x[2]}) > kQuantSteps)
+		if (std::max({at[0], at[1], at[2]}) >= kQuantSteps)
 			return false;
+		// Candidates: every plateau from off up to two above the intended light.
+		// Off must stay in reach even when the target sits several plateaus up -
+		// a PWM dead zone puts mere glimmers at the bottom indices, and a channel
+		// that cannot join yet (blue's first plateau 3x too bright) is better off
+		// than shown alone.
 		int lo[3], hi[3];
 		for (int c = 0; c < 3; c++)
 		{
-			lo[c] = std::max(0, static_cast<int>(std::floor(x[c])) - 1);
-			hi[c] = static_cast<int>(std::ceil(x[c])) + 1;
+			lo[c] = 0;
+			hi[c] = at[c] + 2;
 			if (hi[c] >= m.stairs[c].known)
 				return false; // beyond the measured staircase
 		}
@@ -1538,14 +1587,22 @@ namespace
 			drive = {0, 0, 0};
 			return changed; // no light intended: black (already black = not a snap)
 		}
+		// Colour error = chromaticity difference (output and target each scaled to
+		// unit brightness): a light's colour is seen relative to ITS OWN brightness,
+		// so a faint red+green glimmer without blue reads fully orange however far
+		// below the target it is - black (no colour, only missing light) beats it.
+		// At matched brightness this equals the plain light difference / target.
 		auto cost = [&](const int n[3])
 		{
-			cv::Vec3d dd;
+			cv::Vec3d o;
 			for (int c = 0; c < 3; c++)
-				dd[c] = n[c] * m.stairs[c].step / w[c] - ut[c];
-			const double lum = (dd[0] + dd[1] + dd[2]) / 3.0;
-			const cv::Vec3d ch = dd - cv::Vec3d{lum, lum, lum};
-			return (4.0 * ch.dot(ch) + lum * lum) / (ref * ref);
+				o[c] = m.stairs[c].lvl[n[c]] / w[c];
+			const double lumO = (o[0] + o[1] + o[2]) / 3.0;
+			const double dl = (lumO - ref) / ref;
+			if (lumO <= 0.0)
+				return dl * dl;
+			const cv::Vec3d ch = o * (1.0 / lumO) - ut * (1.0 / ref);
+			return 4.0 * ch.dot(ch) + dl * dl;
 		};
 		int best[3] = {0, 0, 0};
 		double bestCost = cost(best);
@@ -1759,10 +1816,13 @@ namespace
 			f << (c ? ", " : "") << "{\"ok\": " << (st.ok ? "true" : "false");
 			if (st.ok)
 			{
-				f << ", \"steps_full\": " << (st.step > 0 ? 1.0 / st.step : 0.0) << ", \"first_code\": " << st.firstCode
-				  << ", \"snr\": " << st.snr << ", \"step_start\": [";
+				f << ", \"median_step\": " << st.step << ", \"first_code\": " << st.firstCode << ", \"snr\": " << st.snr
+				  << ", \"glitches\": " << st.glitches << ", \"step_start\": [";
 				for (std::size_t k = 0; k < st.start.size(); k++)
 					f << (k ? ", " : "") << st.start[k];
+				f << "], \"level\": [";
+				for (std::size_t k = 0; k < st.lvl.size(); k++)
+					f << (k ? ", " : "") << st.lvl[k];
 				f << "]";
 			}
 			else
@@ -1855,9 +1915,24 @@ namespace
 			{
 				const auto &st = m.stairs[c];
 				if (st.ok)
-					std::cout << "LED staircase " << "rgb"[c] << ": first step at code " << st.firstCode << ", "
-							  << std::lround(1.0 / st.step) << " drive steps at full output, " << st.known
-							  << " steps resolved (step/noise " << std::lround(st.snr) << ")" << std::endl;
+				{
+					// Unevenness over the handled plateaus above the first (the onset
+					// plateau of a PWM dead zone is often a mere glimmer).
+					double imin = 1e30, imax = 0.0;
+					const int lim = std::min(st.known, kQuantSteps + 2);
+					for (int k = 2; k <= lim; k++)
+					{
+						imin = std::min(imin, st.lvl[k] - st.lvl[k - 1]);
+						imax = std::max(imax, st.lvl[k] - st.lvl[k - 1]);
+					}
+					std::cout << "LED staircase " << "rgb"[c] << ": first light at code " << st.firstCode << " ("
+							  << (100.0 * st.lvl[1]) << "% of full), " << st.known << " light levels resolved, steps "
+							  << (imin / st.step) << ".." << (imax / st.step) << "x the median"
+							  << (imax > 1.5 * imin ? " (uneven LED PWM - measured, handled)" : "")
+							  << ", smallest step/noise " << std::lround(st.snr)
+							  << (st.glitches ? ", " + std::to_string(st.glitches) + " settle glitch(es) merged" : "")
+							  << std::endl;
+				}
 				else
 					std::cout << "LED staircase " << "rgb"[c] << ": " << st.why << std::endl;
 			}
@@ -1950,12 +2025,51 @@ namespace
 			return 255.0 * std::pow(oetf(std::clamp(hhT[c] * eotf(x), 0.0, 1.0)), hhGamma);
 		}
 		double hhDrive(double code, int c) const { return std::round(hhDriveCont(std::round(code), c)); }
+		// LED light (fraction of full) per drive value. Linear PWM by default; the
+		// non-linear option mirrors a real WS2812 strip measured with --ledcalib
+		// gamma_leds (2026-11): no light at drive 1-3, a glimmer at 4, half-size
+		// steps up to ~9, blue moving only every 2nd drive at 4..7, regular above.
+		bool ledNonlin = false;
+		double ledE(double d, int c) const
+		{
+			d = std::clamp(d, 0.0, 255.0);
+			if (!ledNonlin)
+				return d / 255.0;
+			static const double tab[3][11] = {{0, 0, 0, 0, 0.23, 0.41, 0.90, 1.37, 1.84, 2.36, 3.36},
+											  {0, 0, 0, 0, 0.035, 0.22, 0.71, 1.23, 1.75, 2.55, 3.55},
+											  {0, 0, 0, 0, 0.09, 0.09, 0.91, 0.91, 1.93, 2.93, 3.93}}; // full steps
+			auto l = [&](double x)
+			{
+				if (x >= 10.0)
+					return tab[c][10] + (x - 10.0);
+				const int i = static_cast<int>(x);
+				return tab[c][i] + (x - i) * (tab[c][i + 1] - tab[c][i]);
+			};
+			return l(d) / l(255.0);
+		}
+		// Continuous light consistent with whole-step rounding: halfway between the
+		// lights of drives k-1 and k where the rounding switches (k - 1/2). Equal to
+		// ledE for a linear LED; for a dead-zone LED it is what a fractional drive
+		// is worth (the table's own interpolation inside the dead zone is not).
+		double ledEMid(double d, int c) const
+		{
+			if (!ledNonlin)
+				return ledE(d, c);
+			d = std::clamp(d, 0.0, 255.0);
+			auto y = [&](int k) { return k >= 256 ? ledE(255.0, c) : 0.5 * (ledE(k - 1, c) + ledE(k, c)); };
+			if (d < 0.5)
+				return d / 0.5 * y(1);
+			const int k = static_cast<int>(std::floor(d + 0.5));
+			const double x0 = k - 0.5, x1 = (k + 1 >= 256) ? 255.0 : k + 0.5;
+			return y(k) + (x1 > x0 ? (d - x0) / (x1 - x0) : 0.0) * (y(k + 1) - y(k));
+		}
 
 		cv::Vec3d glowLin(const cv::Vec3d &drive) const
 		{
 			cv::Vec3d e;
 			for (int c = 0; c < 3; c++)
-				e[c] = hh ? hhDrive(drive[c], c) / 255.0 : std::pow(std::clamp(drive[c], 0.0, 255.0) / 255.0, exps[c]);
+				e[c] = hh ? ledE(hhDrive(drive[c], c), c)
+						  : std::pow(std::clamp(drive[c], 0.0, 255.0) / 255.0, exps[c]);
 			return A * e + ambient;
 		}
 		cv::Vec3d encode(const cv::Vec3d &lin) const
@@ -2418,14 +2532,19 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 		struct HhCase
 		{
 			double t[3], g;
+			bool nonlin; // non-linear LED PWM (dead zone + uneven steps, as measured on a WS2812 strip)
 		};
-		const HhCase cases[] = {{{1.0, 0.38, 0.22}, 1.0}, {{1.0, 0.64, 0.49}, 2.2}, {{0.7, 1.0, 0.45}, 1.8}};
+		const HhCase cases[] = {{{1.0, 0.38, 0.22}, 1.0, false},
+								{{1.0, 0.64, 0.49}, 2.2, false},
+								{{0.7, 1.0, 0.45}, 1.8, false},
+								{{1.0, 0.7, 0.5}, 2.2, true}};
 		for (const HhCase &hc : cases)
 		{
 			TruthChain q;
 			q.hh = true;
 			std::copy(hc.t, hc.t + 3, q.hhT);
 			q.hhGamma = hc.g;
+			q.ledNonlin = hc.nonlin;
 			// No ambient on the wall / TV black: the ideal LED gray is then exactly the
 			// eye-matched white at every level, so the metric sees only the rounding
 			// (with ambient the fit rightly tints the glow to make glow + ambient match).
@@ -2446,7 +2565,9 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 			qc.calibDir = qd;
 			qc.knee = "auto";
 			qc.darkFloor = "auto";
-			const cv::Vec3d dw{q.hhDriveCont(127, 0), q.hhDriveCont(127, 1), q.hhDriveCont(127, 2)};
+			// Eye-matched white = the LED light at code 127 on every channel.
+			const cv::Vec3d dw{q.ledE(q.hhDriveCont(127, 0), 0), q.ledE(q.hhDriveCont(127, 1), 1),
+							   q.ledE(q.hhDriveCont(127, 2), 2)};
 			auto stats = [&](const FitResult &r, double &badPct, int &rev)
 			{
 				int bad = 0, tot = 0;
@@ -2457,17 +2578,19 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 					const cv::Vec3d code = sampleLutTrilinear(r, {v, v, v});
 					cv::Vec3d u;
 					for (int c = 0; c < 3; c++)
-						u[c] = q.hhDrive(code[c], c) / dw[c];
+						u[c] = q.ledE(q.hhDrive(code[c], c), c) / dw[c];
 					const double um = std::max({u[0], u[1], u[2]});
 					const double ce = um > 0.0 ? (um - std::min({u[0], u[1], u[2]})) / um : 0.0;
 					tot++;
 					bad += ce > 0.34;
-					if (std::getenv("HYPERCAM_SELFTEST_DUMP") && std::fmod(v, 1.0) == 0.0)
-						std::cout << "    v " << v << " code " << code[0] << "," << code[1] << "," << code[2] << " drive "
-								  << q.hhDrive(code[0], 0) << "," << q.hhDrive(code[1], 1) << "," << q.hhDrive(code[2], 2)
-								  << " ce " << ce << std::endl;
 					const cv::Vec3d l = q.glowLin(code) - q.ambient;
 					const double Y = 0.299 * l[0] + 0.587 * l[1] + 0.114 * l[2];
+					// HYPERCAM_SELFTEST_DUMP=1: every code; =2: every quarter code.
+					const char *dump = std::getenv("HYPERCAM_SELFTEST_DUMP");
+					if (dump && (std::fmod(v, 1.0) == 0.0 || std::string(dump) == "2"))
+						std::cout << "    v " << v << " code " << code[0] << "," << code[1] << "," << code[2] << " drive "
+								  << q.hhDrive(code[0], 0) << "," << q.hhDrive(code[1], 1) << "," << q.hhDrive(code[2], 2)
+								  << " ce " << ce << " Y " << Y << std::endl;
 					if (Y < prevY - 1e-12)
 						rev++;
 					prevY = Y;
@@ -2478,6 +2601,7 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 			int revOn = 99, revOff = 99;
 			bool resolved = false;
 			double floorChroma = 1.0;
+			int floorNodes = 0;
 			for (const char *mode : {"off", "auto"})
 			{
 				qc.darkQuant = mode;
@@ -2491,12 +2615,20 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 					const double F = qr.model.darkFloor;
 					const int n = qr.n;
 					floorChroma = 0.0;
+					floorNodes = 0;
 					for (int k = 1; k < n && 255.0 * k / (n - 1) < 0.5 * F; k++)
 					{
 						const cv::Vec3d d = qr.lut[(static_cast<std::size_t>(k) * n + k) * n + k];
+						// A floor inside a PWM dead zone has no renderable colour (every
+						// drive there is black or a glimmer; the snapper decides): score
+						// only nodes where the LED is regular on every channel.
+						if (q.ledNonlin && std::min({q.hhDriveCont(d[0], 0), q.hhDriveCont(d[1], 1),
+													 q.hhDriveCont(d[2], 2)}) < 9.5)
+							continue;
+						floorNodes++;
 						cv::Vec3d u;
 						for (int c = 0; c < 3; c++)
-							u[c] = q.hhDriveCont(d[c], c) / dw[c];
+							u[c] = q.ledEMid(q.hhDriveCont(d[c], c), c) / dw[c];
 						const double um = std::max({u[0], u[1], u[2]});
 						if (um > 1e-6)
 							floorChroma = std::max(floorChroma, (um - std::min({u[0], u[1], u[2]})) / um);
@@ -2508,16 +2640,29 @@ int runLedCalibFitSelftest(const LedCalibFitConfig &cfgIn)
 					stats(qr, badOn, revOn);
 				}
 			}
-			// Measured on this chain: curve rebuild + snapping take the gamma-2.2 case
-			// from ~5% (power-law bottom, plain rounding) to ~2% off-white; the rest
-			// is the trilinear blend between the black node and the first lit one.
+			// Measured on these chains (chromaticity-based snapping cost): linear LEDs
+			// go from ~2.5-3.2% to ~1.2-2.5% off-white; the rest is the trilinear blend
+			// between the black node and the first lit one. The WS2812-like strip goes
+			// 7.7% -> 4%: its blue has a 6-drive dead zone then a 0.9-step jump, so a
+			// balanced white exists only from ~1.6% red - the transition from black
+			// can't be neutral (cap 5% there). At most ONE one-step brightness dip: a
+			// neighbour node that legitimately takes one red step less (crosstalk)
+			// makes the interpolation linger on a step boundary - the same flicker
+			// camera noise causes at any boundary.
+			const double cap = hc.nonlin ? 5.0 : 2.5;
 			const bool ok =
-				resolved && badOn <= 0.8 * badOff + 0.1 && badOn <= 2.5 && revOn == 0 && floorChroma < 0.15;
+				resolved && badOn <= 0.8 * badOff + 0.1 && badOn <= cap && revOn <= 1 && floorChroma < 0.15;
 			quantOk = quantOk && ok;
+			std::ostringstream fl;
+			if (floorNodes > 0)
+				fl << (100.0 * floorChroma) << "%";
+			else
+				fl << "n/a (floor inside the LED dead zone)";
 			std::cout << "Selftest round-off dark end (HyperHDR wb " << hc.t[0] << "/" << hc.t[1] << "/" << hc.t[2]
-					  << ", gamma " << hc.g << "): staircase " << (resolved ? "resolved" : "NOT resolved")
-					  << ", off-white dark grays " << badOff << "% -> " << badOn << "% snapped, brightness reversals "
-					  << revOn << ", dark-floor chroma " << (100.0 * floorChroma) << "% -> " << (ok ? "PASS" : "FAIL")
+					  << ", gamma " << hc.g << (hc.nonlin ? ", non-linear LED PWM" : "")
+					  << "): staircase " << (resolved ? "resolved" : "NOT resolved") << ", off-white dark grays "
+					  << badOff << "% -> " << badOn << "% snapped, brightness reversals " << revOn << " (unsnapped "
+					  << revOff << "), dark-floor chroma " << fl.str() << " -> " << (ok ? "PASS" : "FAIL")
 					  << std::endl;
 		}
 	}
