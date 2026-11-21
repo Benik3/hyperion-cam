@@ -43,7 +43,7 @@
 #include "gpuRgbTransform.h"
 #endif
 
-static constexpr const char *HYPERCAM_VERSION = "1.0.1";
+static constexpr const char *HYPERCAM_VERSION = "2.0.0";
 
 using namespace libcamera;
 namespace po = boost::program_options;
