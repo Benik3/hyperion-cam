@@ -378,6 +378,21 @@ Acted on:
 Not acted on (yet): calibration solid frames as NV12 (±1-2 code round trip), TV side on RAW,
 exposure bracketing of the dark end, extra R/G/B eye anchors (3×3 metameric correction).
 
+### Real-TV result (2026-11-21, `~/calib3`)
+
+First full session with the fix (HyperHDR gamma 2.2, temperature 1/0.7/0.5, WS2812 strip):
+the eye check **passes**: gray and white balance match the TV, and colours match in both dark
+and bright areas. Fits A/B/C look nearly the same on a quick check. That's expected: the frozen
+tuning's power-2.2 curve makes the legacy power-law model almost equal to the measured response,
+so A ≈ B. C changes only the cube's corners: knee 2.6% of nodes, round-off-aware dark end 0.8%,
+dark floor 0.01%. So most of the gain comes from what all three share (frozen tuning, TV-fitted
+matrix, `-b 1,1`, HyperHDR gamma 2.2). Differences would show only on slow gray ramps below ~30
+and on bright saturated colours. Fit report: response RMS 0.8%, RAW→ISP map residual 1.0%, no
+channel clipping. LED staircase on RAW: first light at code 34/45/54 (R/G/B) with 28/17/9
+resolved light levels below code 96. The anchor drive is equal at 127 (126.9/127.0/127.2), and
+the knee needs 116% of the LED full output for the TV white. Multi-point eye calibration (the
+fallback) is not needed.
+
 ## Gamma ramp probe (`--ledcalib gamma`, implemented 2026-06-15)
 
 A standalone feasibility/diagnostic step, separate from the full calib: characterize the
