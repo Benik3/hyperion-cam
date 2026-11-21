@@ -389,7 +389,8 @@ dark floor 0.01%. So most of the gain comes from what all three share (frozen tu
 matrix, `-b 1,1`, HyperHDR gamma 2.2). Differences would show only on slow gray ramps below ~30
 and on bright saturated colours. Fit report: response RMS 0.8%, RAW→ISP map residual 1.0%, no
 channel clipping. LED staircase on RAW: first light at code 34/45/54 (R/G/B) with 28/17/9
-resolved light levels below code 96. The anchor drive is equal at 127 (126.9/127.0/127.2), and
+resolved light levels below code 96. The eye check ran with `--shading-map`, which also
+validates the shading gain magnitude. The anchor drive is equal at 127 (126.9/127.0/127.2), and
 the knee needs 116% of the LED full output for the TV white. Multi-point eye calibration (the
 fallback) is not needed.
 
@@ -453,9 +454,10 @@ shading every position reads the same flattened value, so the global LUT is vali
 the exact ROI choice stops mattering. The LED wall ROI is left unshaded (see above); `all`/`led`
 ignore `--shading-map` (they need the full frame and can't keep the TV crop) — run `tv` and `led`
 as separate phases and derive white from the sweeps (the standard workflow).
-- **Verify on the real TV** (can't be checked off-Pi): show uniform gray with the map applied — it
-  should get *flatter*, not worse. If a corner gets worse it's an axis flip in the gain texture
-  upload, a one-line fix.
+- **Verified on the real TV.** Orientation (2026-06-21): a 4-corner colour probe map showed the
+  right corners in HyperHDR live view (no flip, no transpose). Gain magnitude (2026-11-21): the
+  `~/calib3` production eye check ran with `--shading-map` and passed. Grays and colours matched
+  the LEDs with the map applied, so the map doesn't make the field worse.
 
 ### Phase 4 — verification (later milestone)
 
