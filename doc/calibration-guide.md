@@ -85,12 +85,15 @@ pick the TV ROI inside it:
 ./Release/hyperion-cam --ledcalib-web-dryrun --calib-tv-port 8080 --patch-size 10
 #   open http://<pi>:8080/ fullscreen on the TV PC -> red rectangle marks the patch
 
-# Terminal B — capture the camera's cropped view:
+# Terminal B — capture the camera's cropped view: the same -w/-h/--crop as $GEO, but NO -t
 sudo systemctl stop hypercam
-sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain --imgout /tmp/aim.jpg $GEO
+sudo ./Release/hyperion-cam -c /tmp/hyperhdr-domain --imgout /tmp/aim.jpg \
+  -w 768 -h 432 --crop 1686,1014,1173,751
 ```
 Open `/tmp/aim.jpg`: read `--calib-tv-roi x,y,w,h` **inside the red rectangle**, near the TV
-centre (off the red border). For the **LED ROI**, capture a full-frame still (`-w 1024 -h 576`, no
+centre (off the red border). The calibration samples the cropped frame **before** the perspective
+warp, so the picture must be taken without `-t` (with `-t`, `--imgout` saves the warped output and
+the coordinates are off by the warp). For the **LED ROI**, capture a full-frame still (`-w 1024 -h 576`, no
 `--crop`) with the LEDs lit and read `--calib-led-roi x,y,w,h` on a clearly-lit patch of wall.
 
 ---
